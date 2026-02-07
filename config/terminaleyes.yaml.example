@@ -1,0 +1,62 @@
+# terminaleyes Configuration
+# Copy this file to terminaleyes.yaml and adjust as needed.
+#
+# API keys should be set via environment variables, NOT in this file:
+#   export TERMINALEYES_ANTHROPIC_API_KEY=sk-ant-...
+#   export TERMINALEYES_OPENAI_API_KEY=sk-...
+#   export TERMINALEYES_OPENROUTER_API_KEY=sk-or-...
+
+# Vision capture settings
+capture:
+  device_index: 0            # OpenCV camera device index
+  capture_interval: 2.0      # Seconds between frame captures
+  crop_enabled: false        # Whether to crop captured frames
+  crop_x: 0                  # Crop region x offset (pixels)
+  crop_y: 0                  # Crop region y offset (pixels)
+  crop_width: 800            # Crop region width (pixels)
+  crop_height: 600           # Crop region height (pixels)
+  # resolution_width: 1920   # Uncomment to override camera resolution
+  # resolution_height: 1080
+
+# MLLM interpreter settings
+mllm:
+  provider: anthropic        # "anthropic" or "openai" (use "openai" for OpenRouter)
+  model: claude-sonnet-4-20250514   # Model identifier
+  # base_url: null           # Custom API base URL (set for OpenRouter, etc.)
+  max_tokens: 1024           # Max response tokens
+  # system_prompt_override: null  # Custom system prompt (overrides default)
+
+  # OpenRouter example:
+  # provider: openai
+  # model: google/gemini-2.0-flash-lite-001
+  # base_url: https://openrouter.ai/api/v1
+
+# Local HTTP command endpoint settings
+endpoint:
+  host: "0.0.0.0"
+  port: 8080
+  shell_command: /bin/bash
+  terminal_rows: 24
+  terminal_cols: 80
+  font_size: 16
+  bg_color: [30, 30, 30]     # Dark background
+  fg_color: [192, 192, 192]  # Light gray text
+
+# Keyboard output settings
+keyboard:
+  backend: http              # "http" or "usb_hid"
+  http_base_url: "http://localhost:8080"
+  http_timeout: 10.0
+  usb_hid_device: /dev/hidg0  # Future use
+
+# Agent / decision engine settings
+agent:
+  action_delay: 1.0          # Seconds to wait after action before next capture
+  max_consecutive_errors: 5  # Max consecutive errors before abort
+  default_max_steps: 100     # Default max steps per goal
+
+# Logging settings
+logging:
+  level: INFO                # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  # file: /var/log/terminaleyes.log  # Uncomment to log to file
