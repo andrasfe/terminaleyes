@@ -49,6 +49,7 @@ class EndpointConfig(BaseModel):
     font_size: int = Field(default=24, gt=0)
     bg_color: tuple[int, int, int] = Field(default=(30, 30, 30))
     fg_color: tuple[int, int, int] = Field(default=(192, 192, 192))
+    fullscreen: bool = Field(default=True, description="Run display in fullscreen mode")
 
 
 class KeyboardConfig(BaseModel):

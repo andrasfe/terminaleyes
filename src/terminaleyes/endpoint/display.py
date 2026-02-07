@@ -32,6 +32,7 @@ class TerminalDisplay:
         bg_color: tuple[int, int, int] = (30, 30, 30),
         fg_color: tuple[int, int, int] = (192, 192, 192),
         window_title: str = "terminaleyes - Terminal",
+        fullscreen: bool = False,
     ) -> None:
         self._rows = rows
         self._cols = cols
@@ -39,6 +40,7 @@ class TerminalDisplay:
         self._bg_color = bg_color
         self._fg_color = fg_color
         self._window_title = window_title
+        self._fullscreen = fullscreen
         self._content: str = ""
         self._running = False
         self._thread: threading.Thread | None = None
@@ -57,7 +59,8 @@ class TerminalDisplay:
             target=self._render_loop, daemon=True, name="terminal-display"
         )
         self._thread.start()
-        logger.info("Terminal display started (%dx%d)", self._cols, self._rows)
+        mode = "fullscreen" if self._fullscreen else f"{self._cols}x{self._rows}"
+        logger.info("Terminal display started (%s)", mode)
 
     def stop(self) -> None:
         """Stop the display window."""
@@ -80,26 +83,55 @@ class TerminalDisplay:
 
         pygame.init()
 
-        padding = 10
-        # Find a monospace font
-        font = None
-        for font_name in ["dejavusansmono", "liberationmono", "couriernew", "monospace", "courier"]:
-            font_path = pygame.font.match_font(font_name)
-            if font_path:
-                font = pygame.font.Font(font_path, self._font_size)
-                break
-        if font is None:
-            font = pygame.font.SysFont("monospace", self._font_size)
+        padding = 20
 
-        # Measure character dimensions
+        if self._fullscreen:
+            # Get display info before creating the window
+            info = pygame.display.Info()
+            screen_w, screen_h = info.current_w, info.current_h
+            screen = pygame.display.set_mode((screen_w, screen_h), pygame.FULLSCREEN)
+
+            # Calculate font size to fill the screen
+            # Try to fit rows x cols with padding
+            usable_w = screen_w - padding * 2
+            usable_h = screen_h - padding * 2
+
+            # Find the largest font size where rows*line_height fits vertically
+            # and cols*char_w fits horizontally
+            best_size = self._font_size
+            for test_size in range(8, 80):
+                test_font = self._find_mono_font(pygame, test_size)
+                cw, ch = test_font.size("M")
+                lh = int(ch * 1.2)
+                if cw * self._cols <= usable_w and lh * self._rows <= usable_h:
+                    best_size = test_size
+                else:
+                    break
+
+            font = self._find_mono_font(pygame, best_size)
+            logger.info(
+                "Fullscreen %dx%d, auto font size: %d",
+                screen_w, screen_h, best_size,
+            )
+        else:
+            font = self._find_mono_font(pygame, self._font_size)
+            char_w, char_h = font.size("M")
+            line_height = int(char_h * 1.2)
+            win_w = self._cols * char_w + padding * 2
+            win_h = self._rows * line_height + padding * 2
+            screen = pygame.display.set_mode((win_w, win_h))
+
+        pygame.display.set_caption(self._window_title)
+
         char_w, char_h = font.size("M")
         line_height = int(char_h * 1.2)
 
-        win_w = self._cols * char_w + padding * 2
-        win_h = self._rows * line_height + padding * 2
-
-        screen = pygame.display.set_mode((win_w, win_h))
-        pygame.display.set_caption(self._window_title)
+        # Center the text area in the window
+        win_w, win_h = screen.get_size()
+        text_block_w = self._cols * char_w
+        text_block_h = self._rows * line_height
+        offset_x = (win_w - text_block_w) // 2
+        offset_y = (win_h - text_block_h) // 2
 
         clock = pygame.time.Clock()
         cursor_visible = True
@@ -115,6 +147,10 @@ class TerminalDisplay:
                 if event.type == pygame.QUIT:
                     self._running = False
                     break
+                # Allow Escape to exit fullscreen
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    self._running = False
+                    break
 
             screen.fill(self._bg_color)
 
@@ -123,12 +159,11 @@ class TerminalDisplay:
 
             lines = content.split("\n")
 
-            # Render each line
             for i, line in enumerate(lines[: self._rows]):
                 truncated = line[: self._cols]
                 if truncated:
                     surface = font.render(truncated, True, self._fg_color)
-                    screen.blit(surface, (padding, padding + i * line_height))
+                    screen.blit(surface, (offset_x, offset_y + i * line_height))
 
             # Blinking cursor
             cursor_timer += dt
@@ -137,13 +172,12 @@ class TerminalDisplay:
                 cursor_timer = 0.0
 
             if cursor_visible:
-                # Place cursor at end of last non-empty line
                 cursor_line = min(len(lines) - 1, self._rows - 1) if lines else 0
                 cursor_col = len(lines[cursor_line]) if cursor_line < len(lines) else 0
                 cursor_col = min(cursor_col, self._cols - 1)
                 cursor_rect = pygame.Rect(
-                    padding + cursor_col * char_w,
-                    padding + cursor_line * line_height,
+                    offset_x + cursor_col * char_w,
+                    offset_y + cursor_line * line_height,
                     char_w,
                     line_height,
                 )
@@ -153,3 +187,12 @@ class TerminalDisplay:
             clock.tick(30)
 
         pygame.quit()
+
+    @staticmethod
+    def _find_mono_font(pygame, size: int):
+        """Find a monospace font at the given size."""
+        for name in ["dejavusansmono", "liberationmono", "couriernew", "monospace", "courier"]:
+            path = pygame.font.match_font(name)
+            if path:
+                return pygame.font.Font(path, size)
+        return pygame.font.SysFont("monospace", size)

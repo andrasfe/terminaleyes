@@ -92,14 +92,28 @@ class MLLMProvider(ABC):
         if brace_match:
             json_str = brace_match.group(0)
 
+        data = None
         try:
             data = json.loads(json_str)
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
+            # Try fixing common issues: truncated JSON, bad escapes
+            try:
+                # Fix invalid escape sequences by replacing lone backslashes
+                fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', json_str)
+                data = json.loads(fixed)
+            except json.JSONDecodeError:
+                pass
+
+            if data is None:
+                # Try extracting individual fields with regex as fallback
+                data = self._extract_fields_fallback(raw_response)
+
+        if data is None:
             raise MLLMError(
-                f"Failed to parse MLLM response as JSON: {e}",
+                f"Failed to parse MLLM response as JSON",
                 provider=type(self).__name__,
                 raw_response=raw_response,
-            ) from e
+            )
 
         try:
             content = TerminalContent(
@@ -133,6 +147,48 @@ class MLLMProvider(ABC):
                 provider=type(self).__name__,
                 raw_response=raw_response,
             ) from e
+
+
+    @staticmethod
+    def _extract_fields_fallback(raw: str) -> dict | None:
+        """Extract fields from malformed JSON using regex."""
+        try:
+            fields = {}
+            # Extract visible_text
+            m = re.search(r'"visible_text"\s*:\s*"((?:[^"\\]|\\.)*)"', raw, re.DOTALL)
+            if m:
+                fields["visible_text"] = m.group(1).replace("\\n", "\n")
+            else:
+                # Use any substantial text we can find
+                fields["visible_text"] = raw[:500]
+
+            # Extract readiness
+            m = re.search(r'"readiness"\s*:\s*"(\w+)"', raw)
+            fields["readiness"] = m.group(1) if m else "unknown"
+
+            # Extract confidence
+            m = re.search(r'"confidence"\s*:\s*([\d.]+)', raw)
+            fields["confidence"] = float(m.group(1)) if m else 0.5
+
+            # Extract other fields
+            for field in ["last_command", "last_output", "prompt_text", "working_directory"]:
+                m = re.search(rf'"{field}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+                fields[field] = m.group(1) if m else None
+                m2 = re.search(rf'"{field}"\s*:\s*null', raw)
+                if m2:
+                    fields[field] = None
+
+            # Extract error_messages
+            m = re.search(r'"error_messages"\s*:\s*\[(.*?)\]', raw, re.DOTALL)
+            if m:
+                errors = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
+                fields["error_messages"] = errors
+            else:
+                fields["error_messages"] = []
+
+            return fields
+        except Exception:
+            return None
 
 
 class MLLMError(Exception):

@@ -46,6 +46,12 @@ STEP {step_number} of maximum {max_steps}
 PREVIOUS ACTIONS (last 5):
 {recent_actions}
 
+IMPORTANT RULES:
+- Do NOT repeat the same command if it was already sent and executed. Move on to the next step.
+- If you see the output of a previous command, acknowledge it and proceed with the next action.
+- If the terminal shows the result of 'ls', move on to the next task (e.g., 'date').
+- Only send ONE action at a time.
+
 Decide the SINGLE next action. Respond ONLY with valid JSON:
 
 For typing a command (text followed by Enter):

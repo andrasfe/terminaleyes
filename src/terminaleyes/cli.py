@@ -51,6 +51,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     subparsers.add_parser("endpoint", help="Start the HTTP command endpoint server")
     subparsers.add_parser("capture-test", help="Test webcam capture (saves a frame)")
+    subparsers.add_parser("validate", help="Capture frame, interpret via MLLM, compare with actual screen")
+    calibrate_parser = subparsers.add_parser(
+        "calibrate",
+        help="Auto-detect terminal position in webcam and save crop config",
+    )
+    calibrate_parser.add_argument(
+        "--no-save", action="store_true",
+        help="Show results without saving to config",
+    )
 
     return parser.parse_args(argv)
 
@@ -165,6 +174,96 @@ async def _capture_test(settings) -> None:
         print(f"Saved frame to {outfile} ({frame.image.shape[1]}x{frame.image.shape[0]})")
 
 
+async def _validate(settings) -> None:
+    """Capture a frame, interpret it via MLLM, and compare with actual screen."""
+    import httpx
+    import cv2
+    from terminaleyes.capture.webcam import WebcamCapture
+    from terminaleyes.domain.models import CropRegion
+    from terminaleyes.interpreter.openai import OpenAIProvider
+
+    # Build capture
+    crop = None
+    if settings.capture.crop_enabled:
+        crop = CropRegion(
+            x=settings.capture.crop_x, y=settings.capture.crop_y,
+            width=settings.capture.crop_width, height=settings.capture.crop_height,
+        )
+    capture = WebcamCapture(
+        device_index=settings.capture.device_index, crop_region=crop,
+    )
+
+    # Build MLLM provider
+    api_key = settings.openrouter_api_key.get_secret_value() or settings.openai_api_key.get_secret_value()
+    base_url = settings.mllm.base_url
+    if not base_url and settings.openrouter_api_key.get_secret_value():
+        base_url = "https://openrouter.ai/api/v1"
+
+    interpreter = OpenAIProvider(
+        api_key=api_key, model=settings.mllm.model,
+        base_url=base_url, max_tokens=settings.mllm.max_tokens,
+    )
+
+    # Capture and interpret
+    async with capture:
+        frame = await capture.capture_frame()
+        cv2.imwrite("validate_capture.png", frame.image)
+        print(f"Saved webcam capture to validate_capture.png ({frame.image.shape[1]}x{frame.image.shape[0]})")
+
+    print("\nInterpreting via MLLM...")
+    state = await interpreter.interpret(frame)
+
+    # Get actual screen content from endpoint
+    actual = "(endpoint not available)"
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{settings.keyboard.http_base_url}/screen")
+            actual = r.json().get("content", "")
+    except Exception as e:
+        actual = f"(could not fetch: {e})"
+
+    print("\n" + "=" * 60)
+    print("MLLM INTERPRETATION")
+    print("=" * 60)
+    print(f"Readiness:  {state.readiness.value}")
+    print(f"Confidence: {state.confidence}")
+    print(f"Prompt:     {state.content.prompt_text}")
+    print(f"Last cmd:   {state.content.last_command}")
+    print(f"Last out:   {state.content.last_output}")
+    print(f"Work dir:   {state.content.working_directory}")
+    print(f"Errors:     {state.content.error_messages}")
+    print(f"\nVisible text ({len(state.content.visible_text)} chars):")
+    print("-" * 40)
+    print(state.content.visible_text[:500])
+    print("-" * 40)
+
+    print("\n" + "=" * 60)
+    print("ACTUAL SCREEN CONTENT (from /screen endpoint)")
+    print("=" * 60)
+    print(actual[:500])
+    print("=" * 60)
+
+    # Similarity check (strip empty lines)
+    actual_stripped = " ".join(actual.split())
+    mllm_stripped = " ".join(state.content.visible_text.split())
+    actual_words = set(actual_stripped.lower().split())
+    mllm_words = set(mllm_stripped.lower().split())
+    if actual_words and mllm_words:
+        overlap = len(actual_words & mllm_words)
+        total = len(actual_words | mllm_words)
+        similarity = overlap / total * 100
+        print(f"\nWord overlap: {overlap}/{total} ({similarity:.0f}%)")
+        if similarity >= 30:
+            print("OK -- MLLM is reading the terminal correctly.")
+        else:
+            # Check if the MLLM text is a substring of actual or vice versa
+            if mllm_stripped.lower() in actual_stripped.lower():
+                print("OK -- MLLM text is a subset of the actual screen content.")
+            else:
+                print("WARNING: Low similarity -- camera may not be focused on the terminal.")
+    print()
+
+
 def main(argv: list[str] | None = None) -> None:
     """Main entry point for the terminaleyes CLI."""
     args = parse_args(argv)
@@ -199,6 +298,7 @@ def main(argv: list[str] | None = None) -> None:
             font_size=ep.font_size,
             bg_color=ep.bg_color,
             fg_color=ep.fg_color,
+            fullscreen=ep.fullscreen,
         )
         uvicorn.run(
             app,
@@ -209,6 +309,48 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "capture-test":
         logger.info("Running capture test")
         asyncio.run(_capture_test(settings))
+
+    elif args.command == "validate":
+        logger.info("Running MLLM validation")
+        asyncio.run(_validate(settings))
+
+    elif args.command == "calibrate":
+        logger.info("Running camera calibration")
+        asyncio.run(_calibrate(settings, save=not args.no_save))
+
+
+async def _calibrate(settings, save: bool = True) -> None:
+    """Auto-detect terminal position in webcam feed."""
+    from terminaleyes.calibration import calibrate, apply_calibration_to_config
+
+    print("Starting calibration...")
+    print("The screen will flash WHITE and BLACK. Keep the camera steady.\n")
+
+    result = await calibrate(
+        device_index=settings.capture.device_index,
+        fullscreen=settings.endpoint.fullscreen,
+    )
+
+    print(f"\nDetected terminal region:")
+    print(f"  Position: ({result['crop_x']}, {result['crop_y']})")
+    print(f"  Size:     {result['crop_width']}x{result['crop_height']}")
+    print(f"  Frame:    {result['frame_width']}x{result['frame_height']}")
+    print(f"  Coverage: {result['area_ratio'] * 100:.0f}% of camera frame")
+    print(f"\nDebug images saved: calibration_*.png")
+
+    if save:
+        config_path = "config/terminaleyes.yaml"
+        apply_calibration_to_config(config_path, result)
+        print(f"\nCrop settings saved to {config_path}")
+        print("The agent will now auto-crop to the terminal region.")
+    else:
+        print("\nTo apply manually, add to config/terminaleyes.yaml:")
+        print(f"  capture:")
+        print(f"    crop_enabled: true")
+        print(f"    crop_x: {result['crop_x']}")
+        print(f"    crop_y: {result['crop_y']}")
+        print(f"    crop_width: {result['crop_width']}")
+        print(f"    crop_height: {result['crop_height']}")
 
 
 if __name__ == "__main__":
