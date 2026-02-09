@@ -61,6 +61,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Show results without saving to config",
     )
 
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Passively watch a screen via webcam and build a session summary",
+    )
+    watch_parser.add_argument(
+        "--interval", type=float, default=None,
+        help="Minutes between captures (default: config value, 3)",
+    )
+    watch_parser.add_argument(
+        "--duration", type=float, default=None,
+        help="Hours to run (default: config value, 1)",
+    )
+    watch_parser.add_argument(
+        "--output", type=str, default=None,
+        help="Save session JSON to this file",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -189,8 +206,12 @@ async def _validate(settings) -> None:
             x=settings.capture.crop_x, y=settings.capture.crop_y,
             width=settings.capture.crop_width, height=settings.capture.crop_height,
         )
+    resolution = None
+    if settings.capture.resolution_width and settings.capture.resolution_height:
+        resolution = (settings.capture.resolution_width, settings.capture.resolution_height)
     capture = WebcamCapture(
         device_index=settings.capture.device_index, crop_region=crop,
+        resolution=resolution,
     )
 
     # Build MLLM provider
@@ -291,6 +312,57 @@ def main(argv: list[str] | None = None) -> None:
         from terminaleyes.endpoint.server import create_app
         import uvicorn
         ep = settings.endpoint
+        window_x = ep.window_x
+        window_y = ep.window_y
+
+        # Auto-position text area from calibration data if no explicit position set
+        if window_x is None and window_y is None:
+            cap = settings.capture
+            if cap.crop_width > 0 and cap.crop_height > 0:
+                from terminaleyes.calibration import compute_window_position
+                import pygame
+                pygame.init()
+                info = pygame.display.Info()
+                screen_w, screen_h = info.current_w, info.current_h
+                pygame.quit()
+
+                # Estimate window size from font metrics
+                char_w_est = int(ep.font_size * 0.6)
+                line_h_est = int(ep.font_size * 1.2)
+                pad = 30
+                win_w = ep.terminal_cols * char_w_est + pad * 2
+                win_h = ep.terminal_rows * line_h_est + pad * 2
+
+                calibration = {
+                    "crop_x": cap.crop_x,
+                    "crop_y": cap.crop_y,
+                    "crop_width": cap.crop_width,
+                    "crop_height": cap.crop_height,
+                    "frame_width": cap.resolution_width or 1920,
+                    "frame_height": cap.resolution_height or 1080,
+                }
+                window_x, window_y = compute_window_position(
+                    calibration, screen_w, screen_h, win_w, win_h,
+                )
+                logger.info("Auto-positioned window at (%d, %d) size %dx%d", window_x, window_y, win_w, win_h)
+            else:
+                # No calibration: default to bottom-center of screen
+                import pygame
+                pygame.init()
+                info = pygame.display.Info()
+                screen_w, screen_h = info.current_w, info.current_h
+                pygame.quit()
+
+                char_w_est = int(ep.font_size * 0.6)
+                line_h_est = int(ep.font_size * 1.2)
+                pad = 30
+                win_w = ep.terminal_cols * char_w_est + pad * 2
+                win_h = ep.terminal_rows * line_h_est + pad * 2
+
+                window_x = (screen_w - win_w) // 2
+                window_y = screen_h - win_h - 50
+                logger.info("No calibration data, defaulting to bottom-center (%d, %d)", window_x, window_y)
+
         app = create_app(
             shell_command=ep.shell_command,
             rows=ep.terminal_rows,
@@ -299,6 +371,8 @@ def main(argv: list[str] | None = None) -> None:
             bg_color=ep.bg_color,
             fg_color=ep.fg_color,
             fullscreen=ep.fullscreen,
+            window_x=window_x,
+            window_y=window_y,
         )
         uvicorn.run(
             app,
@@ -314,9 +388,98 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("Running MLLM validation")
         asyncio.run(_validate(settings))
 
+    elif args.command == "watch":
+        logger.info("Starting screen watcher")
+        asyncio.run(_watch(settings, args))
+
     elif args.command == "calibrate":
         logger.info("Running camera calibration")
         asyncio.run(_calibrate(settings, save=not args.no_save))
+
+
+async def _watch(settings, args) -> None:
+    """Run the passive screen watcher."""
+    import signal
+    from terminaleyes.capture.webcam import WebcamCapture
+    from terminaleyes.watcher.reader import ScreenReader
+    from terminaleyes.watcher.memory import MemoryStore
+    from terminaleyes.watcher.loop import WatchLoop
+
+    interval = args.interval if args.interval is not None else settings.watch.capture_interval_minutes
+    duration = args.duration if args.duration is not None else settings.watch.session_duration_hours
+
+    print("=" * 60)
+    print("SCREEN WATCHER")
+    print("=" * 60)
+    print(f"Capture interval: {interval} min")
+    print(f"Session duration: {duration} hr")
+    print(f"Change threshold: {settings.watch.change_threshold}")
+    print()
+    print("NOTE: This tool captures and reads your screen via webcam.")
+    print("Press Ctrl+C to stop early and generate summary.")
+    print("=" * 60)
+    print()
+
+    # Build webcam capture (no crop — watch arbitrary screens)
+    resolution = None
+    if settings.capture.resolution_width and settings.capture.resolution_height:
+        resolution = (settings.capture.resolution_width, settings.capture.resolution_height)
+
+    capture = WebcamCapture(
+        device_index=settings.capture.device_index,
+        resolution=resolution,
+    )
+
+    # Build screen reader
+    api_key = settings.openrouter_api_key.get_secret_value() or settings.openai_api_key.get_secret_value()
+    base_url = settings.mllm.base_url
+    if not base_url and settings.openrouter_api_key.get_secret_value():
+        base_url = "https://openrouter.ai/api/v1"
+
+    model = settings.watch.model_override or settings.mllm.model
+
+    reader = ScreenReader(
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        max_tokens=settings.mllm.max_tokens,
+    )
+
+    memory = MemoryStore()
+    loop = WatchLoop(
+        capture=capture,
+        reader=reader,
+        memory=memory,
+        capture_interval_minutes=interval,
+        session_duration_hours=duration,
+        change_threshold=settings.watch.change_threshold,
+    )
+
+    # Handle Ctrl+C gracefully
+    def _sigint_handler(sig, frame):
+        print("\nStopping watch (generating summary)...")
+        loop.stop()
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    session = await loop.run()
+
+    print()
+    print("=" * 60)
+    print("SESSION SUMMARY")
+    print("=" * 60)
+    print(f"Duration:  {session.duration_minutes:.1f} min")
+    print(f"Captures:  {session.total_captures}")
+    print(f"Changes:   {session.changes_detected}")
+    print()
+    print(session.final_summary)
+    print("=" * 60)
+
+    if args.output:
+        import json
+        with open(args.output, "w") as f:
+            json.dump(session.model_dump(mode="json"), f, indent=2, default=str)
+        print(f"\nSession saved to {args.output}")
 
 
 async def _calibrate(settings, save: bool = True) -> None:
@@ -326,9 +489,14 @@ async def _calibrate(settings, save: bool = True) -> None:
     print("Starting calibration...")
     print("The screen will flash WHITE and BLACK. Keep the camera steady.\n")
 
+    resolution = None
+    if settings.capture.resolution_width and settings.capture.resolution_height:
+        resolution = (settings.capture.resolution_width, settings.capture.resolution_height)
+
     result = await calibrate(
         device_index=settings.capture.device_index,
         fullscreen=settings.endpoint.fullscreen,
+        resolution=resolution,
     )
 
     print(f"\nDetected terminal region:")

@@ -50,6 +50,8 @@ class EndpointConfig(BaseModel):
     bg_color: tuple[int, int, int] = Field(default=(30, 30, 30))
     fg_color: tuple[int, int, int] = Field(default=(192, 192, 192))
     fullscreen: bool = Field(default=True, description="Run display in fullscreen mode")
+    window_x: int | None = Field(default=None, description="Window X position (None=auto)")
+    window_y: int | None = Field(default=None, description="Window Y position (None=auto)")
 
 
 class KeyboardConfig(BaseModel):
@@ -57,6 +59,16 @@ class KeyboardConfig(BaseModel):
     http_base_url: str = Field(default="http://localhost:8080")
     http_timeout: float = Field(default=10.0, gt=0)
     usb_hid_device: str = Field(default="/dev/hidg0")
+
+
+class WatchConfig(BaseModel):
+    capture_interval_minutes: float = Field(default=3.0, gt=0)
+    session_duration_hours: float = Field(default=1.0, gt=0)
+    change_threshold: float = Field(default=0.02, ge=0.0, le=1.0)
+    model_override: str | None = Field(
+        default=None,
+        description="Use a different model for watch mode (overrides mllm.model)",
+    )
 
 
 class AgentConfig(BaseModel):
@@ -99,6 +111,7 @@ class Settings(BaseSettings):
     endpoint: EndpointConfig = Field(default_factory=EndpointConfig)
     keyboard: KeyboardConfig = Field(default_factory=KeyboardConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
+    watch: WatchConfig = Field(default_factory=WatchConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 
