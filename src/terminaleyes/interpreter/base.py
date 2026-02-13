@@ -19,7 +19,7 @@ from terminaleyes.domain.models import (
     TerminalReadiness,
     TerminalState,
 )
-from terminaleyes.utils.imaging import numpy_to_base64_png, resize_for_mllm
+from terminaleyes.utils.imaging import enhance_for_ocr, numpy_to_base64_png, resize_for_mllm
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +73,13 @@ class MLLMProvider(ABC):
         ...
 
     def _encode_frame_to_base64(self, frame: CapturedFrame) -> str:
-        """Encode a captured frame's image to a base64 PNG string."""
-        resized = resize_for_mllm(frame.image)
+        """Encode a captured frame's image to a base64 PNG string.
+
+        Applies OCR enhancement (binarization, contrast) before resizing
+        to improve MLLM text recognition accuracy.
+        """
+        enhanced = enhance_for_ocr(frame.image)
+        resized = resize_for_mllm(enhanced)
         return numpy_to_base64_png(resized)
 
     def _parse_response(self, raw_response: str, frame: CapturedFrame) -> TerminalState:

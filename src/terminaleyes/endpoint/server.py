@@ -77,6 +77,8 @@ def create_app(
     bg_color: tuple[int, int, int] = (30, 30, 30),
     fg_color: tuple[int, int, int] = (192, 192, 192),
     fullscreen: bool = True,
+    window_x: int | None = None,
+    window_y: int | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
 
@@ -93,6 +95,7 @@ def create_app(
                 rows=s.rows, cols=s.cols,
                 font_size=font_size, bg_color=bg_color, fg_color=fg_color,
                 fullscreen=fullscreen,
+                window_x=window_x, window_y=window_y,
             )
             app.state.display = d
         await s.start()

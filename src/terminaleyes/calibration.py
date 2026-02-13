@@ -90,6 +90,7 @@ async def calibrate(
     device_index: int = 0,
     fullscreen: bool = True,
     margin: int = 10,
+    resolution: tuple[int, int] | None = None,
 ) -> dict:
     """Run the calibration procedure.
 
@@ -119,6 +120,13 @@ async def calibrate(
     if not cap.isOpened():
         display.stop()
         raise RuntimeError(f"Cannot open webcam device {device_index}")
+
+    if resolution:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        logger.info("Calibration: webcam resolution set to %dx%d", actual_w, actual_h)
 
     # Let the camera auto-exposure settle with a dark screen
     logger.info("Calibration: warming up camera...")
@@ -276,3 +284,35 @@ def apply_calibration_to_config(
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
     logger.info("Saved calibration to %s", path)
+
+
+def compute_window_position(
+    calibration: dict,
+    screen_width: int,
+    screen_height: int,
+    window_width: int,
+    window_height: int,
+    margin: int = 50,
+) -> tuple[int, int]:
+    """Compute where to place the window so the camera can see it.
+
+    Reverse-maps calibration crop coordinates (camera space) back to
+    screen coordinates via linear proportion, then centers the window
+    on that point.
+    """
+    cam_cx = calibration["crop_x"] + calibration["crop_width"] / 2
+    cam_cy = calibration["crop_y"] + calibration["crop_height"] / 2
+
+    scale_x = screen_width / calibration["frame_width"]
+    scale_y = screen_height / calibration["frame_height"]
+
+    screen_cx = cam_cx * scale_x
+    screen_cy = cam_cy * scale_y
+
+    x = int(screen_cx - window_width / 2)
+    y = int(screen_cy - window_height / 2)
+
+    x = max(margin, min(x, screen_width - window_width - margin))
+    y = max(margin, min(y, screen_height - window_height - margin))
+
+    return x, y

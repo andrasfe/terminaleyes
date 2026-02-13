@@ -1,8 +1,12 @@
 """Terminal display renderer for the command endpoint.
 
-Renders the shell's screen buffer in a window that looks like a real
-terminal, so the webcam + MLLM can read it reliably. Uses pygame for
+Renders the shell's screen buffer in a fullscreen window with a positioned
+text rectangle that the webcam + MLLM can read reliably. Uses pygame for
 precise control over rendering (monospace font, colors, cursor).
+
+The display is fullscreen (guaranteed always-on-top on Wayland) with a black
+background. Only the text area has the configured bg_color (white), making it
+unobtrusive while keeping the terminal content visible to the camera.
 """
 
 from __future__ import annotations
@@ -15,10 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class TerminalDisplay:
-    """Renders terminal content in a pygame window.
-
-    Creates a window that visually resembles a terminal emulator with
-    dark background, monospace font, and blinking cursor.
+    """Renders terminal content in a fullscreen window with positioned text area.
 
     The display runs in its own thread to avoid blocking the async
     event loop of the HTTP server.
@@ -29,10 +30,12 @@ class TerminalDisplay:
         rows: int = 24,
         cols: int = 80,
         font_size: int = 24,
-        bg_color: tuple[int, int, int] = (30, 30, 30),
-        fg_color: tuple[int, int, int] = (192, 192, 192),
+        bg_color: tuple[int, int, int] = (255, 255, 255),
+        fg_color: tuple[int, int, int] = (0, 0, 0),
         window_title: str = "terminaleyes - Terminal",
-        fullscreen: bool = False,
+        fullscreen: bool = True,
+        window_x: int | None = None,
+        window_y: int | None = None,
     ) -> None:
         self._rows = rows
         self._cols = cols
@@ -41,6 +44,8 @@ class TerminalDisplay:
         self._fg_color = fg_color
         self._window_title = window_title
         self._fullscreen = fullscreen
+        self._window_x = window_x
+        self._window_y = window_y
         self._content: str = ""
         self._running = False
         self._thread: threading.Thread | None = None
@@ -59,8 +64,7 @@ class TerminalDisplay:
             target=self._render_loop, daemon=True, name="terminal-display"
         )
         self._thread.start()
-        mode = "fullscreen" if self._fullscreen else f"{self._cols}x{self._rows}"
-        logger.info("Terminal display started (%s)", mode)
+        logger.info("Terminal display started")
 
     def stop(self) -> None:
         """Stop the display window."""
@@ -78,60 +82,50 @@ class TerminalDisplay:
             self._content = content
 
     def _render_loop(self) -> None:
-        """Main pygame rendering loop running in its own thread."""
+        """Main pygame rendering loop running in its own thread.
+
+        Always uses fullscreen with black background. The text area
+        (white rectangle) is positioned where the camera can see it,
+        using window_x/window_y as the text area offset within the
+        fullscreen surface.
+        """
         import pygame
 
         pygame.init()
 
-        padding = 20
+        info = pygame.display.Info()
+        screen_w, screen_h = info.current_w, info.current_h
+        screen = pygame.display.set_mode((screen_w, screen_h), pygame.FULLSCREEN)
 
-        if self._fullscreen:
-            # Get display info before creating the window
-            info = pygame.display.Info()
-            screen_w, screen_h = info.current_w, info.current_h
-            screen = pygame.display.set_mode((screen_w, screen_h), pygame.FULLSCREEN)
-
-            # Calculate font size to fill the screen
-            # Try to fit rows x cols with padding
-            usable_w = screen_w - padding * 2
-            usable_h = screen_h - padding * 2
-
-            # Find the largest font size where rows*line_height fits vertically
-            # and cols*char_w fits horizontally
-            best_size = self._font_size
-            for test_size in range(8, 80):
-                test_font = self._find_mono_font(pygame, test_size)
-                cw, ch = test_font.size("M")
-                lh = int(ch * 1.2)
-                if cw * self._cols <= usable_w and lh * self._rows <= usable_h:
-                    best_size = test_size
-                else:
-                    break
-
-            font = self._find_mono_font(pygame, best_size)
-            logger.info(
-                "Fullscreen %dx%d, auto font size: %d",
-                screen_w, screen_h, best_size,
-            )
-        else:
-            font = self._find_mono_font(pygame, self._font_size)
-            char_w, char_h = font.size("M")
-            line_height = int(char_h * 1.2)
-            win_w = self._cols * char_w + padding * 2
-            win_h = self._rows * line_height + padding * 2
-            screen = pygame.display.set_mode((win_w, win_h))
-
-        pygame.display.set_caption(self._window_title)
-
+        # Calculate font and text block size
+        padding = 30
+        font = self._find_mono_font(pygame, self._font_size)
         char_w, char_h = font.size("M")
         line_height = int(char_h * 1.2)
-
-        # Center the text area in the window
-        win_w, win_h = screen.get_size()
         text_block_w = self._cols * char_w
         text_block_h = self._rows * line_height
-        offset_x = (win_w - text_block_w) // 2
-        offset_y = (win_h - text_block_h) // 2
+        rect_w = text_block_w + padding * 2
+        rect_h = text_block_h + padding * 2
+
+        # Position the text rectangle using window_x/window_y (from calibration)
+        # or center on screen if not specified
+        if self._window_x is not None and self._window_y is not None:
+            rect_x = self._window_x
+            rect_y = self._window_y
+        else:
+            rect_x = (screen_w - rect_w) // 2
+            rect_y = (screen_h - rect_h) // 2
+
+        # Text offset within the rectangle
+        text_x = rect_x + padding
+        text_y = rect_y + padding
+
+        logger.info(
+            "Fullscreen %dx%d, text area at (%d,%d) size %dx%d, font: %d",
+            screen_w, screen_h, rect_x, rect_y, rect_w, rect_h, self._font_size,
+        )
+
+        pygame.display.set_caption(self._window_title)
 
         clock = pygame.time.Clock()
         cursor_visible = True
@@ -147,12 +141,16 @@ class TerminalDisplay:
                 if event.type == pygame.QUIT:
                     self._running = False
                     break
-                # Allow Escape to exit fullscreen
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     self._running = False
                     break
 
-            screen.fill(self._bg_color)
+            # Black background (unobtrusive)
+            screen.fill((0, 0, 0))
+
+            # White text rectangle where camera can see it
+            text_rect = pygame.Rect(rect_x, rect_y, rect_w, rect_h)
+            pygame.draw.rect(screen, self._bg_color, text_rect)
 
             with self._lock:
                 content = self._content
@@ -163,7 +161,7 @@ class TerminalDisplay:
                 truncated = line[: self._cols]
                 if truncated:
                     surface = font.render(truncated, True, self._fg_color)
-                    screen.blit(surface, (offset_x, offset_y + i * line_height))
+                    screen.blit(surface, (text_x, text_y + i * line_height))
 
             # Blinking cursor
             cursor_timer += dt
@@ -176,8 +174,8 @@ class TerminalDisplay:
                 cursor_col = len(lines[cursor_line]) if cursor_line < len(lines) else 0
                 cursor_col = min(cursor_col, self._cols - 1)
                 cursor_rect = pygame.Rect(
-                    offset_x + cursor_col * char_w,
-                    offset_y + cursor_line * line_height,
+                    text_x + cursor_col * char_w,
+                    text_y + cursor_line * line_height,
                     char_w,
                     line_height,
                 )

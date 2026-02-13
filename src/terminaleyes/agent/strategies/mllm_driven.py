@@ -49,8 +49,9 @@ PREVIOUS ACTIONS (last 5):
 IMPORTANT RULES:
 - Do NOT repeat the same command if it was already sent and executed. Move on to the next step.
 - If you see the output of a previous command, acknowledge it and proceed with the next action.
-- If the terminal shows the result of 'ls', move on to the next task (e.g., 'date').
 - Only send ONE action at a time.
+- When paging with 'more' or 'less': if you see a shell PROMPT (e.g. "user@host:~$") WITHOUT "--More--", it means paging is DONE. Report completion immediately.
+- If the visible text looks the same as the last few steps and there is no "--More--" indicator, the task is likely complete.
 
 Decide the SINGLE next action. Respond ONLY with valid JSON:
 
@@ -117,6 +118,14 @@ class MLLMDrivenStrategy(AgentStrategy):
             max_steps=context.current_goal.max_steps,
             recent_actions=actions_text,
         )
+
+        # Inject suppression/re-evaluation hints
+        suppressed = context.metadata.get("suppressed_command")
+        if suppressed:
+            prompt += f"\n\nWARNING: Your previous suggestion '{suppressed}' was ALREADY EXECUTED. Its output is visible above. Do NOT send it again. If the output shows the goal is achieved, respond with action_type 'done'."
+        if context.metadata.get("force_reevaluate") == "true":
+            prompt += "\n\nCRITICAL: You have been stuck suggesting the same command repeatedly. The command already ran and its output is on screen. Evaluate whether the goal is COMPLETE based on what you see. If the visible text contains the expected result, respond with action_type 'done' status 'completed'."
+            context.metadata.pop("force_reevaluate", None)
 
         try:
             # Use the MLLM to decide (text-only, no image needed)

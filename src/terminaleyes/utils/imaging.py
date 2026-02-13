@@ -36,18 +36,54 @@ def pil_to_numpy(image: Image.Image) -> np.ndarray:
     return cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
 
 
+def enhance_for_ocr(image: np.ndarray) -> np.ndarray:
+    """Enhance a camera-captured terminal image for better MLLM OCR.
+
+    Produces high-contrast black text on white background regardless of
+    input polarity (works for both white-on-black and black-on-white displays).
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Apply CLAHE for local contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    # Otsu threshold to get binary text
+    _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Ensure black-on-white: if majority of pixels are dark, invert
+    white_ratio = np.mean(binary) / 255.0
+    if white_ratio < 0.5:
+        binary = cv2.bitwise_not(binary)
+
+    # Convert back to BGR for the MLLM
+    return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+
 def resize_for_mllm(
     image: np.ndarray,
     max_dimension: int = 1568,
+    min_dimension: int = 1024,
 ) -> np.ndarray:
-    """Resize an image to fit within MLLM input size limits.
+    """Resize an image for optimal MLLM interpretation.
 
-    Preserves aspect ratio. Returns the original if already within limits.
+    Preserves aspect ratio. Downscales large images and upscales
+    small images so text is readable by the vision model.
     """
     h, w = image.shape[:2]
-    if h <= max_dimension and w <= max_dimension:
-        return image
-    scale = max_dimension / max(h, w)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    largest = max(h, w)
+
+    if largest > max_dimension:
+        # Downscale
+        scale = max_dimension / largest
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    elif largest < min_dimension:
+        # Upscale small images so text is large enough for MLLM OCR
+        scale = min_dimension / largest
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+    return image
