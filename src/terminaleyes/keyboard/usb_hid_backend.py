@@ -1,12 +1,11 @@
-"""USB HID keyboard output backend (future implementation).
+"""USB HID keyboard output backend.
 
-Will send keyboard actions via a Raspberry Pi acting as a USB HID
-keyboard device. This module is a placeholder for the future
-hardware-based backend.
+Sends keyboard actions by writing USB HID reports to /dev/hidg0 on a
+Raspberry Pi configured as a USB gadget. This is the production backend
+that replaces HttpKeyboardOutput when running on real hardware.
 
-NOTE: This backend is not yet implemented. It exists to demonstrate
-the pluggable architecture and to serve as a starting point when
-Raspberry Pi hardware integration begins.
+Use this backend when the terminaleyes agent runs directly on the Pi,
+or use the raspi.server REST API when the agent runs on a separate machine.
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ from __future__ import annotations
 import logging
 
 from terminaleyes.keyboard.base import KeyboardOutput, KeyboardOutputError
+from terminaleyes.raspi.hid_writer import HidWriteError, HidWriter
 
 logger = logging.getLogger(__name__)
 
@@ -21,74 +21,64 @@ logger = logging.getLogger(__name__)
 class UsbHidKeyboardOutput(KeyboardOutput):
     """Sends keyboard actions via USB HID on a Raspberry Pi.
 
-    This backend will communicate with a Raspberry Pi configured as a
-    USB HID gadget, sending keyboard scan codes that appear as real
-    keyboard input to the connected machine.
+    Wraps HidWriter to conform to the KeyboardOutput ABC, so the agent
+    loop can swap between HTTP and USB HID backends transparently.
 
-    NOTE: This is a placeholder. Full implementation requires:
-        - Raspberry Pi with USB OTG support (Pi Zero, Pi 4, etc.)
-        - Configured USB HID gadget mode (/dev/hidg0)
-        - USB HID scan code mapping
-        - Serial or network connection to the Pi
-
-    TODO: Full implementation roadmap:
-        1. Decide on communication protocol (serial, SSH, local socket)
-        2. Implement USB HID report descriptor building
-        3. Map key names to USB HID scan codes
-        4. Handle modifier key state management
-        5. Implement timing for key press/release cycles
-        6. Add error recovery for disconnected USB
+    Requires:
+        - Raspberry Pi with USB OTG (Pi Zero, Pi 4, etc.)
+        - USB HID gadget configured (run scripts/setup_usb_gadget.sh)
+        - /dev/hidg0 device present and writable
     """
 
     def __init__(
         self,
         device_path: str = "/dev/hidg0",
-        host: str | None = None,
+        keypress_delay: float = 0.02,
+        inter_char_delay: float = 0.01,
     ) -> None:
-        """Initialize the USB HID backend.
-
-        Args:
-            device_path: Path to the HID gadget device on the Pi.
-            host: If controlling the Pi remotely, the SSH host.
-                  If None, assumes running directly on the Pi.
-        """
-        self._device_path = device_path
-        self._host = host
-
-    async def connect(self) -> None:
-        """Open the USB HID device.
-
-        TODO: Implement when hardware is available.
-        """
-        raise NotImplementedError(
-            "USB HID backend is not yet implemented. "
-            "Use HttpKeyboardOutput for development."
+        self._writer = HidWriter(
+            device_path=device_path,
+            keypress_delay=keypress_delay,
+            inter_char_delay=inter_char_delay,
         )
 
-    async def disconnect(self) -> None:
-        """Close the USB HID device.
+    async def connect(self) -> None:
+        """Open the USB HID gadget device."""
+        try:
+            await self._writer.open()
+            logger.info("Connected to USB HID device")
+        except HidWriteError as e:
+            raise KeyboardOutputError(str(e), backend="usb_hid") from e
 
-        TODO: Implement when hardware is available.
-        """
-        raise NotImplementedError("USB HID backend is not yet implemented.")
+    async def disconnect(self) -> None:
+        """Close the USB HID gadget device."""
+        await self._writer.close()
+        logger.info("Disconnected from USB HID device")
 
     async def send_keystroke(self, key: str) -> None:
-        """Send a keystroke via USB HID report.
-
-        TODO: Implement USB HID scan code lookup and report sending.
-        """
-        raise NotImplementedError("USB HID backend is not yet implemented.")
+        """Send a keystroke via USB HID report."""
+        try:
+            await self._writer.send_keystroke(key)
+        except (ValueError, HidWriteError) as e:
+            raise KeyboardOutputError(
+                f"Failed to send keystroke '{key}': {e}", backend="usb_hid"
+            ) from e
 
     async def send_key_combo(self, modifiers: list[str], key: str) -> None:
-        """Send a key combination via USB HID report.
-
-        TODO: Implement modifier bitmask + scan code in a single report.
-        """
-        raise NotImplementedError("USB HID backend is not yet implemented.")
+        """Send a key combination via USB HID report."""
+        try:
+            await self._writer.send_key_combo(modifiers, key)
+        except (ValueError, HidWriteError) as e:
+            raise KeyboardOutputError(
+                f"Failed to send combo {'+'.join(modifiers)}+{key}: {e}",
+                backend="usb_hid",
+            ) from e
 
     async def send_text(self, text: str) -> None:
-        """Send text via sequential USB HID keystroke reports.
-
-        TODO: Implement character-to-scan-code mapping and sequential sending.
-        """
-        raise NotImplementedError("USB HID backend is not yet implemented.")
+        """Type text character by character via USB HID reports."""
+        try:
+            await self._writer.send_text(text)
+        except (ValueError, HidWriteError) as e:
+            raise KeyboardOutputError(
+                f"Failed to send text: {e}", backend="usb_hid"
+            ) from e

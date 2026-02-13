@@ -168,18 +168,85 @@ Status legend:
   - [ ] Error wrapping in KeyboardOutputError
   - [ ] Integration test with running endpoint
 
-### TICK-032: USB HID Keyboard Backend (Future)
-- **Status:** SCAFFOLDED
-- **Priority:** LOW
+### TICK-032: USB HID Keyboard Backend
+- **Status:** COMPLETE
+- **Priority:** HIGH
 - **File:** `src/terminaleyes/keyboard/usb_hid_backend.py`
-- **Dependencies:** TICK-030, physical Raspberry Pi hardware
-- **Description:** Placeholder for future hardware integration.
+- **Dependencies:** TICK-030, TICK-033
+- **Description:** Wraps HidWriter to implement KeyboardOutput ABC for direct Pi usage.
 - **Acceptance Criteria:**
-  - [ ] USB HID scan code mapping
-  - [ ] Report descriptor building
-  - [ ] Pi communication protocol decided
-  - [ ] Key press/release timing
-  - [ ] Integration test with hardware (manual)
+  - [x] USB HID scan code mapping (raspi/hid_codes.py)
+  - [x] Report descriptor building (scripts/setup_usb_gadget.sh)
+  - [x] Pi communication protocol: REST API (raspi/server.py) or direct HID writes
+  - [x] Key press/release timing with configurable delays
+  - [x] Unit tests (test_usb_hid_backend.py)
+  - [ ] Integration test with hardware (manual, pending Pi arrival)
+
+### TICK-033: Raspberry Pi HID Scan Code Mapping
+- **Status:** COMPLETE
+- **Priority:** HIGH
+- **File:** `src/terminaleyes/raspi/hid_codes.py`
+- **Dependencies:** None
+- **Description:** Full USB HID Usage Table mapping: key names to scan codes, character-to-HID conversion, modifier bitmasks, shifted character handling (US layout).
+- **Acceptance Criteria:**
+  - [x] KEY_CODES dict: a-z, 0-9, F1-F12, arrows, nav, punctuation
+  - [x] MODIFIER_MAP: ctrl/shift/alt/meta with left/right variants
+  - [x] SHIFT_CHARS: uppercase letters + shifted symbols
+  - [x] char_to_hid() returns (modifier, scan_code) for any printable char
+  - [x] key_name_to_hid() resolves named keys
+  - [x] modifiers_to_bitmask() combines modifier names
+  - [x] 24 unit tests passing
+
+### TICK-034: HID Report Writer
+- **Status:** COMPLETE
+- **Priority:** HIGH
+- **File:** `src/terminaleyes/raspi/hid_writer.py`
+- **Dependencies:** TICK-033
+- **Description:** Async writer that opens /dev/hidg0 and sends 8-byte USB HID keyboard reports. Handles press/release timing, text typing, key combos.
+- **Acceptance Criteria:**
+  - [x] open()/close() manage file descriptor via asyncio executor
+  - [x] press_key() writes 8-byte report with modifier + scan code
+  - [x] release_keys() writes all-zeros report
+  - [x] tap_key() does press + delay + release
+  - [x] send_keystroke/send_key_combo/send_text high-level methods
+  - [x] Async context manager support
+  - [x] Configurable keypress_delay and inter_char_delay
+  - [x] 16 unit tests passing (mocked /dev/hidg0)
+  - [ ] Integration test with hardware (manual, pending Pi arrival)
+
+### TICK-035: Pi REST API Server
+- **Status:** COMPLETE
+- **Priority:** HIGH
+- **File:** `src/terminaleyes/raspi/server.py`
+- **Dependencies:** TICK-034
+- **Description:** FastAPI server running on the Pi that accepts keyboard commands over HTTP and routes them to HidWriter. Same API contract as endpoint/server.py so HttpKeyboardOutput works unchanged.
+- **Acceptance Criteria:**
+  - [x] GET /health returns HID device status
+  - [x] POST /keystroke sends key via HID
+  - [x] POST /key-combo sends modifier+key via HID
+  - [x] POST /text types text character by character via HID
+  - [x] Error handling returns 400 for bad keys/modifiers
+  - [x] Application factory with injectable writer for testing
+  - [x] Lifespan manages HidWriter open/close
+  - [x] `terminaleyes-pi` entry point in pyproject.toml
+  - [x] 8 unit tests passing
+  - [ ] Integration test with hardware (manual, pending Pi arrival)
+
+### TICK-036: USB Gadget Setup Script
+- **Status:** COMPLETE
+- **Priority:** HIGH
+- **File:** `scripts/setup_usb_gadget.sh`
+- **Dependencies:** None (run on Pi hardware)
+- **Description:** Shell script that configures Pi Zero USB OTG as HID keyboard gadget via Linux ConfigFS. Creates /dev/hidg0 with standard boot keyboard report descriptor.
+- **Acceptance Criteria:**
+  - [x] Loads libcomposite kernel module
+  - [x] Creates gadget under /sys/kernel/config/usb_gadget/
+  - [x] Sets USB device descriptor (vendor, product, serial)
+  - [x] Writes HID report descriptor (8-byte boot keyboard)
+  - [x] Binds to UDC (USB Device Controller)
+  - [x] Teardown mode to cleanly remove gadget
+  - [x] Error handling for missing dwc2/libcomposite
+  - [ ] Test on actual Pi hardware (pending arrival)
 
 ---
 
