@@ -1,8 +1,10 @@
-"""Low-level USB HID report writer for /dev/hidg0.
+"""Low-level USB HID report writers for /dev/hidg0 (keyboard) and /dev/hidg1 (mouse).
 
-Writes 8-byte HID keyboard reports to the Linux USB gadget device.
-Each report represents the current state of the keyboard:
+Keyboard (/dev/hidg0): 8-byte reports
     [modifier, 0x00, key1, key2, key3, key4, key5, key6]
+
+Mouse (/dev/hidg1): 4-byte reports
+    [buttons, x_delta, y_delta, wheel]
 
 A key press is sent by writing a report with the key, then a release
 is sent by writing an all-zeros report.
@@ -12,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import struct
+from enum import IntFlag
 from pathlib import Path
 
 from terminaleyes.raspi.hid_codes import (
@@ -167,6 +171,144 @@ class HidWriter:
         logger.debug("Sent text: %s", text[:50])
 
     async def __aenter__(self) -> HidWriter:
+        await self.open()
+        return self
+
+    async def __aexit__(self, exc_type: type | None, exc_val: Exception | None, exc_tb: object) -> None:
+        await self.close()
+
+
+# ---------------------------------------------------------------------------
+# Mouse HID writer (/dev/hidg1)
+# ---------------------------------------------------------------------------
+
+class MouseButton(IntFlag):
+    """Mouse button bitmask for the HID report."""
+    NONE = 0x00
+    LEFT = 0x01
+    RIGHT = 0x02
+    MIDDLE = 0x04
+
+
+BUTTON_MAP: dict[str, MouseButton] = {
+    "left": MouseButton.LEFT,
+    "right": MouseButton.RIGHT,
+    "middle": MouseButton.MIDDLE,
+}
+
+# 4-byte empty report = all buttons released, no movement
+MOUSE_RELEASE_REPORT = b"\x00" * 4
+
+
+def _clamp(value: int, minimum: int = -127, maximum: int = 127) -> int:
+    return max(minimum, min(maximum, value))
+
+
+class MouseHidWriter:
+    """Writes USB HID mouse reports to /dev/hidg1.
+
+    4-byte reports: [buttons, x_delta, y_delta, wheel]
+
+    Usage::
+
+        writer = MouseHidWriter()
+        await writer.open()
+        await writer.move(10, -5)
+        await writer.click("left")
+        await writer.scroll(-3)
+        await writer.close()
+    """
+
+    def __init__(self, device_path: str = "/dev/hidg1") -> None:
+        self._device_path = Path(device_path)
+        self._fd: int | None = None
+        self._buttons: int = 0
+
+    @property
+    def is_open(self) -> bool:
+        return self._fd is not None
+
+    async def open(self) -> None:
+        """Open the HID gadget device for writing."""
+        import os
+
+        try:
+            loop = asyncio.get_running_loop()
+            self._fd = await loop.run_in_executor(
+                None, lambda: os.open(str(self._device_path), os.O_WRONLY)
+            )
+            logger.info("Opened mouse HID device: %s", self._device_path)
+        except OSError as e:
+            raise HidWriteError(
+                f"Cannot open mouse HID device {self._device_path}: {e}"
+            ) from e
+
+    async def close(self) -> None:
+        """Release all buttons and close the device."""
+        import os
+
+        if self._fd is not None:
+            try:
+                self._buttons = 0
+                await self._write_report(MOUSE_RELEASE_REPORT)
+            except HidWriteError:
+                pass
+            try:
+                loop = asyncio.get_running_loop()
+                fd = self._fd
+                await loop.run_in_executor(None, lambda: os.close(fd))
+            except OSError:
+                pass
+            self._fd = None
+            logger.info("Closed mouse HID device")
+
+    async def _write_report(self, report: bytes) -> None:
+        """Write a 4-byte HID mouse report to the device."""
+        import os
+
+        if self._fd is None:
+            raise HidWriteError("Mouse HID device not open")
+        if len(report) != 4:
+            raise HidWriteError(f"Mouse HID report must be 4 bytes, got {len(report)}")
+        try:
+            loop = asyncio.get_running_loop()
+            fd = self._fd
+            await loop.run_in_executor(None, lambda: os.write(fd, report))
+        except OSError as e:
+            raise HidWriteError(f"Failed to write mouse HID report: {e}") from e
+
+    async def move(self, x: int, y: int) -> None:
+        """Move the mouse cursor by (x, y) relative pixels."""
+        x = _clamp(x)
+        y = _clamp(y)
+        report = struct.pack("BbbB", self._buttons, x, y, 0)
+        await self._write_report(report)
+        logger.debug("Mouse move: dx=%d dy=%d", x, y)
+
+    async def click(self, button: str = "left") -> None:
+        """Click a mouse button (press and release)."""
+        btn = BUTTON_MAP.get(button.lower())
+        if btn is None:
+            raise ValueError(f"Unknown button: {button!r}. Use: left, right, middle")
+        # Press
+        self._buttons |= btn
+        report = struct.pack("BbbB", self._buttons, 0, 0, 0)
+        await self._write_report(report)
+        await asyncio.sleep(0.05)
+        # Release
+        self._buttons &= ~btn
+        report = struct.pack("BbbB", self._buttons, 0, 0, 0)
+        await self._write_report(report)
+        logger.debug("Mouse click: %s", button)
+
+    async def scroll(self, amount: int) -> None:
+        """Scroll the mouse wheel. Positive=up, negative=down."""
+        amount = _clamp(amount)
+        report = struct.pack("Bbb b", self._buttons, 0, 0, amount)
+        await self._write_report(report)
+        logger.debug("Mouse scroll: %d", amount)
+
+    async def __aenter__(self) -> MouseHidWriter:
         await self.open()
         return self
 

@@ -9,9 +9,11 @@ import pytest
 from terminaleyes.raspi.hid_writer import (
     DEFAULT_INTER_CHAR_DELAY,
     DEFAULT_KEYPRESS_DELAY,
+    MOUSE_RELEASE_REPORT,
     RELEASE_REPORT,
     HidWriteError,
     HidWriter,
+    MouseHidWriter,
 )
 
 
@@ -163,6 +165,168 @@ class TestHidWriterContextManager:
     async def test_context_manager(self) -> None:
         w = HidWriter()
         with patch("os.open", return_value=42), \
+             patch("os.write"), \
+             patch("os.close"):
+            async with w:
+                assert w.is_open
+            assert not w.is_open
+
+
+# ===================================================================
+# MouseHidWriter tests
+# ===================================================================
+
+@pytest.fixture
+def mouse_writer() -> MouseHidWriter:
+    return MouseHidWriter(device_path="/dev/hidg1")
+
+
+class TestMouseHidWriterInit:
+    def test_defaults(self, mouse_writer: MouseHidWriter) -> None:
+        assert str(mouse_writer._device_path) == "/dev/hidg1"
+        assert not mouse_writer.is_open
+        assert mouse_writer._buttons == 0
+
+    def test_custom_device_path(self) -> None:
+        w = MouseHidWriter(device_path="/dev/hidg5")
+        assert str(w._device_path) == "/dev/hidg5"
+
+
+class TestMouseHidWriterOpen:
+    @pytest.mark.asyncio
+    async def test_open_sets_fd(self) -> None:
+        w = MouseHidWriter()
+        with patch("os.open", return_value=99):
+            await w.open()
+        assert w._fd == 99
+        assert w.is_open
+        w._fd = None
+
+    @pytest.mark.asyncio
+    async def test_open_failure_raises(self) -> None:
+        w = MouseHidWriter(device_path="/dev/nonexistent")
+        with patch("os.open", side_effect=OSError("No such device")):
+            with pytest.raises(HidWriteError, match="Cannot open mouse"):
+                await w.open()
+        assert not w.is_open
+
+
+class TestMouseHidWriterWrite:
+    @pytest.mark.asyncio
+    async def test_write_report(self) -> None:
+        w = MouseHidWriter()
+        w._fd = 99
+        with patch("os.write") as mock_write:
+            await w._write_report(b"\x00" * 4)
+            mock_write.assert_called_once_with(99, b"\x00" * 4)
+
+    @pytest.mark.asyncio
+    async def test_write_report_wrong_length(self) -> None:
+        w = MouseHidWriter()
+        w._fd = 99
+        with pytest.raises(HidWriteError, match="must be 4 bytes"):
+            await w._write_report(b"\x00" * 8)
+
+    @pytest.mark.asyncio
+    async def test_write_report_not_open(self) -> None:
+        w = MouseHidWriter()
+        with pytest.raises(HidWriteError, match="not open"):
+            await w._write_report(b"\x00" * 4)
+
+    @pytest.mark.asyncio
+    async def test_write_os_error(self) -> None:
+        w = MouseHidWriter()
+        w._fd = 99
+        with patch("os.write", side_effect=OSError("I/O error")):
+            with pytest.raises(HidWriteError, match="Failed to write"):
+                await w._write_report(b"\x00" * 4)
+
+
+class TestMouseHidWriterMove:
+    @pytest.mark.asyncio
+    async def test_move(self) -> None:
+        w = MouseHidWriter()
+        w._fd = 99
+        reports: list[bytes] = []
+        with patch("os.write", side_effect=lambda fd, data: reports.append(data)):
+            await w.move(10, -5)
+        assert len(reports) == 1
+        # [buttons=0, x=10, y=-5, wheel=0]
+        assert reports[0] == b"\x00\x0a\xfb\x00"
+
+    @pytest.mark.asyncio
+    async def test_move_clamps(self) -> None:
+        w = MouseHidWriter()
+        w._fd = 99
+        reports: list[bytes] = []
+        with patch("os.write", side_effect=lambda fd, data: reports.append(data)):
+            await w.move(200, -200)
+        assert len(reports) == 1
+        # Clamped to 127 and -127
+        assert reports[0] == b"\x00\x7f\x81\x00"
+
+
+class TestMouseHidWriterClick:
+    @pytest.mark.asyncio
+    async def test_click_left(self) -> None:
+        w = MouseHidWriter()
+        w._fd = 99
+        reports: list[bytes] = []
+        with patch("os.write", side_effect=lambda fd, data: reports.append(data)):
+            await w.click("left")
+        assert len(reports) == 2
+        # Press: buttons=LEFT(0x01)
+        assert reports[0][0] == 0x01
+        # Release: buttons=0
+        assert reports[1][0] == 0x00
+
+    @pytest.mark.asyncio
+    async def test_click_right(self) -> None:
+        w = MouseHidWriter()
+        w._fd = 99
+        reports: list[bytes] = []
+        with patch("os.write", side_effect=lambda fd, data: reports.append(data)):
+            await w.click("right")
+        assert len(reports) == 2
+        assert reports[0][0] == 0x02
+
+    @pytest.mark.asyncio
+    async def test_click_unknown_button(self) -> None:
+        w = MouseHidWriter()
+        w._fd = 99
+        with pytest.raises(ValueError, match="Unknown button"):
+            await w.click("banana")
+
+
+class TestMouseHidWriterScroll:
+    @pytest.mark.asyncio
+    async def test_scroll(self) -> None:
+        w = MouseHidWriter()
+        w._fd = 99
+        reports: list[bytes] = []
+        with patch("os.write", side_effect=lambda fd, data: reports.append(data)):
+            await w.scroll(-3)
+        assert len(reports) == 1
+        # [buttons=0, x=0, y=0, wheel=-3]
+        assert reports[0] == b"\x00\x00\x00\xfd"
+
+    @pytest.mark.asyncio
+    async def test_scroll_clamps(self) -> None:
+        w = MouseHidWriter()
+        w._fd = 99
+        reports: list[bytes] = []
+        with patch("os.write", side_effect=lambda fd, data: reports.append(data)):
+            await w.scroll(200)
+        assert len(reports) == 1
+        # Clamped to 127
+        assert reports[0] == b"\x00\x00\x00\x7f"
+
+
+class TestMouseHidWriterContextManager:
+    @pytest.mark.asyncio
+    async def test_context_manager(self) -> None:
+        w = MouseHidWriter()
+        with patch("os.open", return_value=99), \
              patch("os.write"), \
              patch("os.close"):
             async with w:

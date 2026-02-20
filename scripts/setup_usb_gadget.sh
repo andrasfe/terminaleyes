@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# setup_usb_gadget.sh — Configure Raspberry Pi Zero as a USB HID keyboard gadget.
+# setup_usb_gadget.sh — Configure Raspberry Pi Zero as a USB HID keyboard+mouse gadget.
 #
 # This script uses Linux USB ConfigFS to set up the Pi as a composite
-# USB device that presents itself as a standard keyboard to whatever
-# machine the Pi's USB data port is plugged into.
+# USB device that presents itself as a standard keyboard and mouse to
+# whatever machine the Pi's USB data port is plugged into.
 #
 # Prerequisites:
 #   - Raspberry Pi Zero (W/2W) or Pi 4 with USB OTG support
@@ -14,7 +14,7 @@
 #   sudo bash scripts/setup_usb_gadget.sh          # set up
 #   sudo bash scripts/setup_usb_gadget.sh teardown  # tear down
 #
-# After setup, the HID device is available at /dev/hidg0.
+# After setup, the HID devices are available at /dev/hidg0 (keyboard) and /dev/hidg1 (mouse).
 
 set -euo pipefail
 
@@ -23,7 +23,7 @@ UDC_PATH="/sys/class/udc"
 
 # HID keyboard report descriptor (standard 8-byte boot keyboard)
 # Modifier byte + reserved + 6 key codes
-REPORT_DESCRIPTOR=$(printf '%b' \
+KEYBOARD_REPORT_DESCRIPTOR=$(printf '%b' \
     '\x05\x01' \
     '\x09\x06' \
     '\xa1\x01' \
@@ -48,16 +48,54 @@ REPORT_DESCRIPTOR=$(printf '%b' \
     '\x81\x00' \
     '\xc0')
 
+# HID mouse report descriptor (standard 4-byte boot mouse)
+# Buttons (3) + X delta + Y delta + wheel
+MOUSE_REPORT_DESCRIPTOR=$(printf '%b' \
+    '\x05\x01' \
+    '\x09\x02' \
+    '\xa1\x01' \
+    '\x09\x01' \
+    '\xa1\x00' \
+    '\x05\x09' \
+    '\x19\x01' \
+    '\x29\x03' \
+    '\x15\x00' \
+    '\x25\x01' \
+    '\x95\x03' \
+    '\x75\x01' \
+    '\x81\x02' \
+    '\x95\x01' \
+    '\x75\x05' \
+    '\x81\x01' \
+    '\x05\x01' \
+    '\x09\x30' \
+    '\x09\x31' \
+    '\x15\x81' \
+    '\x25\x7f' \
+    '\x75\x08' \
+    '\x95\x02' \
+    '\x81\x06' \
+    '\x09\x38' \
+    '\x15\x81' \
+    '\x25\x7f' \
+    '\x75\x08' \
+    '\x95\x01' \
+    '\x81\x06' \
+    '\xc0' \
+    '\xc0')
+
 teardown() {
     echo "Tearing down USB gadget..."
     if [ -d "$GADGET_DIR" ]; then
         # Disable the gadget
         echo "" > "$GADGET_DIR/UDC" 2>/dev/null || true
-        # Remove function from configuration
+        # Remove functions from configuration
+        rm -f "$GADGET_DIR/configs/c.1/hid.usb1" 2>/dev/null || true
         rm -f "$GADGET_DIR/configs/c.1/hid.usb0" 2>/dev/null || true
         # Remove strings
         rmdir "$GADGET_DIR/configs/c.1/strings/0x409" 2>/dev/null || true
         rmdir "$GADGET_DIR/configs/c.1" 2>/dev/null || true
+        rmdir "$GADGET_DIR/functions/hid.usb1" 2>/dev/null || true
         rmdir "$GADGET_DIR/functions/hid.usb0" 2>/dev/null || true
         rmdir "$GADGET_DIR/strings/0x409" 2>/dev/null || true
         rmdir "$GADGET_DIR" 2>/dev/null || true
@@ -80,16 +118,18 @@ setup() {
         teardown
     fi
 
-    # Load the required kernel module
-    modprobe libcomposite || {
-        echo "ERROR: Cannot load libcomposite. Ensure dwc2 overlay is enabled:" >&2
-        echo "  Add 'dtoverlay=dwc2' to /boot/config.txt" >&2
-        echo "  Add 'dwc2' to /etc/modules" >&2
-        echo "  Add 'libcomposite' to /etc/modules" >&2
-        exit 1
-    }
+    # Load the required kernel module (skip if already loaded)
+    if ! lsmod | grep -q libcomposite; then
+        /usr/sbin/modprobe libcomposite 2>/dev/null || modprobe libcomposite || {
+            echo "ERROR: Cannot load libcomposite. Ensure dwc2 overlay is enabled:" >&2
+            echo "  Add 'dtoverlay=dwc2' to /boot/config.txt" >&2
+            echo "  Add 'dwc2' to /etc/modules" >&2
+            echo "  Add 'libcomposite' to /etc/modules" >&2
+            exit 1
+        }
+    fi
 
-    echo "Creating USB HID keyboard gadget..."
+    echo "Creating USB HID keyboard+mouse gadget..."
 
     # Create the gadget
     mkdir -p "$GADGET_DIR"
@@ -104,11 +144,11 @@ setup() {
     mkdir -p "$GADGET_DIR/strings/0x409"
     echo "terminaleyes0001"   > "$GADGET_DIR/strings/0x409/serialnumber"
     echo "terminaleyes"       > "$GADGET_DIR/strings/0x409/manufacturer"
-    echo "Pi USB Keyboard"    > "$GADGET_DIR/strings/0x409/product"
+    echo "Pi USB Keyboard+Mouse" > "$GADGET_DIR/strings/0x409/product"
 
     # Configuration
     mkdir -p "$GADGET_DIR/configs/c.1/strings/0x409"
-    echo "Keyboard Configuration" > "$GADGET_DIR/configs/c.1/strings/0x409/configuration"
+    echo "Keyboard+Mouse Configuration" > "$GADGET_DIR/configs/c.1/strings/0x409/configuration"
     echo 250 > "$GADGET_DIR/configs/c.1/MaxPower"  # 250mA
 
     # HID function
@@ -116,10 +156,20 @@ setup() {
     echo 1   > "$GADGET_DIR/functions/hid.usb0/protocol"     # Keyboard
     echo 1   > "$GADGET_DIR/functions/hid.usb0/subclass"     # Boot interface
     echo 8   > "$GADGET_DIR/functions/hid.usb0/report_length"
-    echo -ne "$REPORT_DESCRIPTOR" > "$GADGET_DIR/functions/hid.usb0/report_desc"
+    echo -ne "$KEYBOARD_REPORT_DESCRIPTOR" > "$GADGET_DIR/functions/hid.usb0/report_desc"
 
-    # Link function to configuration
+    # Link keyboard function to configuration
     ln -s "$GADGET_DIR/functions/hid.usb0" "$GADGET_DIR/configs/c.1/"
+
+    # Mouse HID function
+    mkdir -p "$GADGET_DIR/functions/hid.usb1"
+    echo 2   > "$GADGET_DIR/functions/hid.usb1/protocol"     # Mouse
+    echo 1   > "$GADGET_DIR/functions/hid.usb1/subclass"     # Boot interface
+    echo 4   > "$GADGET_DIR/functions/hid.usb1/report_length"
+    echo -ne "$MOUSE_REPORT_DESCRIPTOR" > "$GADGET_DIR/functions/hid.usb1/report_desc"
+
+    # Link mouse function to configuration
+    ln -s "$GADGET_DIR/functions/hid.usb1" "$GADGET_DIR/configs/c.1/"
 
     # Enable the gadget by binding to the UDC (USB Device Controller)
     UDC=$(ls "$UDC_PATH" | head -1)
@@ -130,11 +180,12 @@ setup() {
     fi
     echo "$UDC" > "$GADGET_DIR/UDC"
 
-    echo "USB HID keyboard gadget enabled."
-    echo "  Device: /dev/hidg0"
-    echo "  UDC:    $UDC"
+    echo "USB HID keyboard+mouse gadget enabled."
+    echo "  Keyboard: /dev/hidg0"
+    echo "  Mouse:    /dev/hidg1"
+    echo "  UDC:      $UDC"
     echo ""
-    echo "The Pi now appears as a keyboard to the connected machine."
+    echo "The Pi now appears as a keyboard and mouse to the connected machine."
 }
 
 # ---------------------------------------------------------------------------
