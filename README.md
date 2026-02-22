@@ -18,7 +18,51 @@ Webcam --> MLLM Interpreter --> Agent Strategy --> Keyboard Output --> Terminal
 5. The action is sent via **HTTP** to the endpoint, which feeds it to the shell
 6. The display updates, and the loop repeats
 
-The HTTP endpoint is a temporary stand-in — the architecture is designed so the keyboard output can be swapped for a Raspberry Pi USB HID device to control physical machines.
+## Raspberry Pi Remote Keyboard
+
+The agent can control a physical machine via a Raspberry Pi Zero 2 W acting as a Bluetooth keyboard and mouse:
+
+```
+[Dev Mac / Agent] --USB Ethernet--> [Pi Zero 2 W] --BT HID--> [Target Mac]
+     10.0.0.1        (ECM)            10.0.0.2       (L2CAP)    keyboard+mouse
+```
+
+- **USB ECM Ethernet** connects the dev Mac to the Pi (no WiFi needed for the API)
+- **Bluetooth HID** sends keyboard and mouse events to the target Mac
+- The Pi's shared WiFi/BT radio is freed for Bluetooth since the API uses USB
+
+### Pi REST API endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Server + connection status |
+| POST | `/bt/keystroke` | BT keyboard key `{"key": "Enter"}` |
+| POST | `/bt/key-combo` | BT keyboard combo `{"modifiers": ["ctrl"], "key": "c"}` |
+| POST | `/bt/text` | BT keyboard text `{"text": "hello"}` |
+| POST | `/bt/mouse/move` | BT mouse move `{"x": 10, "y": -5}` |
+| POST | `/bt/mouse/click` | BT mouse click `{"button": "left"}` |
+| POST | `/bt/mouse/scroll` | BT mouse scroll `{"amount": -3}` |
+
+USB HID endpoints (`/keystroke`, `/text`, `/key-combo`, `/mouse/*`) are also available when using `hid` or `all` gadget mode.
+
+### Quick start (Pi)
+
+```bash
+# On the Pi (via SSH over USB ECM at 10.0.0.2):
+sudo bash scripts/setup_usb_gadget.sh ecm   # USB Ethernet gadget
+sudo bash scripts/setup_bt_hid.sh            # One-time BT HID config
+sudo bash scripts/radio_mode.sh bt           # Switch to Bluetooth mode
+sudo systemctl start terminaleyes-pi         # Start REST API
+
+# On dev Mac:
+curl http://10.0.0.2:8080/health
+
+# After pairing target Mac via Bluetooth Settings:
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"text":"hello from pi"}' http://10.0.0.2:8080/bt/text
+```
+
+See `CLAUDE.md` for detailed setup, debugging checklist, and troubleshooting.
 
 ## Installation
 
@@ -134,8 +178,11 @@ When the endpoint server is running:
 - **`src/terminaleyes/interpreter/`** — MLLM providers (OpenRouter/OpenAI-compatible)
 - **`src/terminaleyes/agent/`** — Agent loop and strategies
 - **`src/terminaleyes/endpoint/`** — HTTP server, PTY shell, pygame display
+- **`src/terminaleyes/keyboard/`** — Abstract keyboard interface + backends (HTTP, USB HID)
+- **`src/terminaleyes/raspi/`** — Pi-specific: HID codes, HID writer, BT HID, REST server
 - **`src/terminaleyes/config/`** — Settings from YAML + `.env`
 - **`src/terminaleyes/calibration.py`** — Camera-to-terminal calibration
+- **`scripts/`** — Pi deployment, USB gadget, BT HID setup, radio mode switching
 
 ## License
 
