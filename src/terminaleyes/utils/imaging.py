@@ -61,17 +61,15 @@ def enhance_for_ocr(image: np.ndarray) -> np.ndarray:
 
 
 def enhance_for_screen(image: np.ndarray) -> np.ndarray:
-    """Enhance a webcam photo of a screen for better MLLM interpretation.
+    """Light enhancement for webcam photos of screens.
 
-    Applies CLAHE + brightness boost to handle glare, reflections, and
-    dark webcam captures of monitors.
+    Only applies mild CLAHE to even out lighting differences.
+    No brightness/contrast boost — raw webcam images are usually fine.
     """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    # Boost brightness + contrast for dark webcam captures
-    return cv2.convertScaleAbs(enhanced, alpha=1.4, beta=25)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
 def resize_for_mllm(

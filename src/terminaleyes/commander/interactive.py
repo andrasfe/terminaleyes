@@ -178,8 +178,13 @@ class InteractiveSession:
         lower = user_input.lower().strip()
 
         # Click commands → go straight to ShowUI
+        if lower.startswith("click on "):
+            target = user_input[9:].strip()
+            await self._homing_click("left", target)
+            return True
+
         if lower.startswith("click "):
-            target = user_input[6:].strip()  # preserve original case
+            target = user_input[6:].strip()
             await self._homing_click("left", target)
             return True
 
@@ -369,101 +374,94 @@ class InteractiveSession:
         self, button: str, target_desc: str,
         gemma_fallback: tuple[float | None, float | None] = (None, None),
     ) -> None:
-        """Visual homing: ShowUI for target, frame-diff for cursor tracking.
+        """Visual homing: ShowUI for target, cached calibration for movement.
 
         1. ShowUI finds the target element (fast, ~0.1s)
-        2. Slam cursor off-screen, capture baseline frame
-        3. Probe with HID moves, use frame-diff to detect cursor position
-        4. Compute HID/pixel ratio from probe
-        5. Move to target, verify via frame-diff, correct until on target
+        2. Load calibration (interactive on first run, cached after)
+        3. Slam to corner (known 0,0), move calibrated distance to target
+        4. Click and save proof screenshot
         """
-        import cv2 as _cv2
-
-        PROBE_UNITS = 100
-        tolerance = 0.04  # 4% of screen
-        max_attempts = 15
+        from terminaleyes.commander.calibration import CalibrationResult, MouseCalibrator
 
         print(f"  Homing to: {target_desc}")
 
-        # Step 1: Find target with ShowUI
+        # Step 1: Find target with ShowUI — query 3 times and check consistency
         b64 = await self._capture_b64()
         showui_prompt = target_desc
         if not showui_prompt.lower().startswith("click"):
             showui_prompt = f"Click on {showui_prompt}"
-        target_pos = await self._showui_locate(b64, showui_prompt)
-        if target_pos is None:
-            # Fall back to gemma's coordinates if ShowUI can't find it
+
+        # Try ShowUI first (fast), fall back to gemma (accurate)
+        pos = await self._showui_locate(b64, showui_prompt)
+        if pos is not None:
+            tx, ty = pos
+            print(f"  ShowUI: target at ({tx:.1%}, {ty:.1%})")
+        else:
             gx, gy = gemma_fallback
             if gx is not None and gy is not None:
-                target_pos = (float(gx), float(gy))
-                print(f"  ShowUI miss — using gemma coordinates")
+                tx, ty = float(gx), float(gy)
+                print(f"  Using gemma coordinates ({tx:.1%}, {ty:.1%})")
             else:
-                print(f"  Target not found.")
-                return
+                print(f"  Asking gemma...")
+                gemma_pos = await self._ask_gemma_location(b64, target_desc)
+                if gemma_pos is not None:
+                    tx, ty = gemma_pos
+                    print(f"  Gemma: target at ({tx:.1%}, {ty:.1%})")
+                else:
+                    print(f"  Cannot find '{target_desc}'.")
+                    return
 
-        tx, ty = target_pos
-        print(f"  Target at ({tx:.1%}, {ty:.1%})")
+        # Step 2: Load or run calibration (cached to disk after first run)
+        cal = CalibrationResult.load()
+        if cal is None:
+            print(f"  No calibration found — running interactive calibration...")
+            calibrator = MouseCalibrator(mouse=self._executor._mouse)
+            cal = await calibrator.calibrate_or_load()
 
-        # Step 2: Slam cursor off-screen, capture baseline (no cursor visible)
-        print(f"  Calibrating...")
+        # Step 3: Slam to corner, move to target
+        print(f"  Slamming to corner...")
         for _ in range(200):
             await self._executor._mouse.move(-20, -20)
             await asyncio.sleep(0.001)
-        await asyncio.sleep(0.5)
-        baseline = await self._capture_gray()
-
-        # Step 3: Probe — send HID units, detect cursor via frame diff
-        await self._send_hid_moves(PROBE_UNITS, PROBE_UNITS)
         await asyncio.sleep(0.3)
-        after_probe = await self._capture_gray()
 
-        cursor_pct = self._find_cursor_by_diff(baseline, after_probe)
-        if cursor_pct is None:
-            # Cursor might still be off-screen. Try more units.
-            print(f"  Probe too small, trying 3x...")
-            await self._send_hid_moves(PROBE_UNITS * 2, PROBE_UNITS * 2)
-            await asyncio.sleep(0.3)
-            after_probe = await self._capture_gray()
-            cursor_pct = self._find_cursor_by_diff(baseline, after_probe)
-            probe_total = PROBE_UNITS * 3
-        else:
-            probe_total = PROBE_UNITS
-
-        if cursor_pct is None:
-            print(f"  Cannot detect cursor via frame diff — aborting.")
-            return
-
-        cx, cy = cursor_pct
-        print(f"  Cursor detected at ({cx:.1%}, {cy:.1%}) after {probe_total} HID")
-
-        hid_per_x = probe_total / cx if cx > 0.005 else 3000
-        hid_per_y = probe_total / cy if cy > 0.005 else 3000
-        print(f"  Ratio: {hid_per_x:.0f} H/width, {hid_per_y:.0f} H/height")
-
-        # Step 4: Single-shot move from probe position to target, then verify.
-        # Frame-diff is reliable for the initial probe (clean baseline with cursor
-        # off-screen) but UNRELIABLE during corrections (hover effects, UI updates
-        # create large diffs that drown out the cursor). So: one shot, then verify.
-        dx = tx - cx
-        dy = ty - cy
-        dx_hid = int(dx * hid_per_x)
-        dy_hid = int(dy * hid_per_y)
-        print(f"  Moving from ({cx:.0%},{cy:.0%}) to target ({tx:.0%},{ty:.0%}): ({dx_hid:+d},{dy_hid:+d}) HID")
+        dx_hid, dy_hid = cal.hid_units_for_pct(tx, ty)
+        print(f"  Moving to target: ({dx_hid}, {dy_hid}) HID  [cal: {cal.hid_units_per_full_x:.0f}x{cal.hid_units_per_full_y:.0f}]")
         await self._send_hid_moves(dx_hid, dy_hid)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
-        # Step 5: Save proof screenshot and click.
-        # We can't reliably verify cursor position (ShowUI can't find cursors,
-        # frame-diff is noisy). Be honest about uncertainty.
+        # Step 4: Verify cursor is on target before clicking.
+        # Ask ShowUI for target position again. If the target is still at the
+        # same spot, cursor missed (button still fully visible = cursor elsewhere).
+        # If target shifted or vanished, cursor is likely on/near it.
         import cv2 as _cv2
+        await asyncio.sleep(0.3)
+        b64_after = await self._capture_b64()
+        target_after = await self._showui_locate(b64_after, showui_prompt)
+
         frame = await self._capture.capture_frame()
         proof_path = "/tmp/cursor_on_target.png"
         _cv2.imwrite(proof_path, frame.image)
 
-        print(f"  Moved to estimated position. Clicking {button}.")
-        await self._executor._mouse.click(button)
-        print(f"  Screenshot: {proof_path}")
-        print("  Done.")
+        if target_after is None:
+            # Target vanished — cursor likely covering it
+            print(f"  Target no longer visible — cursor likely on it. Clicking {button}.")
+            await self._executor._mouse.click(button)
+            print(f"  Screenshot: {proof_path}")
+            return
+
+        ax, ay = target_after
+        shift = ((ax - tx) ** 2 + (ay - ty) ** 2) ** 0.5
+
+        if shift > 0.08:
+            # Target position shifted significantly — cursor is interfering
+            print(f"  Target shifted ({tx:.0%},{ty:.0%})→({ax:.0%},{ay:.0%}). Cursor likely near it. Clicking {button}.")
+            await self._executor._mouse.click(button)
+            print(f"  Screenshot: {proof_path}")
+        else:
+            # Target still at same position — cursor is NOT on it
+            print(f"  Target still at ({ax:.0%},{ay:.0%}) — cursor missed. NOT clicking.")
+            print(f"  Screenshot: {proof_path}")
 
     @staticmethod
     def _find_cursor_by_diff(
@@ -520,6 +518,52 @@ class InteractiveSession:
         import cv2 as _cv2
         frame = await self._capture.capture_frame()
         return _cv2.cvtColor(frame.image, _cv2.COLOR_BGR2GRAY)
+
+    async def _ask_gemma_location(self, b64_image: str, target_desc: str) -> tuple[float, float] | None:
+        """Ask gemma for element coordinates. Slower but more accurate than ShowUI."""
+        await self._ensure_client()
+
+        prompt = f"""Find this element on the screen: {target_desc}
+
+Reply with ONLY a JSON object:
+{{"x": 0.0 to 1.0, "y": 0.0 to 1.0}}
+
+Where x=0 is the left edge, x=1 is the right edge, y=0 is the top, y=1 is the bottom.
+If the element is not visible, reply: {{"not_found": true}}"""
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ]
+
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                max_tokens=512,
+                messages=messages,
+            )
+            raw = self._evaluator._best_text_from_response(response)
+            if not raw:
+                return None
+
+            data = self._evaluator._extract_json(raw)
+            if data is None or data.get("not_found"):
+                return None
+
+            x = data.get("x") or data.get("location_x_pct")
+            y = data.get("y") or data.get("location_y_pct")
+            if x is not None and y is not None:
+                return (float(x), float(y))
+            return None
+
+        except Exception as e:
+            logger.error("Gemma location query failed: %s", e)
+            return None
 
     async def _capture_b64(self) -> str:
         """Capture, enhance, resize, encode — one-liner helper."""

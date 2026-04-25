@@ -54,6 +54,13 @@ class WebcamCapture(CaptureSource):
         self._is_open = True
         actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Read several frames to let autofocus settle
+        import time
+        for _ in range(20):
+            await loop.run_in_executor(None, self._cap.read)
+            await asyncio.sleep(0.03)
+
         logger.info(
             "Opened webcam device %d (%dx%d)",
             self._device_index, actual_w, actual_h,
