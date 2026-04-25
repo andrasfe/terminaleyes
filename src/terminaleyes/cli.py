@@ -61,9 +61,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Show results without saving to config",
     )
 
-    subparsers.add_parser(
+    interact_parser = subparsers.add_parser(
         "interact",
         help="Interactive visual control — ask questions and give commands via REPL",
+    )
+    interact_parser.add_argument(
+        "--screen-check", action="store_true",
+        help="Run initial screen visibility check (skipped by default)",
+    )
+    interact_parser.add_argument(
+        "--skip-calibration", action="store_true",
+        help="Skip mouse calibration (use saved values)",
+    )
+    interact_parser.add_argument(
+        "-m", "--message", type=str, default=None,
+        help='Execute a single command then exit (e.g. -m "click the Run button")',
     )
 
     command_parser = subparsers.add_parser(
@@ -416,7 +428,7 @@ def main(argv: list[str] | None = None) -> None:
 
     elif args.command == "interact":
         logger.info("Starting interactive visual commander")
-        asyncio.run(_run_interact(settings))
+        asyncio.run(_run_interact(settings, args))
 
     elif args.command == "command":
         logger.info("Starting visual command agent")
@@ -431,7 +443,7 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_calibrate(settings, save=not args.no_save))
 
 
-async def _run_interact(settings) -> None:
+async def _run_interact(settings, args=None) -> None:
     """Run the interactive visual commander REPL."""
     from terminaleyes.capture.webcam import WebcamCapture
     from terminaleyes.commander.evaluator import ConditionEvaluator
@@ -503,6 +515,9 @@ async def _run_interact(settings) -> None:
         max_tokens=cfg.lmstudio_max_tokens,
         vision_model=cfg.lmstudio_vision_model,
         vision_base_url=cfg.vision_base_url,
+        skip_screen_check=not getattr(args, 'screen_check', False),
+        force_calibration=not getattr(args, 'skip_calibration', False),
+        single_message=getattr(args, 'message', None),
     )
 
     try:

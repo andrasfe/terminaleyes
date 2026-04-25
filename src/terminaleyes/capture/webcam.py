@@ -61,6 +61,10 @@ class WebcamCapture(CaptureSource):
             await loop.run_in_executor(None, self._cap.read)
             await asyncio.sleep(0.03)
 
+        # Photo Booth mirrors for preview, but OpenCV gets raw data.
+        # Set via config if your specific webcam returns mirrored images.
+        self._mirror = False
+
         logger.info(
             "Opened webcam device %d (%dx%d)",
             self._device_index, actual_w, actual_h,
@@ -96,6 +100,9 @@ class WebcamCapture(CaptureSource):
         ret, frame = self._cap.read()
         if not ret or frame is None:
             raise CaptureError("Failed to read frame from webcam")
+        # Flip horizontally — webcams return mirrored images
+        if getattr(self, '_mirror', False):
+            frame = cv2.flip(frame, 1)
         return frame
 
     def _apply_crop(self, frame: np.ndarray) -> np.ndarray:

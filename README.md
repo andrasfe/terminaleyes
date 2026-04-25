@@ -120,6 +120,70 @@ Key settings for reliable MLLM reading:
 - **Few rows/cols** (10x25) — auto-scales font to ~126px, easily readable through camera
 - **Fullscreen** — maximizes text size on display
 
+## Interactive Visual Commander
+
+Control a remote screen interactively via webcam + MLLM. Point the webcam at a monitor, and type commands or ask questions:
+
+```bash
+# Interactive REPL
+terminaleyes interact
+
+# Single command
+terminaleyes interact -m "click the Run button at the bottom right"
+
+# Skip calibration (use saved values)
+terminaleyes interact --skip-calibration -m "click the Review button"
+```
+
+The interactive session uses a dual-model architecture:
+- **Gemma 4 31B** (LM Studio) — reasoning, screen description, element location
+- **ShowUI-2B** (llama.cpp) — fast UI element coordinate grounding (~0.1s/query)
+
+### How clicking works
+
+1. **Find target**: ShowUI locates the element (fast). Falls back to gemma if ShowUI fails.
+2. **Map coordinates**: Detects screen edges in the webcam image to map image coordinates → screen coordinates.
+3. **Calibrate**: Interactive calibration measures HID-unit-to-pixel ratio (done once, cached to `~/.terminaleyes/calibration.json`).
+4. **Move cursor**: Slam to corner (known 0,0), then calibrated HID moves to target position.
+5. **Verify**: Re-queries ShowUI — if target still visible at same position, cursor missed → correct and retry. If target vanished, cursor is covering it → click.
+
+### Prerequisites
+
+- **llama.cpp** with ShowUI-2B for fast grounding:
+  ```bash
+  brew install llama.cpp
+  llama-server \
+    --hf-repo localattention/ShowUI-2B-Q4_K_M-GGUF \
+    --hf-file showui-2b-q4_k_m.gguf \
+    --mmproj <path-to-mmproj-Qwen2-VL-2B-Instruct-f16.gguf> \
+    -c 4096 --port 1235
+  ```
+- **LM Studio** with `google/gemma-4-31b` loaded on port 1234
+- **Raspberry Pi** connected via USB ECM + Bluetooth HID
+
+### Example session
+
+```
+> what do you see?
+The screen shows VS Code with a Python file open. There's a terminal
+panel at the bottom and an agent panel on the right side.
+
+> click the Review button
+  Homing to: the Review button
+  ShowUI: image (88%,42%) → screen (90%,42%)
+  Moving to target: (340, 420) HID
+  [1] Target vanished — clicking left.
+  Screenshot: /tmp/cursor_on_target.png
+
+> type hello world
+  Typing: hello world
+  Done.
+
+> press Enter
+  Pressing Enter
+  Done.
+```
+
 ## Usage
 
 ### Start the endpoint (terminal + display)
@@ -180,6 +244,8 @@ When the endpoint server is running:
 - **`src/terminaleyes/endpoint/`** — HTTP server, PTY shell, pygame display
 - **`src/terminaleyes/keyboard/`** — Abstract keyboard interface + backends (HTTP, USB HID)
 - **`src/terminaleyes/raspi/`** — Pi-specific: HID codes, HID writer, BT HID, REST server
+- **`src/terminaleyes/commander/`** — Interactive visual commander (REPL, homing, calibration)
+- **`src/terminaleyes/mouse/`** — Abstract mouse interface + HTTP backend (BT/USB transport)
 - **`src/terminaleyes/config/`** — Settings from YAML + `.env`
 - **`src/terminaleyes/calibration.py`** — Camera-to-terminal calibration
 - **`scripts/`** — Pi deployment, USB gadget, BT HID setup, radio mode switching

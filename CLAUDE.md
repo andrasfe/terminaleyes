@@ -31,6 +31,8 @@ terminaleyes — vision-based agentic terminal controller. Webcam captures a ter
 
 ## Key directories
 
+- `src/terminaleyes/commander/` — Interactive visual commander (REPL, ShowUI grounding, homing, calibration)
+- `src/terminaleyes/mouse/` — Abstract mouse interface + HTTP backend (BT/USB transport)
 - `src/terminaleyes/raspi/` — Pi-specific: HID codes, HID writer, REST server
 - `src/terminaleyes/keyboard/` — Abstract keyboard interface + backends (HTTP, USB HID)
 - `src/terminaleyes/endpoint/` — Local dev endpoint (shell + pygame display)
@@ -47,7 +49,39 @@ pip install -e ".[dev]"                    # install
 python -m pytest tests/ -v                 # run all tests
 python -m pytest tests/unit/test_raspi/ -v # run raspi tests only
 terminaleyes-pi                            # start Pi REST API server
+terminaleyes interact                      # interactive visual commander REPL
+terminaleyes interact -m "click X"         # single command mode
+terminaleyes interact --skip-calibration   # skip mouse calibration
+terminaleyes interact --screen-check       # enable screen visibility check
 ```
+
+## Interactive Visual Commander
+
+### Dual-model architecture
+- **gemma-4-31b** on LM Studio (port 1234) — reasoning, questions, element location fallback
+- **ShowUI-2B** on llama.cpp (port 1235) — fast UI element coordinate grounding (~0.1s)
+
+### Clicking pipeline
+1. ShowUI finds target → map image coords to screen coords (accounting for bezel)
+2. Slam cursor to corner (known 0,0) → send calibrated HID units to target
+3. Verify: re-query ShowUI. Target vanished → click. Target still there → correct and retry (up to 5x)
+4. Only clicks when verified
+
+### Mouse calibration
+- Interactive: user watches target screen, presses Enter when cursor hits edge
+- Saved to `~/.terminaleyes/calibration.json`, re-run forced by default on each session
+- `--skip-calibration` to reuse saved values
+
+### ShowUI llama.cpp server
+```bash
+brew install llama.cpp
+llama-server \
+  --hf-repo localattention/ShowUI-2B-Q4_K_M-GGUF \
+  --hf-file showui-2b-q4_k_m.gguf \
+  --mmproj <mmproj-Qwen2-VL-2B-Instruct-f16.gguf> \
+  -c 4096 --port 1235
+```
+Note: do NOT use `--image-min-tokens` — it breaks ShowUI output.
 
 ## Pi setup sequence
 
@@ -182,3 +216,6 @@ If BT HID stops working, check in this order:
 - Integration tests for REST API end-to-end with target machine
 - Make bt-agent.service restart-proof (currently needs manual restart if bluetooth restarts)
 - Pi 4 migration: dual-band WiFi + separate BT chip (no radio mode switching needed)
+- Loopy-style self-improving calibration (accumulate click observations to refine HID ratio)
+- Better cursor tracking (template matching for macOS cursor arrow)
+- Webcam mirror detection (auto-detect if image is flipped)

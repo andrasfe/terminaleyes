@@ -62,6 +62,9 @@ class InteractiveSession:
         max_tokens: int = 2048,
         vision_model: str | None = None,
         vision_base_url: str | None = None,
+        skip_screen_check: bool = False,
+        force_calibration: bool = True,
+        single_message: str | None = None,
     ) -> None:
         self._capture = capture
         self._evaluator = evaluator
@@ -74,6 +77,9 @@ class InteractiveSession:
         self._max_tokens = max_tokens
         self._client = None
         self._vision_client = None
+        self._skip_screen_check = skip_screen_check
+        self._force_calibration = force_calibration
+        self._single_message = single_message
 
     async def _ensure_client(self) -> None:
         if self._client is not None:
@@ -100,26 +106,46 @@ class InteractiveSession:
     async def start(self) -> None:
         """Run setup checks then enter the interactive REPL."""
         async with self._capture:
-            # Screen check
-            print("  Checking camera view...")
-            frame = await self._capture.capture_frame()
-            result = await self._evaluator.check_full_screen(frame.image)
-            if result.full_screen_visible:
-                print("  Full screen visible — camera position OK\n")
+            if not self._skip_screen_check:
+                print("  Checking camera view...")
+                frame = await self._capture.capture_frame()
+                result = await self._evaluator.check_full_screen(frame.image)
+                if result.full_screen_visible:
+                    print("  Full screen visible — camera position OK\n")
+                else:
+                    edges = ", ".join(result.edges_cut_off) if result.edges_cut_off else "unknown"
+                    print(f"  WARNING: Edges cut off: {edges}")
+                    if result.suggestion:
+                        print(f"  Suggestion: {result.suggestion}")
+                    print(f"  Continuing anyway — adjust camera if needed.\n")
+
+            # Calibration — force by default, skip with --skip-calibration
+            if self._force_calibration:
+                from terminaleyes.commander.calibration import MouseCalibrator, CalibrationResult
+                import os
+                # Delete old calibration to force re-run
+                cal_path = CalibrationResult.load()
+                if cal_path is not None:
+                    from terminaleyes.commander.calibration import CALIBRATION_FILE
+                    os.remove(CALIBRATION_FILE)
+                calibrator = MouseCalibrator(mouse=self._executor._mouse)
+                await calibrator.calibrate_or_load()
+
+            # Single message mode or REPL
+            if self._single_message:
+                try:
+                    handled = await self._try_fast_action(self._single_message)
+                    if not handled:
+                        await self._handle_input(self._single_message)
+                except Exception as e:
+                    logger.error("Error: %s", e)
+                    print(f"  Error: {e}")
             else:
-                edges = ", ".join(result.edges_cut_off) if result.edges_cut_off else "unknown"
-                print(f"  WARNING: Edges cut off: {edges}")
-                if result.suggestion:
-                    print(f"  Suggestion: {result.suggestion}")
-                print(f"  Continuing anyway — adjust camera if needed.\n")
-
-            # REPL
-            print("Ready. Type commands or questions.")
-            print("  help     — show available commands")
-            print("  quit     — exit")
-            print()
-
-            await self._repl()
+                print("Ready. Type commands or questions.")
+                print("  help     — show available commands")
+                print("  quit     — exit")
+                print()
+                await self._repl()
 
     async def _repl(self) -> None:
         """Main read-eval-print loop."""
@@ -391,22 +417,39 @@ class InteractiveSession:
         if not showui_prompt.lower().startswith("click"):
             showui_prompt = f"Click on {showui_prompt}"
 
+        # Detect screen boundaries in image space (screen != full photo)
+        screen_bounds = await self._detect_screen_bounds(b64)
+        sx0, sy0, sx1, sy1 = screen_bounds
+        print(f"  Screen bounds in image: ({sx0:.0%},{sy0:.0%})→({sx1:.0%},{sy1:.0%})")
+
         # Try ShowUI first (fast), fall back to gemma (accurate)
         pos = await self._showui_locate(b64, showui_prompt)
         if pos is not None:
-            tx, ty = pos
-            print(f"  ShowUI: target at ({tx:.1%}, {ty:.1%})")
+            img_x, img_y = pos
+            # Map from image space to screen space
+            tx = (img_x - sx0) / (sx1 - sx0) if sx1 > sx0 else img_x
+            ty = (img_y - sy0) / (sy1 - sy0) if sy1 > sy0 else img_y
+            tx = max(0.0, min(1.0, tx))
+            ty = max(0.0, min(1.0, ty))
+            print(f"  ShowUI: image ({img_x:.1%},{img_y:.1%}) → screen ({tx:.1%},{ty:.1%})")
         else:
             gx, gy = gemma_fallback
             if gx is not None and gy is not None:
-                tx, ty = float(gx), float(gy)
-                print(f"  Using gemma coordinates ({tx:.1%}, {ty:.1%})")
+                # Gemma coords are also in image space
+                tx = (float(gx) - sx0) / (sx1 - sx0)
+                ty = (float(gy) - sy0) / (sy1 - sy0)
+                tx = max(0.0, min(1.0, tx))
+                ty = max(0.0, min(1.0, ty))
+                print(f"  Gemma: screen ({tx:.1%}, {ty:.1%})")
             else:
                 print(f"  Asking gemma...")
                 gemma_pos = await self._ask_gemma_location(b64, target_desc)
                 if gemma_pos is not None:
-                    tx, ty = gemma_pos
-                    print(f"  Gemma: target at ({tx:.1%}, {ty:.1%})")
+                    tx = (gemma_pos[0] - sx0) / (sx1 - sx0)
+                    ty = (gemma_pos[1] - sy0) / (sy1 - sy0)
+                    tx = max(0.0, min(1.0, tx))
+                    ty = max(0.0, min(1.0, ty))
+                    print(f"  Gemma: screen ({tx:.1%}, {ty:.1%})")
                 else:
                     print(f"  Cannot find '{target_desc}'.")
                     return
@@ -430,38 +473,67 @@ class InteractiveSession:
         await self._send_hid_moves(dx_hid, dy_hid)
         await asyncio.sleep(0.3)
 
-        # Step 4: Verify cursor is on target before clicking.
-        # Ask ShowUI for target position again. If the target is still at the
-        # same spot, cursor missed (button still fully visible = cursor elsewhere).
-        # If target shifted or vanished, cursor is likely on/near it.
+        # Step 4: Verify and correct loop.
+        # After each move, check if target is still visible.
+        # If yes → cursor missed → compute correction from where target still is.
+        # If target vanished → cursor covering it → click.
         import cv2 as _cv2
-        await asyncio.sleep(0.3)
-        b64_after = await self._capture_b64()
-        target_after = await self._showui_locate(b64_after, showui_prompt)
+        cursor_x, cursor_y = tx, ty  # where we think cursor is
 
-        frame = await self._capture.capture_frame()
-        proof_path = "/tmp/cursor_on_target.png"
-        _cv2.imwrite(proof_path, frame.image)
+        for attempt in range(5):
+            await asyncio.sleep(0.3)
+            b64_after = await self._capture_b64()
+            target_after = await self._showui_locate(b64_after, showui_prompt)
 
-        if target_after is None:
-            # Target vanished — cursor likely covering it
-            print(f"  Target no longer visible — cursor likely on it. Clicking {button}.")
-            await self._executor._mouse.click(button)
-            print(f"  Screenshot: {proof_path}")
-            return
+            frame = await self._capture.capture_frame()
+            proof_path = "/tmp/cursor_on_target.png"
+            _cv2.imwrite(proof_path, frame.image)
 
-        ax, ay = target_after
-        shift = ((ax - tx) ** 2 + (ay - ty) ** 2) ** 0.5
+            if target_after is not None:
+                # Map from image space to screen space
+                img_ax, img_ay = target_after
+                target_after = (
+                    max(0.0, min(1.0, (img_ax - sx0) / (sx1 - sx0) if sx1 > sx0 else img_ax)),
+                    max(0.0, min(1.0, (img_ay - sy0) / (sy1 - sy0) if sy1 > sy0 else img_ay)),
+                )
 
-        if shift > 0.08:
-            # Target position shifted significantly — cursor is interfering
-            print(f"  Target shifted ({tx:.0%},{ty:.0%})→({ax:.0%},{ay:.0%}). Cursor likely near it. Clicking {button}.")
-            await self._executor._mouse.click(button)
-            print(f"  Screenshot: {proof_path}")
-        else:
-            # Target still at same position — cursor is NOT on it
-            print(f"  Target still at ({ax:.0%},{ay:.0%}) — cursor missed. NOT clicking.")
-            print(f"  Screenshot: {proof_path}")
+            if target_after is None:
+                # Target vanished — cursor likely covering it
+                print(f"  [{attempt+1}] Target vanished — clicking {button}.")
+                await self._executor._mouse.click(button)
+                print(f"  Screenshot: {proof_path}")
+                return
+
+            ax, ay = target_after
+
+            # Target is still visible → cursor didn't land on it.
+            # The difference between where we aimed and where the target
+            # still appears tells us how far off the cursor is.
+            dx = ax - cursor_x
+            dy = ay - cursor_y
+
+            if abs(dx) < 0.02 and abs(dy) < 0.02:
+                # Target barely moved — cursor is very close but not covering it.
+                # Nudge toward the target center and click.
+                print(f"  [{attempt+1}] Very close — nudging and clicking {button}.")
+                dx_hid, dy_hid = cal.hid_units_for_pct(dx, dy)
+                await self._send_hid_moves(dx_hid, dy_hid)
+                await asyncio.sleep(0.2)
+                await self._executor._mouse.click(button)
+                frame = await self._capture.capture_frame()
+                _cv2.imwrite(proof_path, frame.image)
+                print(f"  Screenshot: {proof_path}")
+                return
+
+            # Cursor missed — correct toward where target still is
+            print(f"  [{attempt+1}] Target still at ({ax:.0%},{ay:.0%}), cursor at ~({cursor_x:.0%},{cursor_y:.0%}). Correcting ({dx:+.1%},{dy:+.1%})")
+            dx_hid, dy_hid = cal.hid_units_for_pct(dx, dy)
+            await self._send_hid_moves(dx_hid, dy_hid)
+            cursor_x += dx
+            cursor_y += dy
+
+        print(f"  Could not reach target after corrections — NOT clicking.")
+        print(f"  Screenshot: {proof_path}")
 
     @staticmethod
     def _find_cursor_by_diff(
@@ -518,6 +590,30 @@ class InteractiveSession:
         import cv2 as _cv2
         frame = await self._capture.capture_frame()
         return _cv2.cvtColor(frame.image, _cv2.COLOR_BGR2GRAY)
+
+    async def _detect_screen_bounds(self, b64_image: str) -> tuple[float, float, float, float]:
+        """Detect screen edges in image space using ShowUI.
+
+        Returns (x0, y0, x1, y1) — the screen's top-left and bottom-right
+        as fractions of the webcam image. Cached after first call.
+        """
+        if hasattr(self, '_screen_bounds_cache'):
+            return self._screen_bounds_cache
+
+        tl = await self._showui_query(b64_image, "Click on the top left corner of the monitor screen")
+        br = await self._showui_query(b64_image, "Click on the bottom right corner of the monitor screen")
+
+        x0 = tl[0] if tl else 0.05
+        y0 = tl[1] if tl else 0.05
+        x1 = br[0] if br else 0.95
+        y1 = br[1] if br else 0.95
+
+        # Sanity check
+        if x1 <= x0 or y1 <= y0:
+            x0, y0, x1, y1 = 0.05, 0.05, 0.95, 0.95
+
+        self._screen_bounds_cache = (x0, y0, x1, y1)
+        return self._screen_bounds_cache
 
     async def _ask_gemma_location(self, b64_image: str, target_desc: str) -> tuple[float, float] | None:
         """Ask gemma for element coordinates. Slower but more accurate than ShowUI."""
