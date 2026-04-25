@@ -61,6 +61,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Show results without saving to config",
     )
 
+    subparsers.add_parser(
+        "interact",
+        help="Interactive visual control — ask questions and give commands via REPL",
+    )
+
+    command_parser = subparsers.add_parser(
+        "command",
+        help="Watch screen via webcam and act on visual conditions",
+    )
+    command_parser.add_argument(
+        "instruction", type=str,
+        help='Natural language instruction, e.g. "when you see a blue Run button, click it"',
+    )
+    command_parser.add_argument(
+        "--interval", type=float, default=None,
+        help="Seconds between captures (default: config value, 180)",
+    )
+    command_parser.add_argument(
+        "--one-shot", action="store_true",
+        help="Stop after the first trigger (default: keep watching continuously)",
+    )
+    command_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Evaluate conditions but don't execute actions",
+    )
+
     watch_parser = subparsers.add_parser(
         "watch",
         help="Passively watch a screen via webcam and build a session summary",
@@ -388,6 +414,14 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("Running MLLM validation")
         asyncio.run(_validate(settings))
 
+    elif args.command == "interact":
+        logger.info("Starting interactive visual commander")
+        asyncio.run(_run_interact(settings))
+
+    elif args.command == "command":
+        logger.info("Starting visual command agent")
+        asyncio.run(_run_command(settings, args))
+
     elif args.command == "watch":
         logger.info("Starting screen watcher")
         asyncio.run(_watch(settings, args))
@@ -395,6 +429,215 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "calibrate":
         logger.info("Running camera calibration")
         asyncio.run(_calibrate(settings, save=not args.no_save))
+
+
+async def _run_interact(settings) -> None:
+    """Run the interactive visual commander REPL."""
+    from terminaleyes.capture.webcam import WebcamCapture
+    from terminaleyes.commander.evaluator import ConditionEvaluator
+    from terminaleyes.commander.executor import ActionExecutor
+    from terminaleyes.commander.interactive import InteractiveSession
+    from terminaleyes.keyboard.http_backend import HttpKeyboardOutput
+    from terminaleyes.mouse.http_backend import HttpMouseOutput
+
+    cfg = settings.commander
+
+    print("=" * 60)
+    print("INTERACTIVE VISUAL COMMANDER")
+    print("=" * 60)
+    print(f"LM Studio: {cfg.lmstudio_base_url} ({cfg.lmstudio_model})")
+    print(f"Pi: {cfg.pi_base_url} (transport={cfg.transport})")
+    print(f"Screen: {cfg.screen_width}x{cfg.screen_height}")
+    print()
+
+    # Build webcam capture
+    resolution = None
+    if settings.capture.resolution_width and settings.capture.resolution_height:
+        resolution = (settings.capture.resolution_width, settings.capture.resolution_height)
+
+    capture = WebcamCapture(
+        device_index=settings.capture.device_index,
+        resolution=resolution,
+    )
+
+    # Build evaluator
+    evaluator = ConditionEvaluator(
+        model=cfg.lmstudio_model,
+        base_url=cfg.lmstudio_base_url,
+        max_tokens=cfg.lmstudio_max_tokens,
+    )
+
+    # Build keyboard + mouse
+    keyboard = HttpKeyboardOutput(
+        base_url=cfg.pi_base_url,
+        timeout=10.0,
+        transport=cfg.transport,
+    )
+    mouse = HttpMouseOutput(
+        base_url=cfg.pi_base_url,
+        timeout=10.0,
+        transport=cfg.transport,
+    )
+
+    # Build executor with capture + evaluator for visual homing
+    executor = ActionExecutor(
+        keyboard=keyboard,
+        mouse=mouse,
+        screen_width=cfg.screen_width,
+        screen_height=cfg.screen_height,
+        capture=capture,
+        evaluator=evaluator,
+    )
+
+    # Connect to Pi
+    await keyboard.connect()
+    await mouse.connect()
+
+    # Build and run interactive session
+    session = InteractiveSession(
+        capture=capture,
+        evaluator=evaluator,
+        executor=executor,
+        model=cfg.lmstudio_model,
+        base_url=cfg.lmstudio_base_url,
+        max_tokens=cfg.lmstudio_max_tokens,
+        vision_model=cfg.lmstudio_vision_model,
+        vision_base_url=cfg.vision_base_url,
+    )
+
+    try:
+        await session.start()
+    except KeyboardInterrupt:
+        print("\nExiting.")
+    finally:
+        await keyboard.disconnect()
+        await mouse.disconnect()
+
+
+async def _run_command(settings, args) -> None:
+    """Run the visual command agent."""
+    import signal
+    from terminaleyes.capture.webcam import WebcamCapture
+    from terminaleyes.commander.parser import CommandParser
+    from terminaleyes.commander.evaluator import ConditionEvaluator
+    from terminaleyes.commander.executor import ActionExecutor
+    from terminaleyes.commander.loop import CommandLoop
+    from terminaleyes.keyboard.http_backend import HttpKeyboardOutput
+    from terminaleyes.mouse.http_backend import HttpMouseOutput
+
+    cfg = settings.commander
+
+    print("=" * 60)
+    print("VISUAL COMMAND AGENT")
+    print("=" * 60)
+    print(f"LM Studio: {cfg.lmstudio_base_url} ({cfg.lmstudio_model})")
+    print(f"Pi: {cfg.pi_base_url} (transport={cfg.transport})")
+    print(f"Screen: {cfg.screen_width}x{cfg.screen_height}")
+    print()
+
+    # 1. Parse instruction
+    print("Parsing instruction...")
+    parser = CommandParser(
+        model=cfg.lmstudio_model,
+        base_url=cfg.lmstudio_base_url,
+        max_tokens=cfg.lmstudio_max_tokens,
+    )
+    command = await parser.parse(args.instruction)
+
+    # Default is continuous — --one-shot overrides to single trigger
+    command = command.model_copy(update={"one_shot": False})
+    if args.one_shot:
+        command = command.model_copy(update={"one_shot": True})
+    if args.interval is not None:
+        command = command.model_copy(update={"interval_seconds": args.interval})
+
+    print(f"\nParsed command:")
+    print(f"  Condition: {command.condition.description}")
+    if command.condition.element_text:
+        print(f"  Element text: {command.condition.element_text}")
+    if command.condition.visual_cues:
+        print(f"  Visual cues: {', '.join(command.condition.visual_cues)}")
+    print(f"  Action: {command.action.action_type} ({command.action.button or command.action.key or command.action.text or ''})")
+    print(f"  Interval: {command.interval_seconds}s")
+    print(f"  Mode: {'one-shot' if command.one_shot else 'continuous'}")
+    if args.dry_run:
+        print(f"  DRY RUN: actions will NOT be executed")
+    print("=" * 60)
+
+    # 2. Build webcam capture (no crop — watching arbitrary screen)
+    resolution = None
+    if settings.capture.resolution_width and settings.capture.resolution_height:
+        resolution = (settings.capture.resolution_width, settings.capture.resolution_height)
+
+    capture = WebcamCapture(
+        device_index=settings.capture.device_index,
+        resolution=resolution,
+    )
+
+    # 3. Build condition evaluator
+    evaluator = ConditionEvaluator(
+        model=cfg.lmstudio_model,
+        base_url=cfg.lmstudio_base_url,
+        max_tokens=cfg.lmstudio_max_tokens,
+    )
+
+    # 4. Build keyboard + mouse outputs
+    keyboard = HttpKeyboardOutput(
+        base_url=cfg.pi_base_url,
+        timeout=10.0,
+        transport=cfg.transport,
+    )
+    mouse = HttpMouseOutput(
+        base_url=cfg.pi_base_url,
+        timeout=10.0,
+        transport=cfg.transport,
+    )
+
+    # 5. Build executor with capture + evaluator for visual cursor homing
+    executor = ActionExecutor(
+        keyboard=keyboard,
+        mouse=mouse,
+        screen_width=cfg.screen_width,
+        screen_height=cfg.screen_height,
+        capture=capture,
+        evaluator=evaluator,
+    )
+
+    if not args.dry_run:
+        await keyboard.connect()
+        await mouse.connect()
+
+    # 6. Build and run loop
+    loop = CommandLoop(
+        capture=capture,
+        evaluator=evaluator,
+        executor=executor,
+        confidence_threshold=cfg.confidence_threshold,
+        change_threshold=cfg.change_threshold,
+        max_consecutive_errors=cfg.max_consecutive_errors,
+    )
+
+    # Ctrl-C: first press sets stop flag, second press force-exits
+    _sigint_count = [0]
+
+    def _sigint_handler(sig, frame):
+        _sigint_count[0] += 1
+        if _sigint_count[0] >= 2:
+            print("\nForce exit.")
+            import sys
+            sys.exit(1)
+        print("\nStopping command loop (press Ctrl-C again to force exit)...")
+        loop.stop()
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    try:
+        session = await loop.run(command)
+        print(f"\nFinal status: {session.status}")
+    finally:
+        if not args.dry_run:
+            await keyboard.disconnect()
+            await mouse.disconnect()
 
 
 async def _watch(settings, args) -> None:

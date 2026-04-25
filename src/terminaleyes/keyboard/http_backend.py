@@ -21,9 +21,12 @@ class HttpKeyboardOutput(KeyboardOutput):
         self,
         base_url: str = "http://localhost:8080",
         timeout: float = 10.0,
+        transport: str = "usb",
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._transport = transport
+        self._prefix = "/bt" if transport == "bt" else ""
         self._client: httpx.AsyncClient | None = None
 
     async def connect(self) -> None:
@@ -52,17 +55,17 @@ class HttpKeyboardOutput(KeyboardOutput):
 
     async def send_keystroke(self, key: str) -> None:
         """Send a keystroke via HTTP POST."""
-        await self._post("/keystroke", {"key": key})
+        await self._post(f"{self._prefix}/keystroke", {"key": key})
         logger.debug("Sent keystroke: %s", key)
 
     async def send_key_combo(self, modifiers: list[str], key: str) -> None:
         """Send a key combination via HTTP POST."""
-        await self._post("/key-combo", {"modifiers": modifiers, "key": key})
+        await self._post(f"{self._prefix}/key-combo", {"modifiers": modifiers, "key": key})
         logger.debug("Sent key combo: %s+%s", "+".join(modifiers), key)
 
     async def send_text(self, text: str) -> None:
         """Send text input via HTTP POST."""
-        await self._post("/text", {"text": text})
+        await self._post(f"{self._prefix}/text", {"text": text})
         logger.debug("Sent text: %s", text[:50])
 
     async def _post(self, path: str, payload: dict) -> httpx.Response:

@@ -71,6 +71,28 @@ class WatchConfig(BaseModel):
     )
 
 
+class CommanderConfig(BaseModel):
+    pi_base_url: str = Field(default="http://10.0.0.2:8080")
+    transport: Literal["bt", "usb"] = Field(default="bt")
+    screen_width: int = Field(default=1920, gt=0)
+    screen_height: int = Field(default=1080, gt=0)
+    default_interval_seconds: float = Field(default=180.0, gt=0)
+    confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    max_consecutive_errors: int = Field(default=5, gt=0)
+    change_threshold: float = Field(default=0.02, ge=0.0, le=1.0)
+    lmstudio_base_url: str = Field(default="http://127.0.0.1:1234/v1")
+    lmstudio_model: str = Field(default="google/gemma-4-31b")
+    lmstudio_vision_model: str = Field(
+        default="showui-2b",
+        description="Model for vision grounding (cursor/element location). ShowUI-2B via llama.cpp.",
+    )
+    vision_base_url: str = Field(
+        default="http://127.0.0.1:1235/v1",
+        description="Base URL for the vision grounding model (may differ from lmstudio_base_url).",
+    )
+    lmstudio_max_tokens: int = Field(default=2048, gt=0)
+
+
 class AgentConfig(BaseModel):
     action_delay: float = Field(default=1.0, gt=0)
     max_consecutive_errors: int = Field(default=5, gt=0)
@@ -111,6 +133,7 @@ class Settings(BaseSettings):
     endpoint: EndpointConfig = Field(default_factory=EndpointConfig)
     keyboard: KeyboardConfig = Field(default_factory=KeyboardConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
+    commander: CommanderConfig = Field(default_factory=CommanderConfig)
     watch: WatchConfig = Field(default_factory=WatchConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
