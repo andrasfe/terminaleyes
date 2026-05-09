@@ -51,7 +51,7 @@ class HttpKeyboardOutput(KeyboardOutput):
         if self._client is not None:
             await self._client.aclose()
             self._client = None
-            logger.info("Disconnected from endpoint")
+            logger.debug("Disconnected from endpoint")
 
     async def send_keystroke(self, key: str) -> None:
         """Send a keystroke via HTTP POST."""
@@ -63,10 +63,18 @@ class HttpKeyboardOutput(KeyboardOutput):
         await self._post(f"{self._prefix}/key-combo", {"modifiers": modifiers, "key": key})
         logger.debug("Sent key combo: %s+%s", "+".join(modifiers), key)
 
-    async def send_text(self, text: str) -> None:
-        """Send text input via HTTP POST."""
+    async def send_text(self, text: str, *, secret: bool = False) -> None:
+        """Send text input via HTTP POST.
+
+        ``secret=True`` redacts the text from any logs — use when typing
+        passwords or other sensitive content. The Pi side already only
+        logs the length.
+        """
         await self._post(f"{self._prefix}/text", {"text": text})
-        logger.debug("Sent text: %s", text[:50])
+        if secret:
+            logger.debug("Sent text (length=%d, redacted)", len(text))
+        else:
+            logger.debug("Sent text: %s", text[:50])
 
     async def _post(self, path: str, payload: dict) -> httpx.Response:
         """Send a POST request to the endpoint."""

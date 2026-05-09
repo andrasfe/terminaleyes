@@ -2,7 +2,7 @@
 
 ## Project
 
-terminaleyes — vision-based agentic terminal controller. Webcam captures a terminal, MLLM interprets the screen, agent decides actions, keyboard output types them.
+terminaleyes — vision-based agentic terminal controller. A webcam captures the target's screen; classical CV + multimodal LLMs locate the cursor and the click target; HID commands flow over BT (or USB) via a Raspberry Pi to drive the target machine. Target OS may be macOS or Ubuntu/GNOME.
 
 ## Raspberry Pi Keyboard Architecture
 
@@ -31,10 +31,16 @@ terminaleyes — vision-based agentic terminal controller. Webcam captures a ter
 
 ## Key directories
 
-- `src/terminaleyes/commander/` — Interactive visual commander (REPL, ShowUI grounding, homing, calibration)
+- `src/terminaleyes/commander/` — Interactive visual commander, visual servo homer, login flow
+  - `visual_servo_homer.py` — closed-loop CV homer (HSV/variance cursor detection, ROI-diff tracking, OCR/ShowUI target localisation, click retry, post-click navigation oracle). The current click engine.
+  - `cursor_finder.py` — HSV finder (saturated red `redglass` cursor) + variance fallback for default cursors
+  - `ocr_finder.py` — tesseract wrapper with multi-pass preprocessing (scales, PSMs, both polarities for dark mode)
+  - `login.py` — remote login flow: wake, polled visual login-screen check, secret-typed password, Enter
+  - `closed_loop_homer.py` — older static-calibration homer (kept as helper: scene-map + keyword extraction)
+  - `interactive.py` — REPL session dispatching to the homer / visual commander
 - `src/terminaleyes/mouse/` — Abstract mouse interface + HTTP backend (BT/USB transport)
 - `src/terminaleyes/raspi/` — Pi-specific: HID codes, HID writer, REST server
-- `src/terminaleyes/keyboard/` — Abstract keyboard interface + backends (HTTP, USB HID)
+- `src/terminaleyes/keyboard/` — Abstract keyboard interface + backends (HTTP, USB HID). `send_text(secret=True)` redacts content from local logs (used for password input).
 - `src/terminaleyes/endpoint/` — Local dev endpoint (shell + pygame display)
 - `scripts/setup_usb_gadget.sh` — Pi USB gadget setup: `hid`, `ecm`, or `all` mode (run with sudo)
 - `scripts/setup_bt_hid.sh` — One-time BT HID setup: bluetoothd override, adapter config, agent install
@@ -46,31 +52,59 @@ terminaleyes — vision-based agentic terminal controller. Webcam captures a ter
 
 ```bash
 pip install -e ".[dev]"                    # install
+brew install tesseract                     # OCR backend (system binary)
+pip install pytesseract                    # python binding
 python -m pytest tests/ -v                 # run all tests
 python -m pytest tests/unit/test_raspi/ -v # run raspi tests only
 terminaleyes-pi                            # start Pi REST API server
-terminaleyes interact                      # interactive visual commander REPL
-terminaleyes interact -m "click X"         # single command mode
-terminaleyes interact --skip-calibration   # skip mouse calibration
+
+# Interactive visual commander (click / type)
+terminaleyes interact                      # REPL
+terminaleyes interact -m "click X"         # single-command mode
+terminaleyes interact --skip-calibration   # legacy flag, no-op now
 terminaleyes interact --screen-check       # enable screen visibility check
+
+# Remote-login flow
+terminaleyes login                         # interactive getpass prompt
+terminaleyes login --password-file PATH    # read pw from file (path visible, contents not)
+terminaleyes login --password-env VAR      # read pw from env var (var name visible)
+terminaleyes login --click-input           # click password field via homer first
+terminaleyes login --no-verify             # skip the visual login-screen check
+terminaleyes login --verify-attempts 12 --verify-interval 1.5  # tune polling
 ```
 
 ## Interactive Visual Commander
 
-### Dual-model architecture
-- **gemma-4-31b** on LM Studio (port 1234) — reasoning, questions, element location fallback
-- **ShowUI-2B** on llama.cpp (port 1235) — fast UI element coordinate grounding (~0.1s)
+### Models
+- **nemotron-3-nano-omni** on LM Studio (port 1234) — default multimodal: scene-map enumeration, login-screen verification, post-click navigation oracle. Override with `TERMINALEYES_COMMANDER__LMSTUDIO_MODEL`.
+- **ShowUI-2B** on llama.cpp (port 1235) — fast UI grounding (~0.1s). Used as fallback when OCR doesn't find the target.
+- **tesseract** (system binary) — primary text-target locator AND post-click URL-bar oracle. The cheapest and most reliable signal when the target is named text.
 
-### Clicking pipeline
-1. ShowUI finds target → map image coords to screen coords (accounting for bezel)
-2. Slam cursor to corner (known 0,0) → send calibrated HID units to target
-3. Verify: re-query ShowUI. Target vanished → click. Target still there → correct and retry (up to 5x)
-4. Only clicks when verified
+### Visual servo cursor homing (`commander/visual_servo_homer.py`)
+Replaces the older static-calibration homer entirely. Per run:
 
-### Mouse calibration
-- Interactive: user watches target screen, presses Enter when cursor hits edge
-- Saved to `~/.terminaleyes/calibration.json`, re-run forced by default on each session
-- `--skip-calibration` to reuse saved values
+1. **Slam to corner** — many `(-20, -20)` mouse moves; cursor is now at top-left of screen.
+2. **Detect cursor**:
+   - HSV thresholding for a saturated red `redglass`-style cursor (motion-verified to reject static red UI elements like the Reddit logo)
+   - Falls back to **oscillation-variance**: jiggle 6 short HID bursts, find the pixel cluster with highest std-dev across captured frames. Robust on any default cursor.
+3. **Locate target** (cascade, first hit wins):
+   - Tesseract OCR with multi-pass preprocessing (scales 3–5, PSM 6+11, both polarities for dark mode), restricted to user-quoted tokens when present so generic words like "subreddit"/"entry" don't match
+   - Scene-map (multimodal) + ShowUI grounding of the matched label
+   - ShowUI on focused crops (left sidebar, footer)
+4. **Visual servo loop** — proportional HID move from current ratio + ROI-prior frame diff to track cursor. Ratio learned online with floor/ceil clamps so a bad sample can't run away. Hard cap on HID per axis.
+5. **Click gate** — geometric: visually-detected cursor within `CLICK_TOL_PCT=1.2%` of aim point for 2 consecutive frames. Hotspot offset compensates for centroid-vs-tip on the default arrow.
+6. **Click retry pattern** — first click overshoots by ~1% on most cursors; if the post-click oracle says nothing changed, nudge through a small diamond (5 attempts) and re-verify.
+7. **Post-click navigation oracle** — captures a frame ~2.5s after click, OCRs the URL bar and page header, looks for the target's distinguishing keywords (quoted text wins over generic descriptors).
+
+### Cursor on the target machine
+- Detection works on any default cursor via oscillation-variance.
+- Optional: switch to a high-contrast theme so HSV detection takes over (faster, no jiggle).
+  - **Ubuntu/GNOME**: `sudo apt install -y xcursor-themes; gsettings set org.gnome.desktop.interface cursor-theme 'redglass'; gsettings set org.gnome.desktop.interface cursor-size 96`. Log out / open a new app for the theme to apply.
+  - **macOS**: System Settings → Accessibility → Display → Pointer (set saturated colours, max size).
+
+### Webcam vs capture card
+- Webcam works; the homer compensates for perspective, glare, bezel, and small-text OCR limits (with a fallback chain).
+- A USB capture card (HDMI→UVC) is a strict upgrade: image-px = screen-px, no bezel/glare, OCR reads any on-screen text. Most CV/perspective compensation in the homer becomes redundant. Same `cv2.VideoCapture` interface — typically a config-only swap (different `device_index`).
 
 ### ShowUI llama.cpp server
 ```bash
@@ -82,6 +116,23 @@ llama-server \
   -c 4096 --port 1235
 ```
 Note: do NOT use `--image-min-tokens` — it breaks ShowUI output.
+
+## Login flow (`commander/login.py`)
+
+End-to-end remote login that **never sees the literal word "password"** to decide whether to type — verification is purely visual.
+
+1. **Wake** — mouse jiggle (×4) + Down arrow + left click. Wakes the monitor and dismisses GDM clock overlays.
+2. **Polled visual verification** — captures a frame, asks the multimodal model "does this LOOK like a login/password screen?" (centred input, hidden-character dots, avatar/clock, dark blurred bg — NOT keyword matching). On miss, alternates between mouse jiggle and Down arrow nudges and re-checks. Default 6 polls × 1.0s.
+3. **Type password** — `keyboard.send_text(pw, secret=True)` so the dev-side log records only `length=N`. Pi side already only logs length.
+4. **Submit** — Enter (skippable with `--no-submit`).
+
+**Password sources** (priority): `--password-file PATH` > `--password-env VAR` > interactive `getpass.getpass()`. **Never** a positional arg (would leak via `ps`).
+
+**`--click-input`** uses the visual homer to click an input field by *visual* description ("the centred text input", "the highlighted input box") — no reliance on the word "password" appearing on screen.
+
+## Command-line gotchas
+- BT HID transit between dev Mac and Pi is over USB ECM (10.0.0.0/24 link-local) — fine for the cable, don't pipe credentials over an untrusted network leg.
+- Python doesn't zero string memory; the password reference is dropped immediately after submit but a memory dump could still recover it. Treat the dev Mac as trusted.
 
 ## Pi setup sequence
 
@@ -216,6 +267,7 @@ If BT HID stops working, check in this order:
 - Integration tests for REST API end-to-end with target machine
 - Make bt-agent.service restart-proof (currently needs manual restart if bluetooth restarts)
 - Pi 4 migration: dual-band WiFi + separate BT chip (no radio mode switching needed)
-- Loopy-style self-improving calibration (accumulate click observations to refine HID ratio)
-- Better cursor tracking (template matching for macOS cursor arrow)
 - Webcam mirror detection (auto-detect if image is flipped)
+- Capture-card path (UVC HDMI→USB): drop most perspective/bezel compensation in the homer
+- Self-improving HID ratio cache (persist learned `pct_per_hid` per session/screen so future runs start from a better prior)
+- Tests for visual servo homer end-to-end (recorded webcam frames + mock HID)

@@ -1,11 +1,10 @@
-"""Mouse calibration — determines the mapping between HID units and screen position.
+"""DEPRECATED — static mouse calibration.
 
-The user positions the cursor on the target machine (using its own
-trackpad/mouse), then we send HID units via the Pi and measure how
-many it takes to reach the opposite edge.
-
-This avoids rounded-corner issues and gives precise measurements.
-Results are persisted to ~/.terminaleyes/calibration.json.
+Superseded by the closed-loop, model-driven homer
+(``commander.closed_loop_homer``). This module is kept temporarily so that
+``MOVE_STEP_SIZE`` and ``MOVE_DELAY`` (still imported by
+``InteractiveSession._send_hid_moves``) remain available. Slated for
+deletion once the closed-loop path is proven across several targets.
 """
 
 from __future__ import annotations
@@ -20,9 +19,10 @@ from terminaleyes.mouse.base import MouseOutput
 
 logger = logging.getLogger(__name__)
 
-# Precision movement settings
-MOVE_STEP_SIZE = 1
-MOVE_DELAY = 0.008
+# Movement step size — 3 units/report balances speed with staying
+# in macOS's linear acceleration zone. At 3ms delay = ~1000 units/sec.
+MOVE_STEP_SIZE = 3
+MOVE_DELAY = 0.003
 
 # Coarse movement for calibration edge-finding
 COARSE_STEP = 3

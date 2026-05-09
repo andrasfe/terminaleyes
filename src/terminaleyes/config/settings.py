@@ -81,7 +81,7 @@ class CommanderConfig(BaseModel):
     max_consecutive_errors: int = Field(default=5, gt=0)
     change_threshold: float = Field(default=0.02, ge=0.0, le=1.0)
     lmstudio_base_url: str = Field(default="http://127.0.0.1:1234/v1")
-    lmstudio_model: str = Field(default="google/gemma-4-31b")
+    lmstudio_model: str = Field(default="nvidia/nemotron-3-nano-omni")
     lmstudio_vision_model: str = Field(
         default="showui-2b",
         description="Model for vision grounding (cursor/element location). ShowUI-2B via llama.cpp.",

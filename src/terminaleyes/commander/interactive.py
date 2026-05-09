@@ -119,17 +119,9 @@ class InteractiveSession:
                         print(f"  Suggestion: {result.suggestion}")
                     print(f"  Continuing anyway — adjust camera if needed.\n")
 
-            # Calibration — force by default, skip with --skip-calibration
+            # No calibration step — homing is closed-loop and model-driven.
             if self._force_calibration:
-                from terminaleyes.commander.calibration import MouseCalibrator, CalibrationResult
-                import os
-                # Delete old calibration to force re-run
-                cal_path = CalibrationResult.load()
-                if cal_path is not None:
-                    from terminaleyes.commander.calibration import CALIBRATION_FILE
-                    os.remove(CALIBRATION_FILE)
-                calibrator = MouseCalibrator(mouse=self._executor._mouse)
-                await calibrator.calibrate_or_load()
+                print("  --calibrate is deprecated and ignored (closed-loop homing).")
 
             # Single message mode or REPL
             if self._single_message:
@@ -170,9 +162,7 @@ class InteractiveSession:
                 continue
 
             if user_input.lower() == "calibrate":
-                from terminaleyes.commander.calibration import MouseCalibrator
-                calibrator = MouseCalibrator(mouse=self._executor._mouse)
-                self._executor._calibration = await calibrator.force_calibrate()
+                print("  calibrate is deprecated — homing is now closed-loop.")
                 continue
 
             if user_input.lower() == "screenshot":
@@ -400,140 +390,29 @@ class InteractiveSession:
         self, button: str, target_desc: str,
         gemma_fallback: tuple[float | None, float | None] = (None, None),
     ) -> None:
-        """Visual homing: ShowUI for target, cached calibration for movement.
+        """Closed-loop, model-driven homing — no static calibration.
 
-        1. ShowUI finds the target element (fast, ~0.1s)
-        2. Load calibration (interactive on first run, cached after)
-        3. Slam to corner (known 0,0), move calibrated distance to target
-        4. Click and save proof screenshot
+        Iterates: capture → ask navigator (direction + magnitude) → move →
+        repeat. Clicks only after the model confirms on-target via a
+        separate final-gate prompt. ``gemma_fallback`` is accepted for
+        backward-compat with callers but ignored — the loop is fully
+        feedback-driven.
         """
-        from terminaleyes.commander.calibration import CalibrationResult, MouseCalibrator
+        del gemma_fallback  # unused in visual-servo path
+        from terminaleyes.commander.visual_servo_homer import VisualServoHomer
 
-        print(f"  Homing to: {target_desc}")
-
-        # Step 1: Find target with ShowUI — query 3 times and check consistency
-        b64 = await self._capture_b64()
-        showui_prompt = target_desc
-        if not showui_prompt.lower().startswith("click"):
-            showui_prompt = f"Click on {showui_prompt}"
-
-        # Detect screen boundaries in image space (screen != full photo)
-        screen_bounds = await self._detect_screen_bounds(b64)
-        sx0, sy0, sx1, sy1 = screen_bounds
-        print(f"  Screen bounds in image: ({sx0:.0%},{sy0:.0%})→({sx1:.0%},{sy1:.0%})")
-
-        # Try ShowUI first (fast), fall back to gemma (accurate)
-        pos = await self._showui_locate(b64, showui_prompt)
-        if pos is not None:
-            img_x, img_y = pos
-            # Map from image space to screen space
-            tx = (img_x - sx0) / (sx1 - sx0) if sx1 > sx0 else img_x
-            ty = (img_y - sy0) / (sy1 - sy0) if sy1 > sy0 else img_y
-            tx = max(0.0, min(1.0, tx))
-            ty = max(0.0, min(1.0, ty))
-            print(f"  ShowUI: image ({img_x:.1%},{img_y:.1%}) → screen ({tx:.1%},{ty:.1%})")
+        homer = VisualServoHomer(session=self)
+        outcome = await homer.run(target_desc, button=button)
+        if outcome.clicked:
+            print(
+                f"  ✓ SUCCESS — navigation confirmed. steps={outcome.steps} "
+                f"reason={outcome.reason} proof={outcome.proof_path}"
+            )
         else:
-            gx, gy = gemma_fallback
-            if gx is not None and gy is not None:
-                # Gemma coords are also in image space
-                tx = (float(gx) - sx0) / (sx1 - sx0)
-                ty = (float(gy) - sy0) / (sy1 - sy0)
-                tx = max(0.0, min(1.0, tx))
-                ty = max(0.0, min(1.0, ty))
-                print(f"  Gemma: screen ({tx:.1%}, {ty:.1%})")
-            else:
-                print(f"  Asking gemma...")
-                gemma_pos = await self._ask_gemma_location(b64, target_desc)
-                if gemma_pos is not None:
-                    tx = (gemma_pos[0] - sx0) / (sx1 - sx0)
-                    ty = (gemma_pos[1] - sy0) / (sy1 - sy0)
-                    tx = max(0.0, min(1.0, tx))
-                    ty = max(0.0, min(1.0, ty))
-                    print(f"  Gemma: screen ({tx:.1%}, {ty:.1%})")
-                else:
-                    print(f"  Cannot find '{target_desc}'.")
-                    return
-
-        # Step 2: Load or run calibration (cached to disk after first run)
-        cal = CalibrationResult.load()
-        if cal is None:
-            print(f"  No calibration found — running interactive calibration...")
-            calibrator = MouseCalibrator(mouse=self._executor._mouse)
-            cal = await calibrator.calibrate_or_load()
-
-        # Step 3: Slam to corner, move to target
-        print(f"  Slamming to corner...")
-        for _ in range(200):
-            await self._executor._mouse.move(-20, -20)
-            await asyncio.sleep(0.001)
-        await asyncio.sleep(0.3)
-
-        dx_hid, dy_hid = cal.hid_units_for_pct(tx, ty)
-        print(f"  Moving to target: ({dx_hid}, {dy_hid}) HID  [cal: {cal.hid_units_per_full_x:.0f}x{cal.hid_units_per_full_y:.0f}]")
-        await self._send_hid_moves(dx_hid, dy_hid)
-        await asyncio.sleep(0.3)
-
-        # Step 4: Verify and correct loop.
-        # After each move, check if target is still visible.
-        # If yes → cursor missed → compute correction from where target still is.
-        # If target vanished → cursor covering it → click.
-        import cv2 as _cv2
-        cursor_x, cursor_y = tx, ty  # where we think cursor is
-
-        for attempt in range(5):
-            await asyncio.sleep(0.3)
-            b64_after = await self._capture_b64()
-            target_after = await self._showui_locate(b64_after, showui_prompt)
-
-            frame = await self._capture.capture_frame()
-            proof_path = "/tmp/cursor_on_target.png"
-            _cv2.imwrite(proof_path, frame.image)
-
-            if target_after is not None:
-                # Map from image space to screen space
-                img_ax, img_ay = target_after
-                target_after = (
-                    max(0.0, min(1.0, (img_ax - sx0) / (sx1 - sx0) if sx1 > sx0 else img_ax)),
-                    max(0.0, min(1.0, (img_ay - sy0) / (sy1 - sy0) if sy1 > sy0 else img_ay)),
-                )
-
-            if target_after is None:
-                # Target vanished — cursor likely covering it
-                print(f"  [{attempt+1}] Target vanished — clicking {button}.")
-                await self._executor._mouse.click(button)
-                print(f"  Screenshot: {proof_path}")
-                return
-
-            ax, ay = target_after
-
-            # Target is still visible → cursor didn't land on it.
-            # The difference between where we aimed and where the target
-            # still appears tells us how far off the cursor is.
-            dx = ax - cursor_x
-            dy = ay - cursor_y
-
-            if abs(dx) < 0.02 and abs(dy) < 0.02:
-                # Target barely moved — cursor is very close but not covering it.
-                # Nudge toward the target center and click.
-                print(f"  [{attempt+1}] Very close — nudging and clicking {button}.")
-                dx_hid, dy_hid = cal.hid_units_for_pct(dx, dy)
-                await self._send_hid_moves(dx_hid, dy_hid)
-                await asyncio.sleep(0.2)
-                await self._executor._mouse.click(button)
-                frame = await self._capture.capture_frame()
-                _cv2.imwrite(proof_path, frame.image)
-                print(f"  Screenshot: {proof_path}")
-                return
-
-            # Cursor missed — correct toward where target still is
-            print(f"  [{attempt+1}] Target still at ({ax:.0%},{ay:.0%}), cursor at ~({cursor_x:.0%},{cursor_y:.0%}). Correcting ({dx:+.1%},{dy:+.1%})")
-            dx_hid, dy_hid = cal.hid_units_for_pct(dx, dy)
-            await self._send_hid_moves(dx_hid, dy_hid)
-            cursor_x += dx
-            cursor_y += dy
-
-        print(f"  Could not reach target after corrections — NOT clicking.")
-        print(f"  Screenshot: {proof_path}")
+            print(
+                f"  ✗ NOT confirmed clicked. reason={outcome.reason} "
+                f"steps={outcome.steps} proof={outcome.proof_path}"
+            )
 
     @staticmethod
     def _find_cursor_by_diff(
@@ -759,14 +638,23 @@ If the element is not visible, reply: {{"not_found": true}}"""
         return None
 
     async def _send_hid_moves(self, dx_hid: int, dy_hid: int) -> None:
-        """Send HID moves 1 unit at a time."""
+        """Send HID moves with retry on errors."""
         from terminaleyes.commander.calibration import MOVE_DELAY, MOVE_STEP_SIZE
         rem_x, rem_y = dx_hid, dy_hid
+        retries = 0
         while rem_x != 0 or rem_y != 0:
             sx = max(-MOVE_STEP_SIZE, min(MOVE_STEP_SIZE, rem_x))
             sy = max(-MOVE_STEP_SIZE, min(MOVE_STEP_SIZE, rem_y))
             if sx != 0 or sy != 0:
-                await self._executor._mouse.move(sx, sy)
+                try:
+                    await self._executor._mouse.move(sx, sy)
+                    retries = 0
+                except Exception:
+                    retries += 1
+                    if retries > 3:
+                        raise
+                    await asyncio.sleep(0.5)
+                    continue
             rem_x -= sx
             rem_y -= sy
             await asyncio.sleep(MOVE_DELAY)

@@ -78,14 +78,19 @@ async def screenshot() -> str:
     if not ret or frame is None:
         return "ERROR: Failed to capture frame from webcam"
 
-    # Encode as PNG
-    success, buf = cv2.imencode(".png", frame)
+    # Resize to keep base64 under token limits (~800px wide)
+    h, w = frame.shape[:2]
+    scale = 800 / max(h, w)
+    if scale < 1.0:
+        frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+
+    # Encode as JPEG for smaller size
+    success, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     if not success:
         return "ERROR: Failed to encode frame"
 
     b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
-    h, w = frame.shape[:2]
-    return f"data:image/png;base64,{b64}"
+    return f"data:image/jpeg;base64,{b64}"
 
 
 @mcp.tool()

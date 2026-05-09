@@ -67,7 +67,7 @@ class HttpMouseOutput(MouseOutput):
         if self._client is not None:
             await self._client.aclose()
             self._client = None
-            logger.info("Mouse disconnected")
+            logger.debug("Mouse disconnected")
 
     async def move(self, dx: int, dy: int) -> None:
         """Send a relative mouse movement."""

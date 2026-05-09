@@ -41,3 +41,15 @@ config/terminaleyes.yaml
 captured_frames/
 *.png
 *.jpg
+
+# Per-machine / user-local files
+.claude/
+.mcp.json
+run_mcp.sh
+
+# Run-time artefacts (homing logs, oracle dumps — may include screenshots)
+*.log
+
+# Password files — never commit
+*.pass
+*.password

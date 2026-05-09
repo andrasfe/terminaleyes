@@ -70,8 +70,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run initial screen visibility check (skipped by default)",
     )
     interact_parser.add_argument(
-        "--skip-calibration", action="store_true",
-        help="Skip mouse calibration (use saved values)",
+        "--calibrate", action="store_true",
+        help="Deprecated no-op (homing is now closed-loop, no calibration needed)",
     )
     interact_parser.add_argument(
         "-m", "--message", type=str, default=None,
@@ -97,6 +97,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     command_parser.add_argument(
         "--dry-run", action="store_true",
         help="Evaluate conditions but don't execute actions",
+    )
+
+    login_parser = subparsers.add_parser(
+        "login",
+        help="Wake the remote screen and type the login password",
+    )
+    login_parser.add_argument(
+        "--password-file", type=str, default=None,
+        help="Path to a single-line file holding the password. "
+             "The path appears in `ps`; the password content does not.",
+    )
+    login_parser.add_argument(
+        "--password-env", type=str, default=None,
+        help="Read the password from this environment variable.",
+    )
+    login_parser.add_argument(
+        "--no-wake", action="store_true",
+        help="Skip the wake sequence (mouse jiggle + Down + click).",
+    )
+    login_parser.add_argument(
+        "--click-input", action="store_true",
+        help="Use the visual homer to click the password field "
+             "before typing (default: rely on auto-focus).",
+    )
+    login_parser.add_argument(
+        "--no-submit", action="store_true",
+        help="Type the password but do not press Enter.",
+    )
+    login_parser.add_argument(
+        "--no-verify", action="store_true",
+        help="Skip the visual login-screen check (default: a vision "
+             "model decides whether the current screen LOOKS like a "
+             "login/password prompt before typing).",
+    )
+    login_parser.add_argument(
+        "--verify-attempts", type=int, default=6,
+        help="Number of times to re-check the screen if the first "
+             "look does not show a login prompt (default 6). Each "
+             "attempt nudges the mouse / arrow keys between checks.",
+    )
+    login_parser.add_argument(
+        "--verify-interval", type=float, default=1.0,
+        help="Seconds to wait between verification polls (default 1.0).",
     )
 
     watch_parser = subparsers.add_parser(
@@ -442,6 +485,10 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("Running camera calibration")
         asyncio.run(_calibrate(settings, save=not args.no_save))
 
+    elif args.command == "login":
+        logger.info("Starting remote login flow")
+        asyncio.run(_run_login(settings, args))
+
 
 async def _run_interact(settings, args=None) -> None:
     """Run the interactive visual commander REPL."""
@@ -516,7 +563,7 @@ async def _run_interact(settings, args=None) -> None:
         vision_model=cfg.lmstudio_vision_model,
         vision_base_url=cfg.vision_base_url,
         skip_screen_check=not getattr(args, 'screen_check', False),
-        force_calibration=not getattr(args, 'skip_calibration', False),
+        force_calibration=getattr(args, 'calibrate', False),
         single_message=getattr(args, 'message', None),
     )
 
@@ -653,6 +700,113 @@ async def _run_command(settings, args) -> None:
         if not args.dry_run:
             await keyboard.disconnect()
             await mouse.disconnect()
+
+
+async def _run_login(settings, args) -> None:
+    """Wake the remote screen and type the login password."""
+    from terminaleyes.commander.login import LoginFlow, resolve_password
+    from terminaleyes.keyboard.http_backend import HttpKeyboardOutput
+    from terminaleyes.mouse.http_backend import HttpMouseOutput
+
+    cfg = settings.commander
+
+    # Resolve password BEFORE printing config — we want any error
+    # (missing file / env var) to surface before bringing up the BT
+    # transport.
+    password = resolve_password(
+        file_path=args.password_file,
+        env_var=args.password_env,
+    )
+    if not password:
+        print("Refusing to send empty password.")
+        return
+    print(
+        f"Login: Pi={cfg.pi_base_url} (transport={cfg.transport}), "
+        f"password length={len(password)}"
+    )
+
+    keyboard = HttpKeyboardOutput(
+        base_url=cfg.pi_base_url,
+        timeout=10.0,
+        transport=cfg.transport,
+    )
+    mouse = HttpMouseOutput(
+        base_url=cfg.pi_base_url,
+        timeout=10.0,
+        transport=cfg.transport,
+    )
+    await keyboard.connect()
+    await mouse.connect()
+
+    session = None
+    needs_session = args.click_input or not args.no_verify
+    if needs_session:
+        # Build a full InteractiveSession so we can run the visual
+        # login-screen check and (optionally) the input-field click.
+        from terminaleyes.capture.webcam import WebcamCapture
+        from terminaleyes.commander.evaluator import ConditionEvaluator
+        from terminaleyes.commander.executor import ActionExecutor
+        from terminaleyes.commander.interactive import InteractiveSession
+
+        resolution = None
+        if (settings.capture.resolution_width
+                and settings.capture.resolution_height):
+            resolution = (
+                settings.capture.resolution_width,
+                settings.capture.resolution_height,
+            )
+        capture = WebcamCapture(
+            device_index=settings.capture.device_index,
+            resolution=resolution,
+        )
+        await capture.open()
+        evaluator = ConditionEvaluator(
+            model=cfg.lmstudio_model,
+            base_url=cfg.lmstudio_base_url,
+            max_tokens=cfg.lmstudio_max_tokens,
+        )
+        executor = ActionExecutor(
+            keyboard=keyboard,
+            mouse=mouse,
+            screen_width=cfg.screen_width,
+            screen_height=cfg.screen_height,
+            capture=capture,
+            evaluator=evaluator,
+        )
+        session = InteractiveSession(
+            capture=capture,
+            evaluator=evaluator,
+            executor=executor,
+            model=cfg.lmstudio_model,
+            base_url=cfg.lmstudio_base_url,
+            max_tokens=cfg.lmstudio_max_tokens,
+            vision_model=cfg.lmstudio_vision_model,
+            vision_base_url=cfg.vision_base_url,
+            skip_screen_check=True,
+        )
+        await session._ensure_client()
+
+    flow = LoginFlow(mouse=mouse, keyboard=keyboard, session=session)
+    try:
+        sent = await flow.login(
+            password=password,
+            wake=not args.no_wake,
+            click_input=args.click_input,
+            submit=not args.no_submit,
+            verify=not args.no_verify,
+            verify_attempts=args.verify_attempts,
+            verify_interval=args.verify_interval,
+        )
+        if sent:
+            print("Login command sent.")
+        else:
+            print("Login NOT sent (verification refused).")
+    finally:
+        # Drop the password reference promptly — Python won't zero
+        # the string memory but it'll be gc-eligible.
+        password = None
+        await keyboard.disconnect()
+        await mouse.disconnect()
 
 
 async def _watch(settings, args) -> None:

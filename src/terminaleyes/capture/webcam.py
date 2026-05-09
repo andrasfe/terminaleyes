@@ -74,7 +74,7 @@ class WebcamCapture(CaptureSource):
         """Release the webcam device."""
         if self._cap is not None and self._cap.isOpened():
             self._cap.release()
-            logger.info("Released webcam device %d", self._device_index)
+            logger.debug("Released webcam device %d", self._device_index)
         self._cap = None
         self._is_open = False
 
