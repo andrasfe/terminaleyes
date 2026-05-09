@@ -41,6 +41,7 @@ from terminaleyes.agents.cursor import CursorAgent
 from terminaleyes.agents.focus import FocusAgent
 from terminaleyes.agents.login import LoginAgent
 from terminaleyes.agents.navigate import NavigateAgent
+from terminaleyes.agents.scroll import ScrollAgent
 from terminaleyes.agents.target import TargetAgent
 from terminaleyes.agents.type_text import TypeAgent
 from terminaleyes.agents.verify import VerifyAgent
@@ -73,8 +74,9 @@ REGISTRY: dict[str, tuple[type, str]] = {
     "focus":    (FocusAgent,    "centre and maximise the foreground app"),
     "login":    (LoginAgent,    "wake + verify-login + type password from vault"),
     "type":     (TypeAgent,     "type text (optional secret + Enter)"),
-    "navigate": (NavigateAgent, "type a URL into the browser address bar"),
-    "click":    (ClickAgent,    "find a target by description and click it"),
+    "navigate": (NavigateAgent, "type a URL into a browser address bar (browser-aware)"),
+    "click":    (ClickAgent,    "find a target by description; scroll-and-retry if not visible"),
+    "scroll":   (ScrollAgent,   "scroll up/down via the mouse wheel"),
     "cursor":   (CursorAgent,   "locate the mouse cursor in the current frame"),
     "target":   (TargetAgent,   "locate a target by description (no click)"),
     # Aliases (kept for backwards compat).
@@ -187,6 +189,18 @@ def _plan_one(
     # wake
     if sl == "wake":
         return [PlanStep("wake", WakeAgent, {})]
+
+    # scroll <direction> [N]
+    scroll_match = re.match(
+        r"^scroll(?:\s+(up|down))?(?:\s+(\d+))?$", sl, re.IGNORECASE,
+    )
+    if scroll_match:
+        direction = scroll_match.group(1) or "down"
+        amount = int(scroll_match.group(2)) if scroll_match.group(2) else 4
+        return [PlanStep(
+            "scroll", ScrollAgent,
+            {"direction": direction, "amount": amount},
+        )]
 
     # No rule matched.
     return []
