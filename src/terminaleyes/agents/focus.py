@@ -1,0 +1,231 @@
+"""Focus agent — bring the foreground app to a centred / maximised state.
+
+Uses :class:`VerifyAgent` to decide visually whether the main
+application window is "in focus and centred", and if not, takes a
+sequence of corrective actions:
+
+  1. Send the WM "maximise focused window" combo (GNOME ``Super+Up``;
+     fall back to ``Alt+F10`` which most EWMH-compliant WMs honour).
+  2. Re-verify after a brief settle.
+  3. If still not centred, click in the image centre to give the
+     window keyboard focus, then retry the maximise combo.
+  4. If still not centred, send ``Super+h`` to unhide / Super to open
+     the activities overview as a last resort.
+
+Each attempt re-verifies. We never click without first having a
+visual confirmation, and we abort cleanly after ``max_attempts``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+
+from terminaleyes.agents.base import Agent, Outcome
+from terminaleyes.agents.verify import VerifyAgent
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FocusOutcome(Outcome):
+    pass
+
+
+class FocusAgent(Agent):
+    """Verify-then-fix the foreground window's centring."""
+
+    name = "focus"
+
+    QUESTION = (
+        "Look at the screen. Decide whether the foreground application "
+        "window is maximised/centred and READY for interaction.\n\n"
+        "Answer FALSE if ANY of these are true:\n"
+        "  * the screen is black, dark, dim, blurred, or appears off/asleep\n"
+        "  * the screen shows a screensaver, lock screen, or login prompt\n"
+        "  * no clear application UI (text, controls, menus, content) is "
+        "visible at all\n"
+        "  * the foreground window is small, off-centre, or surrounded "
+        "by visible desktop borders\n\n"
+        "Answer TRUE only when ALL of these are true:\n"
+        "  * clear application UI is visible (text/controls/content)\n"
+        "  * the foreground window occupies the majority of the visible "
+        "screen area\n"
+        "  * the user could comfortably interact with it as the primary "
+        "window right now"
+    )
+
+    AWAKE_QUESTION = (
+        "Is the screen currently showing clear, readable application "
+        "content — i.e. NOT dark, blurred, off, asleep, on a screensaver, "
+        "or on a lock/login screen? Answer true only if normal app UI "
+        "is visible."
+    )
+
+    async def run(
+        self,
+        *,
+        max_attempts: int = 3,
+        platform: str = "linux",
+        settle_seconds: float = 0.7,
+        wake_first: bool = True,
+    ) -> FocusOutcome:
+        if self.ctx.keyboard is None:
+            return FocusOutcome(
+                success=False, reason="no keyboard in context",
+            )
+
+        verifier = VerifyAgent(self.ctx)
+
+        if wake_first:
+            await self._wake()
+
+        # Pre-check: is the screen even showing content? Refuses to
+        # answer the "is it centred" question until we have something
+        # to look at — prevents hallucinated "yes" verdicts on dark
+        # frames.
+        awake = await verifier.run(
+            question=self.AWAKE_QUESTION, visual_only=True,
+        )
+        print(
+            f"FocusAgent: awake check — awake={bool(awake)} "
+            f"reason={awake.reason!r}"
+        )
+        if not awake:
+            # Try one more wake nudge cycle, then re-check.
+            await self._wake()
+            awake = await verifier.run(
+                question=self.AWAKE_QUESTION, visual_only=True,
+            )
+            print(
+                f"FocusAgent: awake re-check — awake={bool(awake)} "
+                f"reason={awake.reason!r}"
+            )
+        if not awake:
+            return FocusOutcome(
+                success=False,
+                reason=(
+                    f"screen is not awake / showing no content "
+                    f"({awake.reason}); won't act"
+                ),
+                data={"attempts": 0, "awake": False},
+            )
+
+        # 0. Initial check.
+        v0 = await verifier.run(question=self.QUESTION, visual_only=True)
+        print(
+            f"FocusAgent: initial check — focused={bool(v0)} "
+            f"reason={v0.reason!r}"
+        )
+        if v0:
+            return FocusOutcome(
+                success=True,
+                reason=f"already focused: {v0.reason}",
+                data={"attempts": 0},
+            )
+
+        for attempt in range(1, max_attempts + 1):
+            await self._apply_action(attempt, platform)
+            await asyncio.sleep(settle_seconds)
+            v = await verifier.run(
+                question=self.QUESTION, visual_only=True,
+            )
+            print(
+                f"FocusAgent: attempt {attempt}/{max_attempts} — "
+                f"focused={bool(v)} reason={v.reason!r}"
+            )
+            if v:
+                return FocusOutcome(
+                    success=True,
+                    reason=f"focused after attempt {attempt}: {v.reason}",
+                    data={"attempts": attempt},
+                )
+
+        return FocusOutcome(
+            success=False,
+            reason=(
+                f"still not centred/focused after {max_attempts} "
+                f"attempts"
+            ),
+            data={"attempts": max_attempts},
+        )
+
+    async def _wake(self) -> None:
+        """Wake the monitor / dismiss screensaver before checking."""
+        kb = self.ctx.keyboard
+        mouse = self.ctx.mouse
+        try:
+            if mouse is not None:
+                for _ in range(3):
+                    await mouse.move(20, 0)
+                    await asyncio.sleep(0.04)
+                    await mouse.move(-20, 0)
+                    await asyncio.sleep(0.04)
+            if kb is not None:
+                # A safe-no-op key on most desktops.
+                await kb.send_keystroke("Down")
+        except Exception as e:
+            logger.warning("Wake step failed: %s", e)
+        await asyncio.sleep(0.8)
+
+    async def _apply_action(self, attempt: int, platform: str) -> None:
+        """Send one corrective action.
+
+        Strategy escalates each attempt: maximise → click+maximise →
+        WM-overview hint. ``platform`` selects the key combos.
+        """
+        kb = self.ctx.keyboard
+        mouse = self.ctx.mouse
+        if attempt == 1:
+            # Maximise focused window.
+            try:
+                if platform == "macos":
+                    # macOS doesn't have a system-wide "maximize"; the
+                    # "zoom" green-button is per-app. Best portable
+                    # bet: Cmd+Ctrl+F (fullscreen), but this can make
+                    # the situation worse. Skip on macOS unless asked.
+                    print(
+                        "FocusAgent: macOS has no portable maximise "
+                        "combo; sending Option+Cmd+F (fullscreen "
+                        "toggle) — be careful."
+                    )
+                    await kb.send_key_combo(["alt", "cmd"], "f")
+                else:
+                    # GNOME/most Linux WMs.
+                    await kb.send_key_combo(["super"], "Up")
+            except Exception as e:
+                logger.warning("Maximise combo failed: %s", e)
+        elif attempt == 2:
+            # Click image centre to give the visible app keyboard
+            # focus, then retry maximise.
+            try:
+                if mouse is not None:
+                    # Slam to corner, then move ~half-screen so we
+                    # land somewhere on the visible window. Without
+                    # calibration, send a deliberate move via small
+                    # chunks — the Pi backend handles chunking.
+                    for dx, dy in [(80, 80)] * 6:
+                        await mouse.move(dx, dy)
+                        await asyncio.sleep(0.02)
+                    await mouse.click("left")
+                    await asyncio.sleep(0.2)
+            except Exception as e:
+                logger.warning("Centre-click step failed: %s", e)
+            try:
+                if platform == "macos":
+                    await kb.send_key_combo(["alt", "cmd"], "f")
+                else:
+                    await kb.send_key_combo(["super"], "Up")
+            except Exception as e:
+                logger.warning("Maximise combo (retry) failed: %s", e)
+        else:
+            # Last-resort: Alt+F10 (EWMH maximise hint) on Linux,
+            # or repeat the combo for macOS.
+            try:
+                if platform == "macos":
+                    await kb.send_key_combo(["alt", "cmd"], "f")
+                else:
+                    await kb.send_key_combo(["alt"], "F10")
+            except Exception as e:
+                logger.warning("Fallback combo failed: %s", e)

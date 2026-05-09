@@ -99,6 +99,74 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Evaluate conditions but don't execute actions",
     )
 
+    do_parser = subparsers.add_parser(
+        "do",
+        help="Run the ControllerAgent on a high-level intent (chains agents)",
+    )
+    do_parser.add_argument(
+        "intent", type=str,
+        help="Free-form intent, e.g. 'login and open reddit.com'",
+    )
+    do_parser.add_argument(
+        "--no-focus", action="store_true",
+        help="Don't prepend FocusAgent before clicks/navigation",
+    )
+    do_parser.add_argument(
+        "--vault", type=str, default=None,
+        help="Vault entry to use when the plan includes a login step",
+    )
+    do_parser.add_argument(
+        "--platform", choices=["linux", "macos"], default="linux",
+        help="Target platform (selects key combos). Default linux.",
+    )
+    do_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print the plan without executing",
+    )
+
+    focus_parser = subparsers.add_parser(
+        "focus",
+        help="Verify the foreground app is centred/maximised; fix if not",
+    )
+    focus_parser.add_argument(
+        "--max-attempts", type=int, default=3,
+        help="How many corrective actions to try before giving up (default 3).",
+    )
+    focus_parser.add_argument(
+        "--platform", choices=["linux", "macos"], default="linux",
+        help="Which key-combo set to use (default linux/GNOME).",
+    )
+
+    vault_parser = subparsers.add_parser(
+        "vault",
+        help="Manage the local encrypted vault for secrets",
+    )
+    vault_sub = vault_parser.add_subparsers(
+        dest="vault_command", help="Vault operations",
+    )
+    v_add = vault_sub.add_parser(
+        "add", help="Store/overwrite a named secret (value via getpass)",
+    )
+    v_add.add_argument("name", type=str, help="Entry name")
+    v_get = vault_sub.add_parser(
+        "get", help="Print a stored secret to stdout (warns if TTY)",
+    )
+    v_get.add_argument("name", type=str)
+    v_get.add_argument(
+        "--no-confirm", action="store_true",
+        help="Skip the TTY confirmation prompt",
+    )
+    v_list = vault_sub.add_parser(
+        "list", help="List entry names (never values)",
+    )
+    v_remove = vault_sub.add_parser(
+        "remove", help="Delete an entry",
+    )
+    v_remove.add_argument("name", type=str)
+    vault_sub.add_parser(
+        "status", help="Show backend and vault file path",
+    )
+
     login_parser = subparsers.add_parser(
         "login",
         help="Wake the remote screen and type the login password",
@@ -111,6 +179,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     login_parser.add_argument(
         "--password-env", type=str, default=None,
         help="Read the password from this environment variable.",
+    )
+    login_parser.add_argument(
+        "--vault", type=str, default=None,
+        help="Read the password from the local vault under this name "
+             "(see `terminaleyes vault add`).",
     )
     login_parser.add_argument(
         "--no-wake", action="store_true",
@@ -489,6 +562,17 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("Starting remote login flow")
         asyncio.run(_run_login(settings, args))
 
+    elif args.command == "vault":
+        _run_vault(args)
+
+    elif args.command == "focus":
+        logger.info("Running focus agent")
+        asyncio.run(_run_focus(settings, args))
+
+    elif args.command == "do":
+        logger.info("Running controller agent")
+        asyncio.run(_run_controller(settings, args))
+
 
 async def _run_interact(settings, args=None) -> None:
     """Run the interactive visual commander REPL."""
@@ -702,6 +786,201 @@ async def _run_command(settings, args) -> None:
             await mouse.disconnect()
 
 
+async def _build_agent_context(settings, *, with_capture: bool = True):
+    """Construct an AgentContext wired to the Pi + LM Studio.
+
+    Used by tier-3 agents (focus, navigate, etc.). Not used by the
+    pure-CLI vault subcommand (which doesn't need any Pi I/O).
+    """
+    from openai import AsyncOpenAI
+    from terminaleyes.agents.context import AgentContext
+    from terminaleyes.commander.evaluator import ConditionEvaluator
+    from terminaleyes.keyboard.http_backend import HttpKeyboardOutput
+    from terminaleyes.mouse.http_backend import HttpMouseOutput
+
+    cfg = settings.commander
+
+    keyboard = HttpKeyboardOutput(
+        base_url=cfg.pi_base_url,
+        timeout=10.0,
+        transport=cfg.transport,
+    )
+    mouse = HttpMouseOutput(
+        base_url=cfg.pi_base_url,
+        timeout=10.0,
+        transport=cfg.transport,
+    )
+    await keyboard.connect()
+    await mouse.connect()
+
+    capture = None
+    if with_capture:
+        from terminaleyes.capture.webcam import WebcamCapture
+        resolution = None
+        if (settings.capture.resolution_width
+                and settings.capture.resolution_height):
+            resolution = (
+                settings.capture.resolution_width,
+                settings.capture.resolution_height,
+            )
+        capture = WebcamCapture(
+            device_index=settings.capture.device_index,
+            resolution=resolution,
+        )
+        await capture.open()
+
+    client = AsyncOpenAI(
+        base_url=cfg.lmstudio_base_url, api_key="not-needed",
+    )
+    evaluator = ConditionEvaluator(
+        model=cfg.lmstudio_model,
+        base_url=cfg.lmstudio_base_url,
+        max_tokens=cfg.lmstudio_max_tokens,
+    )
+
+    ctx = AgentContext(
+        mouse=mouse,
+        keyboard=keyboard,
+        capture=capture,
+        vision_client=client,
+        vision_model=cfg.lmstudio_model,
+        evaluator=evaluator,
+    )
+    return ctx, keyboard, mouse, capture
+
+
+async def _run_controller(settings, args) -> None:
+    """Run the ControllerAgent on a free-form intent."""
+    from terminaleyes.agents.controller import ControllerAgent
+
+    ctx, keyboard, mouse, capture = await _build_agent_context(
+        settings, with_capture=True,
+    )
+    # Wire the vault lazily — only if the plan needs it.
+    try:
+        agent = ControllerAgent(ctx)
+        outcome = await agent.run(
+            intent=args.intent,
+            no_focus=args.no_focus,
+            vault_name=args.vault,
+            platform=args.platform,
+            dry_run=args.dry_run,
+        )
+        if outcome:
+            print(f"\n✓ Controller succeeded — {outcome.reason}")
+        else:
+            print(f"\n✗ Controller failed — {outcome.reason}")
+    finally:
+        if capture is not None:
+            try:
+                await capture.close()
+            except Exception:
+                pass
+        await keyboard.disconnect()
+        await mouse.disconnect()
+
+
+async def _run_focus(settings, args) -> None:
+    """Run the FocusAgent end-to-end."""
+    from terminaleyes.agents.focus import FocusAgent
+
+    ctx, keyboard, mouse, capture = await _build_agent_context(
+        settings, with_capture=True,
+    )
+    try:
+        agent = FocusAgent(ctx)
+        outcome = await agent.run(
+            max_attempts=args.max_attempts,
+            platform=args.platform,
+        )
+        if outcome:
+            print(f"✓ FocusAgent succeeded — {outcome.reason}")
+        else:
+            print(f"✗ FocusAgent failed — {outcome.reason}")
+    finally:
+        if capture is not None:
+            try:
+                await capture.close()
+            except Exception:
+                pass
+        await keyboard.disconnect()
+        await mouse.disconnect()
+
+
+def _run_vault(args) -> None:
+    """Dispatch ``terminaleyes vault <subcommand>``."""
+    import sys
+    from terminaleyes.agents.vault import (
+        Vault, VaultError, get_passphrase,
+    )
+
+    sub = getattr(args, "vault_command", None)
+    if sub is None:
+        print(
+            "Usage: terminaleyes vault {add|get|list|remove|status} ..."
+        )
+        return
+
+    if sub == "status":
+        # Don't decrypt for status — just file metadata.
+        from terminaleyes.agents.vault import DEFAULT_PATH
+        path = DEFAULT_PATH
+        print(f"Backend : file (AES-256-GCM, scrypt KDF)")
+        print(f"Path    : {path}")
+        print(f"Exists  : {path.exists()}")
+        if path.exists():
+            import os as _os
+            mode = oct(_os.stat(path).st_mode & 0o777)
+            print(f"Mode    : {mode}")
+        return
+
+    try:
+        passphrase = get_passphrase()
+        vault = Vault(passphrase)
+
+        if sub == "add":
+            import getpass as _gp
+            value = _gp.getpass(f"Value for {args.name!r}: ")
+            if not value:
+                print("Refusing to store empty value.")
+                return
+            vault.set(args.name, value)
+            print(f"Stored {args.name!r}.")
+        elif sub == "get":
+            if sys.stdout.isatty() and not args.no_confirm:
+                ans = input(
+                    f"About to print secret {args.name!r} to terminal. "
+                    "Continue? [y/N]: "
+                )
+                if ans.strip().lower() not in ("y", "yes"):
+                    print("Cancelled.")
+                    return
+            print(vault.get(args.name))
+        elif sub == "list":
+            names = vault.names()
+            if not names:
+                print("(empty)")
+            else:
+                for n in names:
+                    print(n)
+        elif sub == "remove":
+            if vault.remove(args.name):
+                print(f"Removed {args.name!r}.")
+            else:
+                print(f"No entry named {args.name!r}.")
+        else:
+            print(f"Unknown vault subcommand: {sub!r}")
+    except VaultError as e:
+        print(f"Vault error: {e}")
+        sys.exit(1)
+    except KeyError as e:
+        print(f"Not found: {e}")
+        sys.exit(1)
+    finally:
+        # Drop the passphrase reference promptly.
+        passphrase = None
+
+
 async def _run_login(settings, args) -> None:
     """Wake the remote screen and type the login password."""
     from terminaleyes.commander.login import LoginFlow, resolve_password
@@ -711,11 +990,12 @@ async def _run_login(settings, args) -> None:
     cfg = settings.commander
 
     # Resolve password BEFORE printing config — we want any error
-    # (missing file / env var) to surface before bringing up the BT
-    # transport.
+    # (missing file / env var / vault entry) to surface before
+    # bringing up the BT transport.
     password = resolve_password(
         file_path=args.password_file,
         env_var=args.password_env,
+        vault_name=args.vault,
     )
     if not password:
         print("Refusing to send empty password.")
