@@ -123,6 +123,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run", action="store_true",
         help="Print the plan without executing",
     )
+    do_parser.add_argument(
+        "--no-llm-fallback", action="store_true",
+        help="Disable the LLM-planner fallback when no rule matches",
+    )
 
     focus_parser = subparsers.add_parser(
         "focus",
@@ -865,6 +869,7 @@ async def _run_controller(settings, args) -> None:
             vault_name=args.vault,
             platform=args.platform,
             dry_run=args.dry_run,
+            allow_llm_fallback=not args.no_llm_fallback,
         )
         if outcome:
             print(f"\n✓ Controller succeeded — {outcome.reason}")

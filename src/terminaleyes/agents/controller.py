@@ -36,10 +36,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from terminaleyes.agents.base import Agent, Outcome
+from terminaleyes.agents.click import ClickAgent
+from terminaleyes.agents.cursor import CursorAgent
 from terminaleyes.agents.focus import FocusAgent
 from terminaleyes.agents.login import LoginAgent
 from terminaleyes.agents.navigate import NavigateAgent
-from terminaleyes.agents.search import SearchAgent
+from terminaleyes.agents.target import TargetAgent
 from terminaleyes.agents.type_text import TypeAgent
 from terminaleyes.agents.verify import VerifyAgent
 from terminaleyes.agents.wake import WakeAgent
@@ -72,7 +74,11 @@ REGISTRY: dict[str, tuple[type, str]] = {
     "login":    (LoginAgent,    "wake + verify-login + type password from vault"),
     "type":     (TypeAgent,     "type text (optional secret + Enter)"),
     "navigate": (NavigateAgent, "type a URL into the browser address bar"),
-    "search":   (SearchAgent,   "find a target by description and click it"),
+    "click":    (ClickAgent,    "find a target by description and click it"),
+    "cursor":   (CursorAgent,   "locate the mouse cursor in the current frame"),
+    "target":   (TargetAgent,   "locate a target by description (no click)"),
+    # Aliases (kept for backwards compat).
+    "search":   (ClickAgent,    "alias of 'click'"),
 }
 
 
@@ -161,7 +167,7 @@ def _plan_one(
         if not no_focus:
             steps.append(PlanStep("focus", FocusAgent, {"platform": platform}))
         steps.append(PlanStep(
-            "search", SearchAgent, {"target": target},
+            "click", ClickAgent, {"target": target},
         ))
         return steps
 
@@ -238,6 +244,7 @@ class ControllerAgent(Agent):
         platform: str = "linux",
         dry_run: bool = False,
         max_steps: int = MAX_STEPS,
+        allow_llm_fallback: bool = True,
     ) -> ControllerOutcome:
         plan = plan_intent(
             intent,
@@ -245,12 +252,25 @@ class ControllerAgent(Agent):
             vault_name=vault_name,
             platform=platform,
         )
+        plan_source = "rules"
+        if not plan and allow_llm_fallback:
+            print(
+                f"No rule matched {intent!r}; asking LLM planner..."
+            )
+            plan = await self._llm_plan(
+                intent,
+                no_focus=no_focus,
+                platform=platform,
+                vault_name=vault_name,
+            )
+            plan_source = "llm"
         if not plan:
             return ControllerOutcome(
                 success=False,
                 reason=(
-                    f"no rule matched intent {intent!r}; "
-                    "LLM-planner fallback not yet implemented"
+                    f"no rule matched intent {intent!r}"
+                    + ("" if allow_llm_fallback
+                       else "; LLM fallback disabled")
                 ),
                 data={"intent": intent},
             )
@@ -261,7 +281,7 @@ class ControllerAgent(Agent):
                 data={"plan": [s.name for s in plan]},
             )
 
-        print("Plan:")
+        print(f"Plan ({plan_source}):")
         for i, step in enumerate(plan, 1):
             print(f"  {i}. {step.name} {step.kwargs or ''}")
         if dry_run:
@@ -307,3 +327,141 @@ class ControllerAgent(Agent):
                 ],
             },
         )
+
+    # ───────────────────── LLM-planner fallback ─────────────────────
+
+    async def _llm_plan(
+        self,
+        intent: str,
+        *,
+        no_focus: bool,
+        platform: str,
+        vault_name: str | None,
+    ) -> list[PlanStep]:
+        """Ask the multimodal model to produce a plan.
+
+        Validates every step against :data:`REGISTRY`; rejects plans
+        that reference unknown actions, exceed the step cap, or
+        contain malformed kwargs.
+        """
+        if self.ctx.vision_client is None:
+            return []
+        agent_descriptions = "\n".join(
+            f"  - {name}: {desc}" for name, (_, desc) in REGISTRY.items()
+        )
+        prompt = (
+            "You are a JSON planner. The user wants to accomplish an "
+            "intent on a remote computer that we control via mouse + "
+            "keyboard. Decompose the intent into a sequence of agent "
+            "calls.\n\n"
+            f"User intent:\n    {intent}\n\n"
+            "Available agents:\n"
+            f"{agent_descriptions}\n\n"
+            "Hard rules:\n"
+            "  * Use ONLY the agents listed above; never invent names.\n"
+            "  * Plan length must be between 1 and "
+            f"{MAX_STEPS} steps.\n"
+            "  * Each step has a 'name' (one of the agents above) and "
+            "'kwargs' (a JSON object of arguments).\n"
+            "  * For 'click', 'navigate', 'login', kwargs are typed:\n"
+            "      click  -> {\"target\": \"<text description>\"}\n"
+            "      navigate -> {\"url\": \"<url>\", \"platform\": "
+            f"\"{platform}\"}}\n"
+            "      login  -> "
+            f"{{\"vault_name\": \"{vault_name or '<entry>'}\"}}"
+            " (omit if no vault entry available)\n"
+            "      type   -> {\"text\": \"...\", \"submit\": false}\n"
+            "      focus  -> "
+            f"{{\"platform\": \"{platform}\"}}\n"
+            "  * Prefix UI-affecting steps with a 'focus' step "
+            f"unless --no-focus was set ({not no_focus} here).\n\n"
+            "Respond with ONLY a JSON object — no preamble, no "
+            "markdown.\n\n"
+            'Schema: {"plan": ['
+            '{"name": "<agent>", "kwargs": {...}}, ...]}'
+        )
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": (
+                f"Plan the steps for: {intent!r}. Reply JSON only."
+            )},
+        ]
+        for attempt in range(2):
+            try:
+                kwargs: dict[str, Any] = dict(
+                    model=self.ctx.vision_model,
+                    max_tokens=900,
+                    temperature=0.0,
+                    messages=messages,
+                )
+                if attempt == 0:
+                    kwargs["response_format"] = {"type": "json_object"}
+                resp = await self.ctx.vision_client.chat.completions.create(
+                    **kwargs
+                )
+                break
+            except Exception as e:
+                if attempt == 0:
+                    logger.debug(
+                        "LLM-planner json_object format failed (%s); "
+                        "retrying free-form", e,
+                    )
+                    continue
+                logger.warning("LLM-planner call failed: %s", e)
+                return []
+        # Extract JSON.
+        raw = ""
+        try:
+            raw = resp.choices[0].message.content or ""
+        except Exception:
+            return []
+        plan_dict = self._extract_json(raw) or {}
+        steps_raw = plan_dict.get("plan")
+        if not isinstance(steps_raw, list) or not steps_raw:
+            logger.warning(
+                "LLM planner returned no plan (raw=%s)", raw[:200],
+            )
+            return []
+        validated: list[PlanStep] = []
+        for entry in steps_raw[:MAX_STEPS]:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "")).strip().lower()
+            kwargs = entry.get("kwargs", {})
+            if name not in REGISTRY:
+                logger.warning(
+                    "LLM planner referenced unknown agent %r — "
+                    "rejecting plan", name,
+                )
+                return []
+            if not isinstance(kwargs, dict):
+                logger.warning(
+                    "LLM planner kwargs for %s is not a dict — "
+                    "rejecting plan", name,
+                )
+                return []
+            agent_cls = REGISTRY[name][0]
+            validated.append(PlanStep(name, agent_cls, kwargs))
+        if not validated:
+            return []
+        print(f"LLM planner produced {len(validated)} step(s)")
+        return validated
+
+    @staticmethod
+    def _extract_json(raw: str) -> dict | None:
+        if not raw:
+            return None
+        import json
+        # Try direct parse first (model in JSON-mode).
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+        # Pull the first {...} substring.
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
