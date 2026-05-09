@@ -1,68 +1,230 @@
 # terminaleyes
 
-A vision-based agentic terminal controller. The agent controls a terminal purely through visual feedback (webcam) and keystroke output — no screen scraping, no API access to the shell.
-
-## How It Works
-
-```
-Webcam --> MLLM Interpreter --> Agent Strategy --> Keyboard Output --> Terminal
-   ^                                                                      |
-   +----------------------------------------------------------------------+
-                        (visual feedback loop)
-```
-
-1. A **pygame fullscreen display** renders a persistent shell session (white background, black text, large monospace font)
-2. A **webcam** captures what the screen looks like at 1920x1080
-3. A **multimodal LLM** (via OpenRouter) interprets the captured image — reading visible text, detecting prompts, errors, etc.
-4. An **agent strategy** decides the next keyboard action based on the goal and terminal state
-5. The action is sent via **HTTP** to the endpoint, which feeds it to the shell
-6. The display updates, and the loop repeats
-
-## Raspberry Pi Remote Keyboard
-
-The agent can control a physical machine via a Raspberry Pi Zero 2 W acting as a Bluetooth keyboard and mouse:
+Vision-based remote control of a real computer. A webcam watches the
+target's screen, classical CV + multimodal LLMs locate the cursor and
+click targets, and HID commands flow over Bluetooth (or USB) via a
+Raspberry Pi. The agent layer composes everything into a single
+high-level interface — `terminaleyes do "<intent>"`.
 
 ```
-[Dev Mac / Agent] --USB Ethernet--> [Pi Zero 2 W] --BT HID--> [Target Mac]
-     10.0.0.1        (ECM)            10.0.0.2       (L2CAP)    keyboard+mouse
+[Dev Mac / agent layer] --USB ECM Ethernet--> [Pi Zero 2 W] --BT HID--> [Target Mac/Ubuntu]
+        10.0.0.1                                  10.0.0.2                keyboard + mouse
+                                                                              ^
+                                                                              |
+                                                  webcam pointed here  -------+
 ```
 
-- **USB ECM Ethernet** connects the dev Mac to the Pi (no WiFi needed for the API)
-- **Bluetooth HID** sends keyboard and mouse events to the target Mac
-- The Pi's shared WiFi/BT radio is freed for Bluetooth since the API uses USB
+Detailed architecture and Pi setup live in [CLAUDE.md](./CLAUDE.md);
+agent index in [AGENTS.md](./AGENTS.md).
+
+## What you can do
+
+```bash
+# Top-level controller — rule planner with LLM-planner fallback
+terminaleyes do "click the Run button"
+terminaleyes do "go to reddit.com/r/LocalLLaMA"
+terminaleyes do "login and open reddit.com" --vault myhost
+terminaleyes do --dry-run "wake the screen and centre the browser"
+
+# Direct agent invocations
+terminaleyes login              # wake → visually verify login → type from vault
+terminaleyes focus              # centre + maximise the foreground app
+terminaleyes vault add NAME     # encrypted local credential store
+
+# Legacy REPL (still works)
+terminaleyes interact -m "click X"
+```
+
+## Agent layer
+
+```
+agents/
+├── base.py / context.py   — Agent ABC, Outcome, AgentContext
+├── vault.py               — AES-256-GCM credential store (scrypt KDF)
+│
+├── verify.py              — tier-1: visual yes/no oracle
+├── cursor.py              — tier-1: locate cursor (HSV / variance / diff)
+├── target.py              — tier-1: locate target by description
+│
+├── wake.py                — tier-2: wake screen
+├── type_text.py           — tier-2: text input (with secret mode)
+│
+├── focus.py               — tier-3: centre + maximise the foreground app
+├── login.py               — tier-3: wake + verify-login + type secret
+├── navigate.py            — tier-3: URL-bar typing
+├── click.py               — tier-3: find-and-click (was SearchAgent)
+│
+└── controller.py          — top-level: rules + LLM-planner fallback
+```
+
+Each agent is a small testable unit returning a typed
+`Outcome { success, reason, data }`. Higher tiers compose lower tiers
+through the shared `AgentContext`. The `ControllerAgent` decomposes
+free-form English intents into agent sequences:
+
+```
+"click the Run button"      → [FocusAgent, ClickAgent(target=...)]
+"go to URL"                 → [FocusAgent, NavigateAgent(url=...)]
+"login and open reddit.com" → [LoginAgent, FocusAgent, NavigateAgent]
+"wake then centre browser"  → [WakeAgent, FocusAgent]   (LLM fallback)
+```
+
+## How clicking works
+
+The visual servo homer behind `ClickAgent`:
+
+1. **Slam to corner** — many `(-20,-20)` mouse moves; cursor is now at top-left of screen.
+2. **Detect cursor** —
+   - HSV thresholding for a saturated red `redglass`-style cursor
+     (motion-verified to reject static red UI elements like the Reddit logo).
+   - Falls back to **oscillation-variance**: jiggle 6 short HID bursts,
+     pick the pixel cluster with highest std-dev across captured frames.
+     Robust on any default cursor.
+3. **Locate target** — cascade:
+   - Tesseract OCR (multi-pass scales / PSMs / both polarities for dark mode), restricted to the user's quoted token when present.
+   - Scene-map (multimodal) + ShowUI grounding of the matched label.
+   - ShowUI on focused crops (sidebar, footer).
+4. **Visual servo loop** — proportional HID move + ROI-prior frame diff to track the cursor; ratio learned online with floor/ceil clamps.
+5. **Click gate** — geometric: cursor within ~1.2% of aim point for 2 consecutive frames.
+6. **Click retry diamond** — first click often overshoots by ~1%; if the post-click oracle says nothing changed, nudge in 4 directions and re-verify.
+7. **Post-click navigation oracle** — capture ~2.5s after click, OCR the URL bar / page header, look for the target's distinguishing keywords.
+
+## How login works
+
+`LoginAgent`:
+
+1. **Wake** — mouse jiggle + Down arrow + click; dismisses GDM clock overlay.
+2. **Polled visual verification** — `VerifyAgent` asks the multimodal model "does this LOOK like a login/password screen?" using **visual cues only** (centred input, hidden-character dots, avatar, clock, dark blurred background) — never relies on the literal word "password" appearing. Default 6 polls × 1.0s with mouse / arrow nudges between.
+3. **Type password** — `keyboard.send_text(pw, secret=True)` so the dev-side log records only `length=N`. Pi side already only logs length.
+4. **Submit** — Enter (skippable with `--no-submit`).
+
+Password sources, in priority order:
+- `--vault NAME` — read from local AES-GCM vault
+- `--password-file PATH` — path visible in `ps`, contents not
+- `--password-env VAR` — variable name visible, value not
+- Interactive `getpass.getpass()` (default)
+
+The password is **never** a positional CLI argument.
+
+## Vault
+
+```bash
+# Store a secret (value via getpass; passphrase via getpass too)
+terminaleyes vault add github
+
+# Use it in a login flow
+terminaleyes login --vault github
+
+# Manage
+terminaleyes vault list           # entry names only
+terminaleyes vault status         # backend + path + mode
+terminaleyes vault remove github
+```
+
+Format: AES-256-GCM at `~/.config/terminaleyes/vault.enc`, mode
+`0600`. Scrypt KDF (`N=2^15, r=8, p=1`). Master passphrase via
+`getpass` or `TERMINALEYES_VAULT_PASSPHRASE` env var.
+
+## Models
+
+- **`nvidia/nemotron-3-nano-omni`** on LM Studio (port 1234) —
+  default multimodal: scene-map enumeration, login-screen verifier,
+  post-click navigation oracle, LLM-planner fallback. Override with
+  `TERMINALEYES_COMMANDER__LMSTUDIO_MODEL`.
+- **`ShowUI-2B`** on llama.cpp (port 1235) — fast UI grounding (~0.1s/query). Used as fallback when OCR misses.
+- **tesseract** (system binary) — primary text-target locator AND
+  post-click URL-bar oracle. Cheapest and most reliable signal when
+  the target is named text.
+
+```bash
+# ShowUI llama.cpp server
+brew install llama.cpp
+llama-server \
+  --hf-repo localattention/ShowUI-2B-Q4_K_M-GGUF \
+  --hf-file showui-2b-q4_k_m.gguf \
+  --mmproj <mmproj-Qwen2-VL-2B-Instruct-f16.gguf> \
+  -c 4096 --port 1235
+# Note: do NOT use --image-min-tokens — it breaks ShowUI output.
+
+# Tesseract (OCR backend)
+brew install tesseract
+pip install pytesseract
+```
+
+## Cursor on the target machine
+
+Detection works on any default cursor via oscillation-variance, but a
+high-contrast cursor lets HSV detection take over (faster, no
+jiggle).
+
+- **Ubuntu / GNOME**:
+  ```bash
+  sudo apt install -y xcursor-themes
+  gsettings set org.gnome.desktop.interface cursor-theme 'redglass'
+  gsettings set org.gnome.desktop.interface cursor-size 96
+  ```
+  Log out / open a new app for the theme to apply.
+- **macOS**: System Settings → Accessibility → Display → Pointer
+  (set saturated colours, max size).
+
+## Webcam vs capture card
+
+The webcam path works; the homer compensates for perspective, glare,
+bezel, and small-text OCR limits with a fallback chain. A USB capture
+card (HDMI → UVC) is a strict upgrade: image-px = screen-px, no
+bezel/glare, OCR reads any on-screen text. Most CV / perspective
+compensation in the homer becomes redundant. Same `cv2.VideoCapture`
+interface — typically a config-only swap (different `device_index`).
+
+## Raspberry Pi remote keyboard
+
+```
+[Dev Mac]  --USB ECM Ethernet-->  [Pi Zero 2 W]  --Bluetooth HID-->  [Target]
+ 10.0.0.1                            10.0.0.2                       keyboard + mouse
+```
+
+- USB ECM Ethernet for the Pi REST API (no WiFi needed)
+- Bluetooth HID to drive the target — the Pi's BCM43436s shares one
+  radio between WiFi and BT, so freeing WiFi (ECM mode) gives BT a
+  stable channel
+- USB HID gadget mode (`/dev/hidg0`, `/dev/hidg1`) is a viable
+  fallback when BT can't be used
 
 ### Pi REST API endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Server + connection status |
-| POST | `/bt/keystroke` | BT keyboard key `{"key": "Enter"}` |
-| POST | `/bt/key-combo` | BT keyboard combo `{"modifiers": ["ctrl"], "key": "c"}` |
-| POST | `/bt/text` | BT keyboard text `{"text": "hello"}` |
-| POST | `/bt/mouse/move` | BT mouse move `{"x": 10, "y": -5}` |
-| POST | `/bt/mouse/click` | BT mouse click `{"button": "left"}` |
-| POST | `/bt/mouse/scroll` | BT mouse scroll `{"amount": -3}` |
+| GET    | `/health` | Server + connection status |
+| POST   | `/bt/keystroke` | BT keyboard key `{"key": "Enter"}` |
+| POST   | `/bt/key-combo` | BT keyboard combo `{"modifiers": ["ctrl"], "key": "c"}` |
+| POST   | `/bt/text` | BT keyboard text `{"text": "hello"}` |
+| POST   | `/bt/mouse/move` | BT mouse move `{"x": 10, "y": -5}` |
+| POST   | `/bt/mouse/click` | BT mouse click `{"button": "left"}` |
+| POST   | `/bt/mouse/scroll` | BT mouse scroll `{"amount": -3}` |
 
-USB HID endpoints (`/keystroke`, `/text`, `/key-combo`, `/mouse/*`) are also available when using `hid` or `all` gadget mode.
+USB HID variants (`/keystroke`, `/text`, `/key-combo`, `/mouse/*`)
+exist when using `hid` or `all` gadget mode.
 
 ### Quick start (Pi)
 
 ```bash
 # On the Pi (via SSH over USB ECM at 10.0.0.2):
 sudo bash scripts/setup_usb_gadget.sh ecm   # USB Ethernet gadget
-sudo bash scripts/setup_bt_hid.sh            # One-time BT HID config
-sudo bash scripts/radio_mode.sh bt           # Switch to Bluetooth mode
-sudo systemctl start terminaleyes-pi         # Start REST API
+sudo bash scripts/setup_bt_hid.sh           # one-time BT HID config
+sudo bash scripts/radio_mode.sh bt          # switch to Bluetooth mode
+sudo systemctl start terminaleyes-pi        # start REST API
 
 # On dev Mac:
 curl http://10.0.0.2:8080/health
 
-# After pairing target Mac via Bluetooth Settings:
+# After pairing target Mac/Ubuntu via Bluetooth Settings:
 curl -X POST -H 'Content-Type: application/json' \
   -d '{"text":"hello from pi"}' http://10.0.0.2:8080/bt/text
 ```
 
-See `CLAUDE.md` for detailed setup, debugging checklist, and troubleshooting.
+CLAUDE.md has the full pairing checklist, debugging commands, and the
+hard-won lessons (band steering, persistent NetworkManager
+connections, BlueZ `--noplugin=input`, etc.).
 
 ## Installation
 
@@ -70,185 +232,56 @@ See `CLAUDE.md` for detailed setup, debugging checklist, and troubleshooting.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
+brew install tesseract
+pip install pytesseract
 ```
 
 ## Configuration
 
-### 1. Create a `.env` file in the project root:
+Most defaults are sensible. Common overrides via environment variables:
 
 ```bash
-OPENROUTER_API_KEY=sk-or-v1-...
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-VISION_MODEL=google/gemini-2.0-flash-lite-001
+# Model used by the agent layer (multimodal calls)
+export TERMINALEYES_COMMANDER__LMSTUDIO_MODEL='nvidia/nemotron-3-nano-omni'
+
+# Pi base URL (defaults to http://10.0.0.2:8080)
+export TERMINALEYES_COMMANDER__PI_BASE_URL='http://10.0.0.2:8080'
+
+# Vault master passphrase (only set this for unattended scripting)
+export TERMINALEYES_VAULT_PASSPHRASE='...'
 ```
 
-### 2. Edit `config/terminaleyes.yaml`:
+For the older terminal-display loop (`terminaleyes run`) configuration
+lives in `config/terminaleyes.yaml`; see CLAUDE.md.
 
-```yaml
-capture:
-  device_index: 0
-  capture_interval: 2.0
-  crop_enabled: false
-  resolution_width: 1920
-  resolution_height: 1080
-mllm:
-  max_tokens: 1024
-endpoint:
-  host: 0.0.0.0
-  port: 8080
-  shell_command: /bin/bash
-  terminal_rows: 10
-  terminal_cols: 25
-  font_size: 24
-  fg_color: [0, 0, 0]
-  bg_color: [255, 255, 255]
-  fullscreen: true
-keyboard:
-  backend: http
-  http_base_url: http://localhost:8080
-agent:
-  action_delay: 2.5
-  max_consecutive_errors: 5
-  default_max_steps: 100
-logging:
-  level: INFO
+## Architecture overview
+
+```
+src/terminaleyes/
+├── agents/             # Tiered agent layer (see AGENTS.md)
+├── commander/          # Implementation modules: visual servo homer, OCR, cursor finder, scene-map
+├── capture/            # Webcam capture (cv2.VideoCapture wrapper)
+├── interpreter/        # MLLM provider clients (OpenAI-compatible)
+├── keyboard/           # Abstract keyboard + HTTP/USB backends
+├── mouse/              # Abstract mouse + HTTP backend
+├── raspi/              # Pi-side: HID codes, BT HID, REST server
+├── endpoint/           # Local dev terminal display
+├── agent/              # Older goal-driven loop (terminaleyes run)
+├── watcher/            # Passive screen observer (terminaleyes watch)
+├── config/             # Pydantic settings from YAML + env
+└── cli.py              # All subcommand wiring
 ```
 
-Key settings for reliable MLLM reading:
-- **White background + black text** — dramatically better OCR accuracy than dark terminals
-- **1920x1080 webcam** — 9x more pixels than the default 640x480
-- **Few rows/cols** (10x25) — auto-scales font to ~126px, easily readable through camera
-- **Fullscreen** — maximizes text size on display
-
-## Interactive Visual Commander
-
-Control a remote screen interactively via webcam + MLLM. Point the webcam at a monitor, and type commands or ask questions:
+## Other commands
 
 ```bash
-# Interactive REPL
-terminaleyes interact
-
-# Single command
-terminaleyes interact -m "click the Run button at the bottom right"
-
-# Skip calibration (use saved values)
-terminaleyes interact --skip-calibration -m "click the Review button"
+terminaleyes-pi                       # start Pi REST endpoint
+terminaleyes capture-test             # save one webcam frame
+terminaleyes endpoint                 # local dev terminal display
+terminaleyes watch                    # passive screen observer
+terminaleyes run --goal "..."         # older goal-driven agent loop
+terminaleyes validate                 # MLLM-vs-actual-screen check
 ```
-
-The interactive session uses a dual-model architecture:
-- **Gemma 4 31B** (LM Studio) — reasoning, screen description, element location
-- **ShowUI-2B** (llama.cpp) — fast UI element coordinate grounding (~0.1s/query)
-
-### How clicking works
-
-1. **Find target**: ShowUI locates the element (fast). Falls back to gemma if ShowUI fails.
-2. **Map coordinates**: Detects screen edges in the webcam image to map image coordinates → screen coordinates.
-3. **Calibrate**: Interactive calibration measures HID-unit-to-pixel ratio (done once, cached to `~/.terminaleyes/calibration.json`).
-4. **Move cursor**: Slam to corner (known 0,0), then calibrated HID moves to target position.
-5. **Verify**: Re-queries ShowUI — if target still visible at same position, cursor missed → correct and retry. If target vanished, cursor is covering it → click.
-
-### Prerequisites
-
-- **llama.cpp** with ShowUI-2B for fast grounding:
-  ```bash
-  brew install llama.cpp
-  llama-server \
-    --hf-repo localattention/ShowUI-2B-Q4_K_M-GGUF \
-    --hf-file showui-2b-q4_k_m.gguf \
-    --mmproj <path-to-mmproj-Qwen2-VL-2B-Instruct-f16.gguf> \
-    -c 4096 --port 1235
-  ```
-- **LM Studio** with `google/gemma-4-31b` loaded on port 1234
-- **Raspberry Pi** connected via USB ECM + Bluetooth HID
-
-### Example session
-
-```
-> what do you see?
-The screen shows VS Code with a Python file open. There's a terminal
-panel at the bottom and an agent panel on the right side.
-
-> click the Review button
-  Homing to: the Review button
-  ShowUI: image (88%,42%) → screen (90%,42%)
-  Moving to target: (340, 420) HID
-  [1] Target vanished — clicking left.
-  Screenshot: /tmp/cursor_on_target.png
-
-> type hello world
-  Typing: hello world
-  Done.
-
-> press Enter
-  Pressing Enter
-  Done.
-```
-
-## Usage
-
-### Start the endpoint (terminal + display)
-
-```bash
-terminaleyes endpoint
-```
-
-This opens a fullscreen pygame window rendering a persistent bash shell, and starts an HTTP server on port 8080 for receiving keyboard commands.
-
-### Run the agent
-
-```bash
-terminaleyes run --goal "List files in the current directory" \
-  --success-criteria "ls output is visible" \
-  --max-steps 20
-```
-
-### Validate MLLM reading accuracy
-
-Captures a webcam frame, sends it to the MLLM, and compares the interpretation against the actual screen content:
-
-```bash
-terminaleyes validate
-```
-
-### Calibrate camera position
-
-Auto-detects where the terminal display appears in the webcam by flashing the screen white and black:
-
-```bash
-terminaleyes calibrate
-```
-
-### Test webcam capture
-
-```bash
-terminaleyes capture-test
-```
-
-## API Endpoints
-
-When the endpoint server is running:
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Server status |
-| GET | `/screen` | Current terminal text content |
-| POST | `/text` | Send text input `{"text": "ls -la\n"}` |
-| POST | `/keystroke` | Send a key `{"key": "Enter"}` |
-| POST | `/key-combo` | Send combo `{"modifiers": ["ctrl"], "key": "c"}` |
-
-## Architecture
-
-- **`src/terminaleyes/capture/`** — Webcam capture via OpenCV
-- **`src/terminaleyes/interpreter/`** — MLLM providers (OpenRouter/OpenAI-compatible)
-- **`src/terminaleyes/agent/`** — Agent loop and strategies
-- **`src/terminaleyes/endpoint/`** — HTTP server, PTY shell, pygame display
-- **`src/terminaleyes/keyboard/`** — Abstract keyboard interface + backends (HTTP, USB HID)
-- **`src/terminaleyes/raspi/`** — Pi-specific: HID codes, HID writer, BT HID, REST server
-- **`src/terminaleyes/commander/`** — Interactive visual commander (REPL, homing, calibration)
-- **`src/terminaleyes/mouse/`** — Abstract mouse interface + HTTP backend (BT/USB transport)
-- **`src/terminaleyes/config/`** — Settings from YAML + `.env`
-- **`src/terminaleyes/calibration.py`** — Camera-to-terminal calibration
-- **`scripts/`** — Pi deployment, USB gadget, BT HID setup, radio mode switching
 
 ## License
 

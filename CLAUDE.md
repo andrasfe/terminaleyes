@@ -4,6 +4,23 @@
 
 terminaleyes — vision-based agentic terminal controller. A webcam captures the target's screen; classical CV + multimodal LLMs locate the cursor and the click target; HID commands flow over BT (or USB) via a Raspberry Pi to drive the target machine. Target OS may be macOS or Ubuntu/GNOME.
 
+## Agent architecture
+
+Tiered agents under `src/terminaleyes/agents/` (full index in [AGENTS.md](./AGENTS.md)):
+
+- **Tier 1 (atomic)** — `VerifyAgent` (visual yes/no), `CursorAgent` (locate cursor), `TargetAgent` (locate target by description)
+- **Tier 2 (actions)** — `WakeAgent` (jiggle/arrow/click), `TypeAgent` (text input with `secret=True`)
+- **Tier 3 (workflows)** — `FocusAgent` (centre app), `LoginAgent` (wake+verify+type), `NavigateAgent` (URL bar), `ClickAgent` (find-and-click via visual servo)
+- **Tier 4 (storage)** — `Vault` (AES-256-GCM file with scrypt KDF)
+- **Top level** — `ControllerAgent` decomposes free-form intents into agent sequences via a rule planner with LLM-planner fallback. CLI `terminaleyes do "<intent>"`.
+
+Each agent returns a typed `Outcome { success: bool, reason: str, data: dict }`. Higher-tier agents construct lower-tier agents with the same `AgentContext` so I/O resources (capture, mouse, keyboard, vision client, vault) are wired once per session.
+
+Defaults that make the controller "safe":
+- Click-like intents are prefixed with `FocusAgent` unless `--no-focus`.
+- `LoginAgent` refuses to type when `VerifyAgent` doesn't see a login screen — visual-only judgement, NOT keyword matching for "password".
+- `FocusAgent` refuses to act on dark/asleep frames.
+
 ## Raspberry Pi Keyboard Architecture
 
 ### Primary: USB ECM + Bluetooth HID
@@ -31,13 +48,26 @@ terminaleyes — vision-based agentic terminal controller. A webcam captures the
 
 ## Key directories
 
-- `src/terminaleyes/commander/` — Interactive visual commander, visual servo homer, login flow
-  - `visual_servo_homer.py` — closed-loop CV homer (HSV/variance cursor detection, ROI-diff tracking, OCR/ShowUI target localisation, click retry, post-click navigation oracle). The current click engine.
-  - `cursor_finder.py` — HSV finder (saturated red `redglass` cursor) + variance fallback for default cursors
-  - `ocr_finder.py` — tesseract wrapper with multi-pass preprocessing (scales, PSMs, both polarities for dark mode)
-  - `login.py` — remote login flow: wake, polled visual login-screen check, secret-typed password, Enter
-  - `closed_loop_homer.py` — older static-calibration homer (kept as helper: scene-map + keyword extraction)
-  - `interactive.py` — REPL session dispatching to the homer / visual commander
+- `src/terminaleyes/agents/` — **Tiered agent layer**. See AGENTS.md for the index.
+  - `base.py` / `context.py` — Agent ABC, Outcome dataclass, AgentContext
+  - `vault.py` — AES-256-GCM credential store (scrypt KDF, atomic write, 0600)
+  - `verify.py` — tier-1: visual yes/no oracle (JSON-mode + retry, visual-only steering)
+  - `cursor.py` — tier-1: locate cursor (HSV / oscillation-variance / ROI-diff)
+  - `target.py` — tier-1: locate target by description (OCR → scene-map+ShowUI → cropped ShowUI)
+  - `wake.py` — tier-2: jiggle + Down arrow + click; idempotent
+  - `type_text.py` — tier-2: text input; `secret=True` redacts logs; optional Enter
+  - `focus.py` — tier-3: awake check → centred check → Super+Up / click+Super+Up corrective combos
+  - `login.py` — tier-3: Wake + poll-Verify(login screen) + Type(secret) + Enter
+  - `navigate.py` — tier-3: URL-bar typing (Ctrl+L → Ctrl+A → text → Enter)
+  - `click.py` — tier-3: find-and-click (wraps `VisualServoHomer`). `SearchAgent` is an alias.
+  - `controller.py` — top-level orchestrator: rule planner + LLM-planner fallback
+- `src/terminaleyes/commander/` — Implementation modules backing the agents
+  - `visual_servo_homer.py` — closed-loop CV homer; the click engine ClickAgent wraps
+  - `cursor_finder.py` — HSV finder (saturated red `redglass` cursor) + variance fallback
+  - `ocr_finder.py` — tesseract wrapper with multi-pass preprocessing
+  - `login.py` — backwards-compat shim; routes to `agents.login.LoginAgent`
+  - `closed_loop_homer.py` — older static-calibration homer (kept as helper for scene-map + keyword extraction)
+  - `interactive.py` — REPL session dispatching to the homer
 - `src/terminaleyes/mouse/` — Abstract mouse interface + HTTP backend (BT/USB transport)
 - `src/terminaleyes/raspi/` — Pi-specific: HID codes, HID writer, REST server
 - `src/terminaleyes/keyboard/` — Abstract keyboard interface + backends (HTTP, USB HID). `send_text(secret=True)` redacts content from local logs (used for password input).
@@ -58,19 +88,34 @@ python -m pytest tests/ -v                 # run all tests
 python -m pytest tests/unit/test_raspi/ -v # run raspi tests only
 terminaleyes-pi                            # start Pi REST API server
 
-# Interactive visual commander (click / type)
-terminaleyes interact                      # REPL
-terminaleyes interact -m "click X"         # single-command mode
-terminaleyes interact --skip-calibration   # legacy flag, no-op now
-terminaleyes interact --screen-check       # enable screen visibility check
+# ── Controller (top-level) ──
+terminaleyes do "click the Run button"
+terminaleyes do "go to reddit.com/r/LocalLLaMA"
+terminaleyes do "login and open reddit.com" --vault myhost
+terminaleyes do --dry-run "<intent>"       # show plan without executing
+terminaleyes do --no-focus "click X"       # skip auto-focus prefix
+terminaleyes do --no-llm-fallback "..."    # rules-only; refuses unknown intents
 
-# Remote-login flow
+# ── Direct agent invocations (low-level) ──
+terminaleyes focus [--platform linux|macos] [--max-attempts N]
 terminaleyes login                         # interactive getpass prompt
-terminaleyes login --password-file PATH    # read pw from file (path visible, contents not)
-terminaleyes login --password-env VAR      # read pw from env var (var name visible)
-terminaleyes login --click-input           # click password field via homer first
+terminaleyes login --vault NAME            # password from local vault
+terminaleyes login --password-file PATH    # path visible in `ps`, contents not
+terminaleyes login --password-env VAR      # var name visible, value not
+terminaleyes login --click-input           # visually click password field first
 terminaleyes login --no-verify             # skip the visual login-screen check
-terminaleyes login --verify-attempts 12 --verify-interval 1.5  # tune polling
+terminaleyes login --verify-attempts 12 --verify-interval 1.5
+
+# ── Vault ──
+terminaleyes vault add NAME                # prompt for value via getpass
+terminaleyes vault get NAME                # print to stdout (warns if TTY)
+terminaleyes vault list                    # entry names only
+terminaleyes vault remove NAME
+terminaleyes vault status                  # backend + path + mode
+
+# ── Legacy / direct ──
+terminaleyes interact                      # REPL routes through the homer
+terminaleyes interact -m "click X"         # single-command mode
 ```
 
 ## Interactive Visual Commander
@@ -270,4 +315,7 @@ If BT HID stops working, check in this order:
 - Webcam mirror detection (auto-detect if image is flipped)
 - Capture-card path (UVC HDMI→USB): drop most perspective/bezel compensation in the homer
 - Self-improving HID ratio cache (persist learned `pct_per_hid` per session/screen so future runs start from a better prior)
-- Tests for visual servo homer end-to-end (recorded webcam frames + mock HID)
+- Tests for the agent layer (vault round-trip, mock-context controller dry-runs, etc.)
+- Vault: optional OS-keychain backend via `keyring` (macOS Keychain / Secret Service / Credential Manager)
+- ScrollAgent — primitive for vertical scroll; controller rule for "scroll up/down"
+- Refactor `VisualServoHomer` internals to use `CursorAgent` + `TargetAgent` directly (currently they wrap the same helpers in parallel)
