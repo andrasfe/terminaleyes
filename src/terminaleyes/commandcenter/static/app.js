@@ -35,11 +35,30 @@ $frame.addEventListener("load", () => {
   $frame.classList.remove("empty");
   $frameEmpty.style.display = "none";
 });
-$frame.addEventListener("error", () => {
+// One-shot resync guard so we don't spin forever if every frame
+// 404s (e.g. server has zero frames).
+let _imageErrorResyncing = false;
+$frame.addEventListener("error", async () => {
   $frame.classList.add("empty");
   $frameEmpty.style.display = "";
   $frameEmpty.textContent =
-    `image load failed for id ${state.currentId} — check server log`;
+    `image load failed for id ${state.currentId} — refreshing frame list…`;
+  if (_imageErrorResyncing) return;
+  _imageErrorResyncing = true;
+  try {
+    // Stale id: the FrameStore was rebuilt (cc restart, ring-buffer
+    // eviction, etc.) so our cached id no longer maps to anything on
+    // disk. Re-list from the server and jump to the new latest.
+    const before = state.currentId;
+    state.currentId = null;     // force setFrameSrc to actually swap
+    await refreshKnownIds();
+    if (state.currentId === before || state.currentId === null) {
+      $frameEmpty.textContent =
+        "no frames available — send an instruction.";
+    }
+  } finally {
+    _imageErrorResyncing = false;
+  }
 });
 
 function setFrameSrc(id) {

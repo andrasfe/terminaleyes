@@ -161,7 +161,17 @@ def create_app(
     def get_frame(frame_id: int) -> Response:
         meta = store.get(frame_id)
         if meta is None:
-            raise HTTPException(404, "frame not found")
+            # The id is unknown — most likely a stale id from a
+            # previous cc instance (FrameStore rebuilt with fresh
+            # mtimes) or evicted from the ring buffer. Tell the
+            # client what's actually available so it can resync.
+            latest = store.latest()
+            raise HTTPException(
+                404,
+                f"frame id {frame_id} not in store "
+                f"(have {store.count()} frames; latest id="
+                f"{latest.id if latest else 'none'})",
+            )
         try:
             data = Path(meta.path).read_bytes()
         except FileNotFoundError:
