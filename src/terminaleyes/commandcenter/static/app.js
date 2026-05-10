@@ -31,6 +31,17 @@ const state = {
 };
 
 // ── frame fetching ─────────────────────────────────────────────
+$frame.addEventListener("load", () => {
+  $frame.classList.remove("empty");
+  $frameEmpty.style.display = "none";
+});
+$frame.addEventListener("error", () => {
+  $frame.classList.add("empty");
+  $frameEmpty.style.display = "";
+  $frameEmpty.textContent =
+    `image load failed for id ${state.currentId} — check server log`;
+});
+
 function setFrameSrc(id) {
   if (id === null || id === undefined) {
     $frame.classList.add("empty");
@@ -38,9 +49,9 @@ function setFrameSrc(id) {
     $frameMeta.textContent = "—";
     return;
   }
-  $frame.classList.remove("empty");
-  $frameEmpty.style.display = "none";
-  $frame.src = `/api/frames/${id}`;
+  // Cache-bust per id so a re-render picks up a fresh fetch even if
+  // the URL is the same.
+  $frame.src = `/api/frames/${id}?t=${Date.now()}`;
   state.currentId = id;
   updateFrameMeta();
 }
@@ -68,18 +79,28 @@ async function refreshKnownIds() {
   // Fetch up to 500 frames (newest-first), reverse to ascending.
   try {
     const r = await fetch("/api/frames?limit=500");
-    if (!r.ok) return;
+    if (!r.ok) {
+      $frameEmpty.textContent =
+        `frames API returned ${r.status} ${r.statusText}`;
+      return;
+    }
     const data = await r.json();
     const ids = (data.items || []).map(m => m.id).reverse();
     state.knownIds = ids;
-    if (state.liveMode && ids.length > 0) {
+    if (ids.length === 0) {
+      $frameEmpty.textContent = "No frames yet — send an instruction.";
+      return;
+    }
+    if (state.liveMode) {
       const latest = ids[ids.length - 1];
       if (latest !== state.currentId) setFrameSrc(latest);
       else updateFrameMeta();
     } else {
       updateFrameMeta();
     }
-  } catch (_) {}
+  } catch (e) {
+    $frameEmpty.textContent = "frames API failed: " + (e && e.message);
+  }
 }
 
 async function pollLatest() {
