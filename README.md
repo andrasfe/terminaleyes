@@ -24,12 +24,16 @@ agent index in [AGENTS.md](./AGENTS.md).
 terminaleyes do "click the Run button"
 terminaleyes do "go to reddit.com/r/LocalLLaMA"
 terminaleyes do "login and open reddit.com" --vault myhost
+terminaleyes do "scroll down 6"
 terminaleyes do --dry-run "wake the screen and centre the browser"
 
 # Direct agent invocations
 terminaleyes login              # wake → visually verify login → type from vault
 terminaleyes focus              # centre + maximise the foreground app
 terminaleyes vault add NAME     # encrypted local credential store
+
+# Web UI (FastAPI + SPA, mobile-friendly)
+terminaleyes commandcenter      # http://0.0.0.0:8765 — see frames + run intents
 
 # Legacy REPL (still works)
 terminaleyes interact -m "click X"
@@ -39,7 +43,7 @@ terminaleyes interact -m "click X"
 
 ```
 agents/
-├── base.py / context.py   — Agent ABC, Outcome, AgentContext
+├── base.py / context.py   — Agent ABC, Outcome, AgentContext (output_dir + record_frame)
 ├── vault.py               — AES-256-GCM credential store (scrypt KDF)
 │
 ├── verify.py              — tier-1: visual yes/no oracle
@@ -48,13 +52,16 @@ agents/
 │
 ├── wake.py                — tier-2: wake screen
 ├── type_text.py           — tier-2: text input (with secret mode)
+├── scroll.py              — tier-2: mouse-wheel scroll
 │
 ├── focus.py               — tier-3: centre + maximise the foreground app
 ├── login.py               — tier-3: wake + verify-login + type secret
-├── navigate.py            — tier-3: URL-bar typing
-├── click.py               — tier-3: find-and-click (was SearchAgent)
+├── navigate.py            — tier-3: browser-aware URL bar typing + OCR oracle
+├── click.py               — tier-3: find-and-click + scroll-and-retry (was SearchAgent)
 │
 └── controller.py          — top-level: rules + LLM-planner fallback
+
+commandcenter/             — web UI + REST/SSE backend (FastAPI + SPA)
 ```
 
 Each agent is a small testable unit returning a typed
@@ -66,8 +73,16 @@ free-form English intents into agent sequences:
 "click the Run button"      → [FocusAgent, ClickAgent(target=...)]
 "go to URL"                 → [FocusAgent, NavigateAgent(url=...)]
 "login and open reddit.com" → [LoginAgent, FocusAgent, NavigateAgent]
+"scroll down 6"             → [ScrollAgent(direction=down, amount=6)]
 "wake then centre browser"  → [WakeAgent, FocusAgent]   (LLM fallback)
 ```
+
+Safe defaults:
+- Click-like intents auto-prefix `FocusAgent` (skip with `--no-focus`).
+- `NavigateAgent` refuses to send keystrokes until verifier confirms a browser is foreground; activates one via GNOME activities (Super → type browser name → Enter) → ClickAgent on dock icon → Super+N sweep.
+- `LoginAgent` refuses to type until verifier confirms a login screen — visual cues only, NOT keyword matching for "password".
+- `FocusAgent` refuses to act on dark/asleep frames.
+- LLM-planner output is validated against the registry; unknown agent names reject the plan.
 
 ## How clicking works
 
@@ -105,6 +120,55 @@ Password sources, in priority order:
 - Interactive `getpass.getpass()` (default)
 
 The password is **never** a positional CLI argument.
+
+## Session output (every captured frame is saved)
+
+Every screenshot the agents take is persisted to a single per-invocation
+directory so a run can be replayed visually after the fact. Resolution
+order:
+
+1. `--output-dir PATH` CLI flag
+2. `TERMINALEYES_OUTPUT_DIR` env var (loadable from `.env`)
+3. `~/.local/share/terminaleyes/runs/`
+
+Filenames: `NNNN_HHMMSS_<agent_label>.png`, sequentially numbered so an
+`ls` lists captures in the order they were taken.
+
+```
+$ ls ~/.local/share/terminaleyes/runs/2026-05-09_17-43-30/
+0001_174330_navigate_browser_check.png
+0002_174331_homer_capture.png
+0003_174333_navigate_postflight_full.png
+0004_174333_navigate_postflight_urlbar.png
+homer/
+└── 174337_vs/
+    ├── step_01.png
+    ├── step_02.png
+    └── ...
+```
+
+The Command Center web UI watches this directory and streams frames +
+logs to the browser; see the next section.
+
+## Command Center (web UI)
+
+```bash
+terminaleyes commandcenter             # http://0.0.0.0:8765 (LAN-reachable)
+terminaleyes cc --port 8888
+```
+
+A FastAPI app + mobile-first SPA exposing the agent layer over HTTP/SSE.
+
+- `GET /` — the SPA
+- `POST /api/run` — start a `ControllerAgent` intent (one at a time)
+- `GET /api/runs[/{id}/logs]` — recent runs + per-run SSE log stream
+- `GET /api/frames[/latest|/{id}]` — newest-first frame index + bytes + long-poll
+- `GET /api/state` — `{busy, latest_id, frame_count, active_run}`
+
+Each `POST /api/run` builds a fresh `AgentContext` with `output_dir =
+<watch_dir>/<run_id>/` so frames in the UI cleanly map to runner
+records (`FrameMeta.run_id == RunRecord.run_id`). The webcam is held
+only during a run, exactly matching `terminaleyes do`.
 
 ## Vault
 
@@ -259,8 +323,9 @@ lives in `config/terminaleyes.yaml`; see CLAUDE.md.
 ```
 src/terminaleyes/
 ├── agents/             # Tiered agent layer (see AGENTS.md)
+├── commandcenter/      # Web UI + REST/SSE backend (FastAPI + SPA)
 ├── commander/          # Implementation modules: visual servo homer, OCR, cursor finder, scene-map
-├── capture/            # Webcam capture (cv2.VideoCapture wrapper)
+├── capture/            # Webcam / capture-card (cv2.VideoCapture wrapper)
 ├── interpreter/        # MLLM provider clients (OpenAI-compatible)
 ├── keyboard/           # Abstract keyboard + HTTP/USB backends
 ├── mouse/              # Abstract mouse + HTTP backend

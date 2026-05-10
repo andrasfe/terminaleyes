@@ -9,17 +9,35 @@ terminaleyes — vision-based agentic terminal controller. A webcam captures the
 Tiered agents under `src/terminaleyes/agents/` (full index in [AGENTS.md](./AGENTS.md)):
 
 - **Tier 1 (atomic)** — `VerifyAgent` (visual yes/no), `CursorAgent` (locate cursor), `TargetAgent` (locate target by description)
-- **Tier 2 (actions)** — `WakeAgent` (jiggle/arrow/click), `TypeAgent` (text input with `secret=True`)
-- **Tier 3 (workflows)** — `FocusAgent` (centre app), `LoginAgent` (wake+verify+type), `NavigateAgent` (URL bar), `ClickAgent` (find-and-click via visual servo)
+- **Tier 2 (actions)** — `WakeAgent` (jiggle/arrow/click), `TypeAgent` (text input with `secret=True`), `ScrollAgent` (mouse-wheel scroll, optional approximate-hover)
+- **Tier 3 (workflows)** — `FocusAgent` (centre app), `LoginAgent` (wake+verify+type), `NavigateAgent` (browser-aware URL bar typing with post-OCR oracle), `ClickAgent` (find-and-click via visual servo, with scroll-and-retry)
 - **Tier 4 (storage)** — `Vault` (AES-256-GCM file with scrypt KDF)
-- **Top level** — `ControllerAgent` decomposes free-form intents into agent sequences via a rule planner with LLM-planner fallback. CLI `terminaleyes do "<intent>"`.
+- **Top level** — `ControllerAgent` decomposes free-form intents into agent sequences via a rule planner; falls back to an LLM planner (validated against the registry) when no rule matches. CLI `terminaleyes do "<intent>"`.
 
-Each agent returns a typed `Outcome { success: bool, reason: str, data: dict }`. Higher-tier agents construct lower-tier agents with the same `AgentContext` so I/O resources (capture, mouse, keyboard, vision client, vault) are wired once per session.
+Each agent returns a typed `Outcome { success: bool, reason: str, data: dict }`. Higher-tier agents construct lower-tier agents with the same `AgentContext` so I/O resources (capture, mouse, keyboard, vision client, vault, output dir) are wired once per session.
 
 Defaults that make the controller "safe":
 - Click-like intents are prefixed with `FocusAgent` unless `--no-focus`.
+- `NavigateAgent` refuses to send keystrokes until `VerifyAgent` confirms a browser is the foreground app — falls back to GNOME activities (Super → type "firefox" → Enter) → Chrome → Chromium → visual icon click → Super+N sweep.
 - `LoginAgent` refuses to type when `VerifyAgent` doesn't see a login screen — visual-only judgement, NOT keyword matching for "password".
 - `FocusAgent` refuses to act on dark/asleep frames.
+
+## Session output dir
+
+Every captured frame is written to a single per-invocation directory so the run can be replayed visually after the fact. Resolution order:
+
+1. `--output-dir PATH` CLI flag
+2. `TERMINALEYES_OUTPUT_DIR` env var (loaded from `.env` by `load_settings()` before agent imports)
+3. `~/.local/share/terminaleyes/runs/`
+
+In all three cases a fresh subdirectory is created per invocation. Filename shape: `NNNN_HHMMSS_<agent_label>.png`, sequentially numbered so an `ls` lists captures in capture order. Sources currently wired to `AgentContext.record_frame()`:
+
+- `VerifyAgent` — labelled by caller (`focus_awake_check`, `navigate_browser_check`, etc.)
+- `FocusAgent` — `focus_awake_check`, `focus_initial_check`, `focus_recheck_NN`
+- `NavigateAgent` — `navigate_browser_check`, `navigate_browser_recheck_NN`, `navigate_postflight_full`, `navigate_postflight_urlbar`
+- `VisualServoHomer` (`ClickAgent`) — every `_capture_color`/`_capture_gray` records a `homer_capture` frame; the homer's annotated debug step images go to `<session>/homer/<run-id>/`
+
+The Command Center web UI (`terminaleyes commandcenter`) watches this directory and streams frames + logs over SSE; see "Command Center" below.
 
 ## Raspberry Pi Keyboard Architecture
 
@@ -49,18 +67,26 @@ Defaults that make the controller "safe":
 ## Key directories
 
 - `src/terminaleyes/agents/` — **Tiered agent layer**. See AGENTS.md for the index.
-  - `base.py` / `context.py` — Agent ABC, Outcome dataclass, AgentContext
+  - `base.py` / `context.py` — Agent ABC, Outcome dataclass, AgentContext (with `output_dir` + `record_frame()`)
   - `vault.py` — AES-256-GCM credential store (scrypt KDF, atomic write, 0600)
-  - `verify.py` — tier-1: visual yes/no oracle (JSON-mode + retry, visual-only steering)
-  - `cursor.py` — tier-1: locate cursor (HSV / oscillation-variance / ROI-diff)
+  - `verify.py` — tier-1: visual yes/no oracle (JSON-mode + retry, visual-only steering, `record_label` arg)
+  - `cursor.py` — tier-1: locate cursor (HSV / oscillation-variance / ROI-diff). Standalone primitive, also embedded in the homer.
   - `target.py` — tier-1: locate target by description (OCR → scene-map+ShowUI → cropped ShowUI)
   - `wake.py` — tier-2: jiggle + Down arrow + click; idempotent
   - `type_text.py` — tier-2: text input; `secret=True` redacts logs; optional Enter
+  - `scroll.py` — tier-2: mouse-wheel scroll, optional `hover_at` to land scroll on the right pane
   - `focus.py` — tier-3: awake check → centred check → Super+Up / click+Super+Up corrective combos
   - `login.py` — tier-3: Wake + poll-Verify(login screen) + Type(secret) + Enter
-  - `navigate.py` — tier-3: URL-bar typing (Ctrl+L → Ctrl+A → text → Enter)
-  - `click.py` — tier-3: find-and-click (wraps `VisualServoHomer`). `SearchAgent` is an alias.
-  - `controller.py` — top-level orchestrator: rule planner + LLM-planner fallback
+  - `navigate.py` — tier-3: browser-aware URL navigation. Pre-flight Verify(browser?) → activate via GNOME activities (Super+type browser name) → Type URL → post-flight OCR oracle on URL bar with fuzzy match
+  - `click.py` — tier-3: find-and-click (wraps `VisualServoHomer`); scroll-and-retry when target not located. `SearchAgent` is an alias.
+  - `controller.py` — top-level orchestrator: rule planner + LLM-planner fallback (validated against REGISTRY)
+- `src/terminaleyes/commandcenter/` — **Web UI + REST/SSE backend**.
+  - `server.py` — FastAPI app. Endpoints: `GET /api/frames[/latest|/{id}]`, `POST /api/run`, `GET /api/runs[/{id}/logs]`, `GET /api/state`, plus the SPA at `/`.
+  - `runner.py` — one-at-a-time `ControllerAgent` runner with per-run resource lifecycle (matches `terminaleyes do`).
+  - `frame_store.py` — polls the agent layer's output dir, indexes new images, serves bytes. Default watch dir reads from `TERMINALEYES_OUTPUT_DIR` then falls back to the agent default — guaranteed to agree with what the agents write.
+  - `factory.py` — `make_default_context_factory(settings, base_dir, bus)`: builds a fresh `AgentContext` per run with `output_dir = base_dir / <run_id>` so frames map cleanly to runner records.
+  - `log_bus.py` — pub/sub for log records + redirected stdout/stderr; SSE streams subscribe.
+  - `static/` — mobile-first SPA (`index.html`, `app.js`, `styles.css`).
 - `src/terminaleyes/commander/` — Implementation modules backing the agents
   - `visual_servo_homer.py` — closed-loop CV homer; the click engine ClickAgent wraps
   - `cursor_finder.py` — HSV finder (saturated red `redglass` cursor) + variance fallback
@@ -88,10 +114,15 @@ python -m pytest tests/ -v                 # run all tests
 python -m pytest tests/unit/test_raspi/ -v # run raspi tests only
 terminaleyes-pi                            # start Pi REST API server
 
+# ── Common flags (all subcommands) ──
+terminaleyes --output-dir PATH ...         # override session output dir
+TERMINALEYES_OUTPUT_DIR=PATH terminaleyes ...   # same, via env (works in .env)
+
 # ── Controller (top-level) ──
 terminaleyes do "click the Run button"
 terminaleyes do "go to reddit.com/r/LocalLLaMA"
 terminaleyes do "login and open reddit.com" --vault myhost
+terminaleyes do "scroll down 6"
 terminaleyes do --dry-run "<intent>"       # show plan without executing
 terminaleyes do --no-focus "click X"       # skip auto-focus prefix
 terminaleyes do --no-llm-fallback "..."    # rules-only; refuses unknown intents
@@ -112,6 +143,11 @@ terminaleyes vault get NAME                # print to stdout (warns if TTY)
 terminaleyes vault list                    # entry names only
 terminaleyes vault remove NAME
 terminaleyes vault status                  # backend + path + mode
+
+# ── Command Center (web UI) ──
+terminaleyes commandcenter                 # FastAPI on 0.0.0.0:8765
+terminaleyes cc --port 8888                # alias
+terminaleyes cc --frames-dir PATH          # override watch dir
 
 # ── Legacy / direct ──
 terminaleyes interact                      # REPL routes through the homer
@@ -178,6 +214,36 @@ End-to-end remote login that **never sees the literal word "password"** to decid
 ## Command-line gotchas
 - BT HID transit between dev Mac and Pi is over USB ECM (10.0.0.0/24 link-local) — fine for the cable, don't pipe credentials over an untrusted network leg.
 - Python doesn't zero string memory; the password reference is dropped immediately after submit but a memory dump could still recover it. Treat the dev Mac as trusted.
+
+## Command Center (`commandcenter/`)
+
+A FastAPI app that exposes the agent layer over HTTP/SSE plus a mobile-first SPA. Boot:
+
+```bash
+terminaleyes commandcenter                 # http://0.0.0.0:8765
+terminaleyes cc --port 8888 --frames-dir /tmp/foo
+```
+
+**Wiring at startup:**
+- `FrameStore` polls the configured watch dir (`TERMINALEYES_OUTPUT_DIR` or default) every 250 ms, indexes new images, surfaces `FrameMeta { id, ts, run_id, filename }`. The `run_id` matches the runner's record id so the UI correlates frames ↔ runs without ambiguity.
+- `LogBus` captures the `terminaleyes` logger AND redirects `stdout`/`stderr` of the active run; SSE subscribers (per-run + global) get `LogEvent { ts, level, source, msg, run_id }`.
+- `Runner` is one-at-a-time: each `POST /api/run` builds a fresh `AgentContext` via `make_default_context_factory(settings, base_dir=watch_dir, bus)`, invokes `ControllerAgent.run(intent=...)`, then closes mouse/keyboard/capture. The webcam is held only during a run, exactly matching `terminaleyes do`.
+- Per-run output dir = `<watch_dir>/<run_id>/`. `bus.active_run(run_id)` is set before the factory runs, so `bus.current_run_id()` is read in the factory to name the dir. UI's `FrameMeta.run_id == RunRecord.run_id`.
+
+**Endpoints:**
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/` | SPA |
+| GET | `/api/state` | `{busy, latest_id, frame_count, active_run}` |
+| GET | `/api/frames[?limit=N&before=ID]` | newest-first index |
+| GET | `/api/frames/latest[?wait=1&since=ID]` | one-shot or long-poll |
+| GET | `/api/frames/{id}` | image bytes |
+| GET | `/api/frames/{id}/neighbours` | `{prev, next}` |
+| POST | `/api/run` | start a controller intent (409 if busy) |
+| GET | `/api/runs[?limit=N]` | recent run records |
+| GET | `/api/runs/{id}` | one record |
+| GET | `/api/runs/{id}/logs` | SSE log stream (replays buffer) |
+| GET | `/api/logs[?tail=N]` | global SSE log stream |
 
 ## Pi setup sequence
 
@@ -313,9 +379,9 @@ If BT HID stops working, check in this order:
 - Make bt-agent.service restart-proof (currently needs manual restart if bluetooth restarts)
 - Pi 4 migration: dual-band WiFi + separate BT chip (no radio mode switching needed)
 - Webcam mirror detection (auto-detect if image is flipped)
-- Capture-card path (UVC HDMI→USB): drop most perspective/bezel compensation in the homer
 - Self-improving HID ratio cache (persist learned `pct_per_hid` per session/screen so future runs start from a better prior)
 - Tests for the agent layer (vault round-trip, mock-context controller dry-runs, etc.)
 - Vault: optional OS-keychain backend via `keyring` (macOS Keychain / Secret Service / Credential Manager)
-- ScrollAgent — primitive for vertical scroll; controller rule for "scroll up/down"
 - Refactor `VisualServoHomer` internals to use `CursorAgent` + `TargetAgent` directly (currently they wrap the same helpers in parallel)
+- Command Center: FrameStore should optionally recurse into `<session>/homer/<run-id>/` so annotated debug step images surface in the UI; OR flatten homer debug output to the session top level
+- Event-driven frame notifications (FrameStore polls every 250ms; could subscribe to AgentContext.record_frame() emissions to push frames to subscribers without polling lag)
