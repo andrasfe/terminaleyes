@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0d0f12" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>terminaleyes — Command Center</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main id="app">
+    <section id="frame-pane" class="pane">
+      <div class="frame-wrap">
+        <img id="frame" alt="latest frame" />
+        <div id="frame-empty" class="empty">No frames yet — send an instruction.</div>
+      </div>
+      <div class="frame-controls">
+        <button id="btn-prev" title="Older">◀</button>
+        <span id="frame-meta">—</span>
+        <button id="btn-next" title="Newer">▶</button>
+        <button id="btn-live" class="live" title="Jump to latest">⏵ Live</button>
+      </div>
+    </section>
+
+    <section id="chat-pane" class="pane">
+      <ul id="chat-log" aria-live="polite"></ul>
+      <form id="chat-form">
+        <textarea
+          id="chat-input"
+          rows="2"
+          placeholder="Tell the controller what to do…  (e.g. open reddit.com)"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+        ></textarea>
+        <div class="chat-row">
+          <label class="opt"><input type="checkbox" id="opt-dry-run"/> dry-run</label>
+          <label class="opt"><input type="checkbox" id="opt-no-focus"/> no-focus</label>
+          <select id="opt-platform" title="Platform">
+            <option value="linux" selected>linux</option>
+            <option value="macos">macos</option>
+          </select>
+          <button id="btn-send" type="submit">Send</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="log-pane" class="pane">
+      <div class="log-header">
+        <span>logs</span>
+        <button id="btn-clear-logs" type="button" title="Clear view">clear</button>
+      </div>
+      <pre id="log-view"></pre>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

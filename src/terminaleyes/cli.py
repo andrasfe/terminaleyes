@@ -261,7 +261,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     cc_parser.add_argument(
         "--frames-dir", type=str, default=None,
         help="Watch directory for PNG frames "
-             "(default: /tmp/terminaleyes_homer)",
+             "(default: $TERMINALEYES_OUTPUT_DIR or "
+             "~/.local/share/terminaleyes/runs/)",
     )
     cc_parser.add_argument(
         "--max-frames", type=int, default=500,
@@ -975,17 +976,28 @@ async def _run_commandcenter(settings, args) -> None:
 
     import uvicorn
 
-    from terminaleyes.commandcenter.frame_store import FrameStore
+    from terminaleyes.commandcenter.factory import (
+        make_default_context_factory,
+    )
+    from terminaleyes.commandcenter.frame_store import (
+        DEFAULT_WATCH_DIR, FrameStore,
+    )
     from terminaleyes.commandcenter.log_bus import LogBus
     from terminaleyes.commandcenter.server import create_app
 
-    async def context_factory():
-        return await _build_agent_context(settings, with_capture=True)
-
-    watch_dir = Path(args.frames_dir) if args.frames_dir \
-        else Path("/tmp/terminaleyes_homer")
+    watch_dir = (
+        Path(args.frames_dir).expanduser().resolve()
+        if args.frames_dir else DEFAULT_WATCH_DIR
+    )
+    watch_dir.mkdir(parents=True, exist_ok=True)
     store = FrameStore(watch_dir=watch_dir, max_frames=args.max_frames)
     bus = LogBus()
+    # The factory builds a fresh AgentContext per run with output_dir
+    # = watch_dir / <run_id>, so frames the agents capture flow into
+    # the FrameStore's watch dir and get streamed to the UI.
+    context_factory = make_default_context_factory(
+        settings, base_dir=watch_dir, bus=bus,
+    )
     app = create_app(context_factory, frame_store=store, bus=bus)
 
     try:
