@@ -487,7 +487,25 @@ class BluetoothHidServer:
         )
 
     async def send_text(self, text: str) -> None:
-        """Type a string character by character."""
+        """Type a string character by character.
+
+        Pre-flight:
+          * Send an explicit release report to clear any lingering
+            keyboard state from prior reports.
+          * Pause briefly so the receiving end (Linux kernel input
+            subsystem + foreground app's stdin reader) is ready.
+            Without this, the very first character is frequently
+            dropped — the symptom we observed was ``echo hello`` →
+            ``cho hello`` and ``clear`` → ``lear``: always exactly
+            one missing leading character.
+        """
+        if not text:
+            return
+        try:
+            await self._release_keyboard()
+        except Exception:
+            pass
+        await asyncio.sleep(0.15)
         for char in text:
             modifier, scan_code = char_to_hid(char)
             await self._tap_key(modifier, scan_code)

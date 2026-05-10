@@ -88,8 +88,29 @@ class FocusAgent(Agent):
 
         verifier = VerifyAgent(self.ctx)
 
+        # Awake check FIRST. The previous order called _wake() —
+        # which sends a Down-arrow keystroke — before checking, so
+        # an already-awake foregrounded terminal/editor would
+        # interpret the Down as history-recall and then any
+        # following typing step would have its first character
+        # consumed by the readline buffer state. We now skip
+        # _wake() entirely when the screen is clearly awake.
         if wake_first:
-            await self._wake()
+            try:
+                bright = await self._mean_brightness()
+            except Exception:
+                bright = 0.0
+            if bright < 0.06:
+                logger.info(
+                    "FocusAgent: screen looks asleep "
+                    "(brightness=%.3f); calling wake", bright,
+                )
+                await self._wake()
+            else:
+                logger.debug(
+                    "FocusAgent: screen already bright "
+                    "(%.3f); skipping wake", bright,
+                )
 
         # Pre-check: is the screen even showing content? Refuses to
         # answer the "is it centred" question until we have something
@@ -104,7 +125,8 @@ class FocusAgent(Agent):
             f"reason={awake.reason!r}"
         )
         if not awake:
-            # Try one more wake nudge cycle, then re-check.
+            # Visual verifier said not awake but brightness
+            # suggested otherwise — try one more wake nudge cycle.
             await self._wake()
             awake = await verifier.run(
                 question=self.AWAKE_QUESTION, visual_only=True,
@@ -166,6 +188,19 @@ class FocusAgent(Agent):
             ),
             data={"attempts": max_attempts},
         )
+
+    async def _mean_brightness(self) -> float:
+        """Cheap awake check — return the captured frame's mean
+        brightness in [0, 1]. ``0`` when no capture is available."""
+        if self.ctx.capture is None:
+            return 0.0
+        import numpy as np
+        try:
+            frame = await self.ctx.capture.capture_frame()
+        except Exception as e:
+            logger.debug("brightness capture failed: %s", e)
+            return 0.0
+        return float(np.asarray(frame.image).mean()) / 255.0
 
     async def _wake(self) -> None:
         """Wake the monitor / dismiss screensaver before checking."""
