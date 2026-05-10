@@ -268,6 +268,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-frames", type=int, default=500,
         help="Max frames to keep in the index (default: 500)",
     )
+    cc_parser.add_argument(
+        "--device-index", type=int, default=None,
+        help="Capture device index to use for the boot frame and "
+             "every run (overrides settings.capture.device_index "
+             "from config / TERMINALEYES_CAPTURE__DEVICE_INDEX env). "
+             "Typical: 0 = built-in webcam, 1 = USB capture card.",
+    )
+    cc_parser.add_argument(
+        "--no-boot-frame", action="store_true",
+        help="Skip the one-shot capture taken at startup so the UI "
+             "has something to show before the first run.",
+    )
 
     return parser.parse_args(argv)
 
@@ -964,6 +976,60 @@ async def _run_controller(settings, args) -> None:
         await mouse.disconnect()
 
 
+async def _capture_boot_frame(settings, watch_dir) -> None:
+    """One-shot capture at server boot so the UI has something to show.
+
+    Saves a single PNG into ``<watch_dir>/_boot_<ts>/``. The FrameStore
+    treats that directory as a "run", labels frames with run_id =
+    "_boot_<ts>" so the UI can distinguish boot frames from real runs.
+    Discards a few warm-up frames so auto-exposure / capture-card sync
+    has time to settle.
+    """
+    import asyncio as _asyncio
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+
+    import cv2 as _cv2
+
+    from terminaleyes.capture.webcam import WebcamCapture
+
+    resolution = None
+    if (settings.capture.resolution_width
+            and settings.capture.resolution_height):
+        resolution = (
+            settings.capture.resolution_width,
+            settings.capture.resolution_height,
+        )
+    cap = WebcamCapture(
+        device_index=settings.capture.device_index,
+        resolution=resolution,
+    )
+    boot_dir = _Path(watch_dir) / (
+        "_boot_" + _dt.now().strftime("%Y-%m-%d_%H-%M-%S")
+    )
+    boot_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        await cap.open()
+        # Discard warm-up frames; the first 1-2 are often black or
+        # half-dark while the device wakes up.
+        for _ in range(3):
+            try:
+                await cap.capture_frame()
+            except Exception:
+                break
+            await _asyncio.sleep(0.05)
+        frame = await cap.capture_frame()
+        ts = _dt.now().strftime("%H%M%S")
+        out_path = boot_dir / f"0001_{ts}_boot.png"
+        _cv2.imwrite(str(out_path), frame.image)
+        print(f"  Boot frame: {out_path}")
+    finally:
+        try:
+            await cap.close()
+        except Exception:
+            pass
+
+
 async def _run_commandcenter(settings, args) -> None:
     """Boot the Command Center FastAPI server.
 
@@ -990,6 +1056,13 @@ async def _run_commandcenter(settings, args) -> None:
         if args.frames_dir else DEFAULT_WATCH_DIR
     )
     watch_dir.mkdir(parents=True, exist_ok=True)
+
+    # CLI flag wins over settings / env for the capture device. Mutate
+    # the settings model so the per-run factory picks up the same
+    # value when it builds AgentContexts.
+    if args.device_index is not None:
+        settings.capture.device_index = args.device_index
+
     store = FrameStore(watch_dir=watch_dir, max_frames=args.max_frames)
     bus = LogBus()
     # The factory builds a fresh AgentContext per run with output_dir
@@ -999,6 +1072,13 @@ async def _run_commandcenter(settings, args) -> None:
         settings, base_dir=watch_dir, bus=bus,
     )
     app = create_app(context_factory, frame_store=store, bus=bus)
+
+    # Boot frame: capture once before serving so the UI isn't empty.
+    if not args.no_boot_frame:
+        try:
+            await _capture_boot_frame(settings, watch_dir)
+        except Exception as e:
+            print(f"  (boot frame skipped: {e})")
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1014,6 +1094,7 @@ async def _run_commandcenter(settings, args) -> None:
     if args.host == "0.0.0.0":
         print(f"  LAN:     http://{lan_ip}:{args.port}")
     print(f"  Frames:  {watch_dir}")
+    print(f"  Capture: device {settings.capture.device_index}")
     print("=" * 60)
 
     config = uvicorn.Config(
