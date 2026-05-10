@@ -133,9 +133,15 @@ def char_to_hid(char: str) -> tuple[int, int]:
 def key_name_to_hid(key: str) -> int:
     """Convert a key name to its HID scan code.
 
+    An empty string returns ``0`` so callers can request a
+    "modifier-only" tap (e.g. Super alone to open GNOME activities)
+    by passing ``key=""`` to ``send_key_combo``.
+
     Raises:
         ValueError: If the key name is not recognized.
     """
+    if key == "":
+        return 0
     if key in KEY_CODES:
         return KEY_CODES[key]
     # Try case-insensitive lookup for single chars

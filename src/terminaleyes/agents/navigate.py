@@ -184,16 +184,51 @@ class NavigateAgent(Agent):
     ) -> str:
         """Try one corrective action to bring a browser to focus.
 
-        Strategy escalates each attempt:
-          1. Visually click a known browser icon via ClickAgent.
-          2. Try the next-most-likely browser description.
-          3. Fall back to Super+N (or Cmd+Tab on macOS).
-          4. Repeat the visual click with a different description.
+        Strategy escalates each attempt. On Linux/GNOME the most
+        reliable path is the activities overview:
+
+          1. Press ``Super`` to open activities, type the browser
+             name, press ``Enter``. Tries ``firefox`` then ``chrome``
+             then ``chromium``.
+          2. Visually click a known browser icon via ClickAgent.
+          3. Super+<N> sweep over the favourites bar.
+          4. macOS: Cmd+Tab.
         """
-        # 1. Visual click on browser icon — most reliable when the
-        # taskbar/dock is visible.
-        if attempt <= len(BROWSER_ICON_DESCRIPTIONS):
-            desc = BROWSER_ICON_DESCRIPTIONS[attempt - 1]
+        kb = self.ctx.keyboard
+
+        # 1. GNOME activities overview + app search (Linux only).
+        if platform != "macos" and kb is not None and attempt <= 3:
+            browser_names = ["firefox", "google-chrome", "chromium"]
+            name = browser_names[attempt - 1]
+            try:
+                # Open activities. A bare Super tap toggles the
+                # overview. If we're already in overview from a
+                # previous attempt, this closes it — so press Esc
+                # first to be safe.
+                try:
+                    await kb.send_keystroke("Escape")
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+                await kb.send_keystroke("super")
+                await asyncio.sleep(0.7)
+                # Type the browser name. Activities filters apps as
+                # you type and highlights the best match.
+                await kb.send_text(name, secret=False)
+                await asyncio.sleep(0.5)
+                await kb.send_keystroke("Enter")
+                return f"GNOME overview + {name!r}"
+            except Exception as e:
+                logger.debug(
+                    "GNOME overview attempt for %r failed: %s",
+                    name, e,
+                )
+
+        # 2. Visual click on browser icon (ClickAgent + ShowUI/OCR).
+        # Less reliable than the overview path but worth one shot.
+        idx = attempt - 4
+        if 0 <= idx < len(BROWSER_ICON_DESCRIPTIONS):
+            desc = BROWSER_ICON_DESCRIPTIONS[idx]
             try:
                 from terminaleyes.agents.click import ClickAgent
                 outcome = await ClickAgent(self.ctx).run(
@@ -206,23 +241,19 @@ class NavigateAgent(Agent):
                     "Browser-icon click attempt failed: %s", e,
                 )
 
-        # 2. GNOME / Ubuntu: Super+<N> activates favourites in order.
-        # Try a small sweep — a browser is usually at position 1, 2,
-        # or 3.
-        if platform != "macos" and self.ctx.keyboard is not None:
-            slot = (attempt - len(BROWSER_ICON_DESCRIPTIONS)) % 4 + 1
+        # 3. Super+N sweep (Linux fallback).
+        if platform != "macos" and kb is not None:
+            slot = (attempt % 5) + 1
             try:
-                await self.ctx.keyboard.send_key_combo(
-                    ["super"], str(slot),
-                )
+                await kb.send_key_combo(["super"], str(slot))
                 return f"Super+{slot}"
             except Exception as e:
                 logger.debug("Super+%d failed: %s", slot, e)
 
-        # 3. macOS fallback: Cmd+Tab once.
-        if platform == "macos" and self.ctx.keyboard is not None:
+        # 4. macOS fallback.
+        if platform == "macos" and kb is not None:
             try:
-                await self.ctx.keyboard.send_key_combo(["cmd"], "Tab")
+                await kb.send_key_combo(["cmd"], "Tab")
                 return "Cmd+Tab"
             except Exception as e:
                 logger.debug("Cmd+Tab failed: %s", e)

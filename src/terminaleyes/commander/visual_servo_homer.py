@@ -1020,7 +1020,9 @@ class VisualServoHomer:
         frames: list[np.ndarray] = []
         # Take an initial frame, then oscillate, capturing each step.
         frames.append(await self._capture_gray())
-        oscillation = [(60, 0), (-120, 0), (120, 0), (0, 60), (0, -120), (0, 120)]
+        # Small symmetric oscillation: trajectory returns to start so
+        # the variance trail's centroid ≈ the original cursor pos.
+        oscillation = [(20, 0), (-40, 0), (40, 0), (0, 20), (0, -40), (0, 40)]
         for dx, dy in oscillation:
             await self._send_hid(dx, dy)
             await asyncio.sleep(0.10)

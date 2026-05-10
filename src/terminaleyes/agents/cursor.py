@@ -142,9 +142,10 @@ class CursorAgent(Agent):
             return None
         frames: list[np.ndarray] = []
         frames.append(await self._capture_gray())
+        # Small symmetric oscillation — trajectory centres on start.
         oscillation = [
-            (60, 0), (-120, 0), (120, 0),
-            (0, 60), (0, -120), (0, 120),
+            (20, 0), (-40, 0), (40, 0),
+            (0, 20), (0, -40), (0, 40),
         ]
         for dx, dy in oscillation:
             try:

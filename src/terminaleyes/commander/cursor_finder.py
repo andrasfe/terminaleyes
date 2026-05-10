@@ -130,25 +130,34 @@ def annotate_cursor(
 
 def find_cursor_by_variance(
     frames: list[np.ndarray],
-    min_area_pct: float = 0.00005,
-    max_area_pct: float = 0.020,
-    percentile: float = 99.5,
+    variance_threshold: float = 8.0,
+    min_active_pixels: int = 30,
+    max_active_fraction: float = 0.05,
 ) -> tuple[float, float] | None:
-    """Find the cursor as the pixel cluster with highest std-deviation
-    across a series of frames captured during cursor oscillation.
+    """Find the cursor by computing the centroid of all high-variance
+    pixels across frames captured during cursor oscillation.
 
-    Premise: when we jiggle the cursor (send small ±moves), only the
-    cursor's pixels change between frames. Static UI = ~0 variance.
-    Webcam noise produces low, scattered variance. The cursor produces
-    a compact cluster of high variance — that's our signal.
+    Premise: when we jiggle the cursor (send small ±moves and back),
+    only the cursor's pixels change between frames. Static UI ≈ 0
+    variance. The cursor leaves a small "trail" of high-variance
+    pixels at each oscillation position. The centroid of that trail
+    is approximately the cursor's start position (oscillation is
+    symmetric, so the trajectory centres on where it started).
 
-    Pass at least 4 grayscale frames captured during a mini-oscillation
-    routine (e.g. send +N, -N, +N, -N with brief settles between).
+    Uses a fixed variance threshold (default 8) rather than a
+    percentile — with ~hundreds of moving pixels in a multi-million
+    pixel frame, the 99th percentile is 0 and the percentile-based
+    cutoff would short-circuit. Cursor pixels have std ≈ 40–80
+    across the oscillation, well above 8.
+
+    Returns ``None`` if the variance signal is too weak
+    (``< min_active_pixels``) or too broad (more than
+    ``max_active_fraction`` of the image is "active" — likely
+    something other than the cursor is animating).
     """
     if len(frames) < 3:
         return None
     if any(f.ndim != 2 for f in frames):
-        # Convert if BGR.
         frames = [
             cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if f.ndim == 3 else f
             for f in frames
@@ -157,39 +166,28 @@ def find_cursor_by_variance(
     img_area = h * w
     arr = np.stack([f.astype(np.float32) for f in frames], axis=0)
     var = arr.std(axis=0)
-    # Threshold at the requested percentile.
-    thresh_val = float(np.percentile(var, percentile))
-    if thresh_val < 4.0:
-        # Too little motion to be sure.
-        return None
-    mask = (var > thresh_val).astype(np.uint8) * 255
-    # Close to merge cursor pixels into one blob.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    # Open to drop scattered noise.
+    mask = (var > variance_threshold).astype(np.uint8) * 255
+    # Open to drop isolated noise pixels; keep cursor outlines intact.
     kernel3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel3)
-    contours, _ = cv2.findContours(
-        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-    )
-    candidates = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        area_pct = area / img_area
-        if area_pct < min_area_pct or area_pct > max_area_pct:
-            continue
-        M = cv2.moments(c)
-        if M["m00"] == 0:
-            continue
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
-        candidates.append((area, cx / w, cy / h))
-    if not candidates:
+
+    active_pixels = int((mask > 0).sum())
+    if active_pixels < min_active_pixels:
         return None
-    # Largest plausible blob = cursor.
-    candidates.sort(key=lambda t: -t[0])
-    _, x_pct, y_pct = candidates[0]
-    return x_pct, y_pct
+    if active_pixels > img_area * max_active_fraction:
+        # Too many pixels are moving — something else is animating.
+        return None
+
+    # Centroid of the entire active mask. Robust to multiple
+    # disconnected blobs (cursor visited several positions during the
+    # jiggle): the geometric centre of all positions ≈ the original
+    # cursor position when the oscillation pattern is symmetric.
+    M = cv2.moments(mask, binaryImage=True)
+    if M["m00"] == 0:
+        return None
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
+    return cx / w, cy / h
 
 
 def setup_instructions() -> str:
