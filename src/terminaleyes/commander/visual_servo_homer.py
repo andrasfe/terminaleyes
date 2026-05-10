@@ -201,7 +201,15 @@ class VisualServoHomer:
                     pass
 
     async def _run_inner(self, target_desc: str, button: str) -> ClickOutcome:
-        run_dir = PROOF_DIR / datetime.now().strftime("%H%M%S_vs")
+        # Honour an AgentContext-supplied output_dir if the session
+        # adapter exposes one; otherwise fall back to the legacy
+        # per-run dump under /tmp.
+        session_out = getattr(self._session, "output_dir", None)
+        ts = datetime.now().strftime("%H%M%S_vs")
+        if session_out is not None:
+            run_dir = session_out / "homer" / ts
+        else:
+            run_dir = PROOF_DIR / ts
         run_dir.mkdir(parents=True, exist_ok=True)
         history: list[StepRecord] = []
         last_proof: str | None = None
@@ -971,11 +979,32 @@ class VisualServoHomer:
 
     async def _capture_gray(self) -> np.ndarray:
         frame = await self._session._capture.capture_frame()
+        self._record_session_frame(frame.image, "homer_capture")
         return cv2.cvtColor(frame.image, cv2.COLOR_BGR2GRAY)
 
     async def _capture_color(self) -> np.ndarray:
         frame = await self._session._capture.capture_frame()
+        self._record_session_frame(frame.image, "homer_capture")
         return frame.image
+
+    def _record_session_frame(self, image, label: str) -> None:
+        """Best-effort: persist into the session's flat output dir if
+        the session adapter exposes one. Doesn't raise on failure."""
+        session_out = getattr(self._session, "output_dir", None)
+        if session_out is None or image is None:
+            return
+        ctx = getattr(self._session, "_ctx", None)
+        # Prefer the AgentContext.record_frame helper for consistent
+        # sequential numbering; fall back to a direct write.
+        try:
+            if ctx is not None and hasattr(ctx, "record_frame"):
+                ctx.record_frame(image, label=label)
+            else:
+                import time as _t
+                fname = f"{int(_t.time()*1000)}_{label}.png"
+                cv2.imwrite(str(session_out / fname), image)
+        except Exception:
+            pass
 
     async def _verify_hsv_by_motion(
         self,

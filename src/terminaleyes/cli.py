@@ -32,6 +32,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory to save all session screenshots and "
+             "artefacts. If unset, falls back to "
+             "$TERMINALEYES_OUTPUT_DIR or "
+             "~/.local/share/terminaleyes/runs/<timestamp>/",
+    )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -234,6 +243,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     watch_parser.add_argument(
         "--output", type=str, default=None,
         help="Save session JSON to this file",
+    )
+
+    cc_parser = subparsers.add_parser(
+        "commandcenter",
+        aliases=["cc"],
+        help="Start the Command Center web UI (FastAPI on LAN)",
+    )
+    cc_parser.add_argument(
+        "--host", type=str, default="0.0.0.0",
+        help="Bind address (default: 0.0.0.0 — LAN reachable)",
+    )
+    cc_parser.add_argument(
+        "--port", type=int, default=8765,
+        help="Port (default: 8765)",
+    )
+    cc_parser.add_argument(
+        "--frames-dir", type=str, default=None,
+        help="Watch directory for PNG frames "
+             "(default: /tmp/terminaleyes_homer)",
+    )
+    cc_parser.add_argument(
+        "--max-frames", type=int, default=500,
+        help="Max frames to keep in the index (default: 500)",
     )
 
     return parser.parse_args(argv)
@@ -577,6 +609,10 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("Running controller agent")
         asyncio.run(_run_controller(settings, args))
 
+    elif args.command in ("commandcenter", "cc"):
+        logger.info("Starting Command Center")
+        asyncio.run(_run_commandcenter(settings, args))
+
 
 async def _run_interact(settings, args=None) -> None:
     """Run the interactive visual commander REPL."""
@@ -790,7 +826,39 @@ async def _run_command(settings, args) -> None:
             await mouse.disconnect()
 
 
-async def _build_agent_context(settings, *, with_capture: bool = True):
+def _resolve_session_dir(args) -> Path:
+    """Pick the per-invocation session directory.
+
+    Priority: ``--output-dir`` CLI flag > ``TERMINALEYES_OUTPUT_DIR``
+    env var > ``~/.local/share/terminaleyes/runs/<UTC-timestamp>/``.
+    The directory is created lazily by :meth:`AgentContext.record_frame`.
+    """
+    import os
+    from datetime import datetime as _dt
+
+    base: Path | None = None
+    arg_dir = getattr(args, "output_dir", None)
+    if arg_dir is not None:
+        base = Path(arg_dir).expanduser().resolve()
+    elif os.environ.get("TERMINALEYES_OUTPUT_DIR"):
+        base = Path(
+            os.environ["TERMINALEYES_OUTPUT_DIR"]
+        ).expanduser().resolve()
+
+    ts = _dt.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if base is None:
+        base = Path.home() / ".local" / "share" / "terminaleyes" / "runs"
+        return base / ts
+    # If the user pointed at an existing dir, append a timestamp
+    # subdir so each run is independently inspectable.
+    if base.exists() and base.is_dir():
+        return base / ts
+    return base
+
+
+async def _build_agent_context(
+    settings, *, with_capture: bool = True, args=None,
+):
     """Construct an AgentContext wired to the Pi + LM Studio.
 
     Used by tier-3 agents (focus, navigate, etc.). Not used by the
@@ -842,6 +910,15 @@ async def _build_agent_context(settings, *, with_capture: bool = True):
         max_tokens=cfg.lmstudio_max_tokens,
     )
 
+    output_dir = _resolve_session_dir(args) if args is not None else None
+    if output_dir is not None:
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Session output dir: {output_dir}")
+        except OSError as e:
+            print(f"WARNING: could not create output_dir {output_dir}: {e}")
+            output_dir = None
+
     ctx = AgentContext(
         mouse=mouse,
         keyboard=keyboard,
@@ -849,6 +926,7 @@ async def _build_agent_context(settings, *, with_capture: bool = True):
         vision_client=client,
         vision_model=cfg.lmstudio_model,
         evaluator=evaluator,
+        output_dir=output_dir,
     )
     return ctx, keyboard, mouse, capture
 
@@ -858,7 +936,7 @@ async def _run_controller(settings, args) -> None:
     from terminaleyes.agents.controller import ControllerAgent
 
     ctx, keyboard, mouse, capture = await _build_agent_context(
-        settings, with_capture=True,
+        settings, with_capture=True, args=args,
     )
     # Wire the vault lazily — only if the plan needs it.
     try:
@@ -885,12 +963,67 @@ async def _run_controller(settings, args) -> None:
         await mouse.disconnect()
 
 
+async def _run_commandcenter(settings, args) -> None:
+    """Boot the Command Center FastAPI server.
+
+    The server itself does NOT open the webcam. A fresh AgentContext is
+    built per run (matching `terminaleyes do`) and torn down when that
+    run finishes. While idle, only the static frame watcher is active.
+    """
+    import socket
+    from pathlib import Path
+
+    import uvicorn
+
+    from terminaleyes.commandcenter.frame_store import FrameStore
+    from terminaleyes.commandcenter.log_bus import LogBus
+    from terminaleyes.commandcenter.server import create_app
+
+    async def context_factory():
+        return await _build_agent_context(settings, with_capture=True)
+
+    watch_dir = Path(args.frames_dir) if args.frames_dir \
+        else Path("/tmp/terminaleyes_homer")
+    store = FrameStore(watch_dir=watch_dir, max_frames=args.max_frames)
+    bus = LogBus()
+    app = create_app(context_factory, frame_store=store, bus=bus)
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        lan_ip = sock.getsockname()[0]
+        sock.close()
+    except Exception:
+        lan_ip = args.host
+    print("=" * 60)
+    print("TERMINALEYES COMMAND CENTER")
+    print("=" * 60)
+    print(f"  Local:   http://127.0.0.1:{args.port}")
+    if args.host == "0.0.0.0":
+        print(f"  LAN:     http://{lan_ip}:{args.port}")
+    print(f"  Frames:  {watch_dir}")
+    print("=" * 60)
+
+    config = uvicorn.Config(
+        app, host=args.host, port=args.port,
+        log_level="info", access_log=False,
+    )
+    server = uvicorn.Server(config)
+    try:
+        await server.serve()
+    finally:
+        try:
+            await store.stop()
+        except Exception:
+            pass
+
+
 async def _run_focus(settings, args) -> None:
     """Run the FocusAgent end-to-end."""
     from terminaleyes.agents.focus import FocusAgent
 
     ctx, keyboard, mouse, capture = await _build_agent_context(
-        settings, with_capture=True,
+        settings, with_capture=True, args=args,
     )
     try:
         agent = FocusAgent(ctx)

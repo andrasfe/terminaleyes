@@ -150,6 +150,7 @@ class NavigateAgent(Agent):
 
         v0 = await verifier.run(
             question=BROWSER_QUESTION, visual_only=True,
+            record_label="navigate_browser_check",
         )
         print(
             f"NavigateAgent: browser check — is_browser={bool(v0)} "
@@ -167,6 +168,7 @@ class NavigateAgent(Agent):
             await asyncio.sleep(0.9)
             v = await verifier.run(
                 question=BROWSER_QUESTION, visual_only=True,
+                record_label=f"navigate_browser_recheck_{attempt:02d}",
             )
             print(
                 f"NavigateAgent: re-check — is_browser={bool(v)} "
@@ -276,8 +278,10 @@ class NavigateAgent(Agent):
             frame = await self.ctx.capture.capture_frame()
         except Exception as e:
             return False, f"post-capture failed: {e}"
+        self.ctx.record_frame(frame.image, label="navigate_postflight_full")
         h, w = frame.image.shape[:2]
         urlbar = frame.image[: int(h * 0.10), :]
+        self.ctx.record_frame(urlbar, label="navigate_postflight_urlbar")
 
         # Try OCR (with both polarities).
         try:
@@ -296,27 +300,46 @@ class NavigateAgent(Agent):
 
         text = (normal + " " + inv).lower()
         text_norm = re.sub(r"[^a-z0-9]", "", text)
-        # The "domain core" is more stable than the full URL — trim
-        # protocol / path and pick the most distinctive portion.
-        core = url.lower()
-        core = re.sub(r"^https?://", "", core)
-        core = re.sub(r"[^a-z0-9]", "", core)
-        # If the URL is long, look for the first 8 chars (subdomain
-        # or hostname start) AND the last 8 chars (path tail).
-        candidates = [core]
-        if len(core) > 12:
-            candidates.append(core[:8])
-            candidates.append(core[-8:])
 
-        # Allow tesseract's classic r→t substitution.
+        # Extract distinctive "tokens" from the URL: hostname stem
+        # (e.g. "reddit") and the last path segment (e.g. "localllama").
+        # These survive tesseract garbling much better than the full
+        # core string.
+        url_lower = re.sub(r"^https?://", "", url.lower())
+        path_segments = [
+            re.sub(r"[^a-z0-9]", "", seg)
+            for seg in url_lower.split("/")
+            if seg.strip()
+        ]
+        path_segments = [s for s in path_segments if len(s) >= 4]
+        # Hostname stem: first segment, before first '.' or '/'
+        host = re.sub(
+            r"[^a-z0-9.]", "", url_lower.split("/")[0],
+        )
+        host_parts = [p for p in host.split(".") if len(p) >= 3]
+        candidates = list(dict.fromkeys(path_segments + host_parts))
+
+        # Substring match (cheap).
         for c in candidates:
             if c in text_norm:
                 return True, f"address bar contains {c!r}"
-            if c.replace("r", "t") in text_norm:
-                return True, f"address bar contains {c!r} (r/t sub)"
-            if c.replace("t", "r") in text_norm:
-                return True, f"address bar contains {c!r} (t/r sub)"
+
+        # Fuzzy match: extract alphanumeric runs of ≥4 chars from the
+        # OCR text and compare against each candidate via ratio.
+        from difflib import SequenceMatcher
+        words = re.findall(r"[a-z0-9]{4,}", text_norm)
+        for c in candidates:
+            for w in words:
+                if abs(len(w) - len(c)) > max(2, len(c) // 3):
+                    continue
+                ratio = SequenceMatcher(None, c, w).ratio()
+                if ratio >= 0.75:
+                    return True, (
+                        f"address bar fuzz-matches {c!r} ~ {w!r} "
+                        f"(ratio={ratio:.2f})"
+                    )
+
         return False, (
             f"address bar text {text.strip()[:120]!r} does not "
-            f"contain {core!r}"
+            f"contain any of {candidates!r}"
         )

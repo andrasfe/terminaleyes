@@ -261,6 +261,9 @@ class _SessionAdapter:
         self._client = ctx.vision_client
         self._model = ctx.vision_model
         self._evaluator = ctx.evaluator
+        # Expose output_dir so the homer drops its per-step dump
+        # alongside the rest of the session's artefacts.
+        self.output_dir = getattr(ctx, "output_dir", None)
         # The homer reaches through `_executor._mouse` and calls
         # `_send_hid_moves` and `_showui_query`.
         self._executor = _ExecutorAdapter(ctx)

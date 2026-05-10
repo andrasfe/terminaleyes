@@ -54,6 +54,7 @@ class VerifyAgent(Agent):
         visual_only: bool = True,
         crop: tuple[float, float, float, float] | None = None,
         max_tokens: int = 800,
+        record_label: str = "verify",
     ) -> VerifyOutcome:
         if self.ctx.vision_client is None:
             return VerifyOutcome(
@@ -71,6 +72,7 @@ class VerifyAgent(Agent):
                 return VerifyOutcome(
                     success=False, reason=f"capture failed: {e}",
                 )
+            self.ctx.record_frame(image, label=record_label)
         if crop is not None:
             h, w = image.shape[:2]
             x0 = max(0, int(crop[0] * w))

@@ -87,6 +87,7 @@ class FocusAgent(Agent):
         # frames.
         awake = await verifier.run(
             question=self.AWAKE_QUESTION, visual_only=True,
+            record_label="focus_awake_check",
         )
         print(
             f"FocusAgent: awake check — awake={bool(awake)} "
@@ -97,6 +98,7 @@ class FocusAgent(Agent):
             await self._wake()
             awake = await verifier.run(
                 question=self.AWAKE_QUESTION, visual_only=True,
+                record_label="focus_awake_recheck",
             )
             print(
                 f"FocusAgent: awake re-check — awake={bool(awake)} "
@@ -113,7 +115,10 @@ class FocusAgent(Agent):
             )
 
         # 0. Initial check.
-        v0 = await verifier.run(question=self.QUESTION, visual_only=True)
+        v0 = await verifier.run(
+            question=self.QUESTION, visual_only=True,
+            record_label="focus_initial_check",
+        )
         print(
             f"FocusAgent: initial check — focused={bool(v0)} "
             f"reason={v0.reason!r}"
@@ -130,6 +135,7 @@ class FocusAgent(Agent):
             await asyncio.sleep(settle_seconds)
             v = await verifier.run(
                 question=self.QUESTION, visual_only=True,
+                record_label=f"focus_recheck_{attempt:02d}",
             )
             print(
                 f"FocusAgent: attempt {attempt}/{max_attempts} — "
