@@ -976,6 +976,66 @@ async def _run_controller(settings, args) -> None:
         await mouse.disconnect()
 
 
+def _check_port_free(host: str, port: int) -> None:
+    """Refuse to start cc if ``host:port`` is already bound.
+
+    macOS lets uvicorn workers bind the same port without raising,
+    which silently splits browser requests across stale + fresh
+    processes. Detect that pre-emptively and exit with a useful
+    pointer.
+    """
+    import socket as _sk
+    import sys as _sys
+
+    probe = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+    probe.settimeout(0.5)
+    test_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    try:
+        probe.connect((test_host, port))
+        # Connection succeeded → something is already serving here.
+        probe.close()
+        existing = []
+        try:
+            import subprocess as _sp
+            out = _sp.check_output(
+                ["lsof", "-i", f":{port}", "-P", "-sTCP:LISTEN"],
+                text=True,
+                stderr=_sp.DEVNULL,
+            )
+            existing = [
+                line for line in out.splitlines()[1:]
+                if line.strip()
+            ]
+        except Exception:
+            pass
+        print(
+            f"\n✗ Port {port} is already in use on {test_host}.\n"
+        )
+        if existing:
+            print("Listening processes:")
+            for line in existing:
+                print(f"  {line}")
+            print(
+                "\nTo stop existing cc instance(s):"
+                "\n  pkill -f 'terminaleyes cc'"
+                f"\nThen re-run, or pick a different port with --port.\n"
+            )
+        else:
+            print(
+                "Pick a different port with --port, or stop the "
+                "existing process.\n"
+            )
+        _sys.exit(2)
+    except (OSError, _sk.timeout):
+        # Connection refused → port is free.
+        pass
+    finally:
+        try:
+            probe.close()
+        except Exception:
+            pass
+
+
 async def _capture_boot_frame(settings, watch_dir) -> None:
     """One-shot capture at server boot so the UI has something to show.
 
@@ -1072,6 +1132,13 @@ async def _run_commandcenter(settings, args) -> None:
         settings, base_dir=watch_dir, bus=bus,
     )
     app = create_app(context_factory, frame_store=store, bus=bus)
+
+    # Pre-flight: refuse to start if another process is already
+    # listening on the requested port. macOS will sometimes let
+    # multiple Python uvicorn workers bind the same port; that
+    # silently splits browser requests across stale and fresh
+    # processes which is brutal to debug. Fail loud instead.
+    _check_port_free(args.host, args.port)
 
     # Boot frame: capture once before serving so the UI isn't empty.
     if not args.no_boot_frame:
