@@ -188,19 +188,33 @@ class FocusAgent(Agent):
     async def _apply_action(self, attempt: int, platform: str) -> None:
         """Send one corrective action.
 
-        Strategy escalates each attempt: maximise → click+maximise →
-        WM-overview hint. ``platform`` selects the key combos.
+        Strategy escalates each attempt:
+
+          1. ``Escape`` (gentle dismiss of any open menu/dropdown) +
+             maximise.
+          2. Click in the screen centre to transfer WM focus to the
+             visible app + maximise.
+          3. **Last resort, destructive**: ``Alt+F4`` to close the
+             stuck foreground window (e.g. an App Center pop-up that
+             holds keyboard focus while a real app is visible behind),
+             then maximise whatever's now in front.
+
+        Increase ``max_attempts`` to a 4th attempt to also try the
+        EWMH ``Alt+F10`` maximise hint as a final non-destructive
+        try after the close.
         """
         kb = self.ctx.keyboard
         mouse = self.ctx.mouse
         if attempt == 1:
-            # Maximise focused window.
+            # Gentle dismissal of an open menu / dropdown first.
+            try:
+                await kb.send_keystroke("Escape")
+                await asyncio.sleep(0.15)
+            except Exception:
+                pass
+            # Then maximise focused window.
             try:
                 if platform == "macos":
-                    # macOS doesn't have a system-wide "maximize"; the
-                    # "zoom" green-button is per-app. Best portable
-                    # bet: Cmd+Ctrl+F (fullscreen), but this can make
-                    # the situation worse. Skip on macOS unless asked.
                     print(
                         "FocusAgent: macOS has no portable maximise "
                         "combo; sending Option+Cmd+F (fullscreen "
@@ -208,19 +222,14 @@ class FocusAgent(Agent):
                     )
                     await kb.send_key_combo(["alt", "cmd"], "f")
                 else:
-                    # GNOME/most Linux WMs.
                     await kb.send_key_combo(["super"], "Up")
             except Exception as e:
                 logger.warning("Maximise combo failed: %s", e)
         elif attempt == 2:
-            # Click image centre to give the visible app keyboard
-            # focus, then retry maximise.
+            # Click image centre to transfer WM focus to the visible
+            # app, then retry maximise.
             try:
                 if mouse is not None:
-                    # Slam to corner, then move ~half-screen so we
-                    # land somewhere on the visible window. Without
-                    # calibration, send a deliberate move via small
-                    # chunks — the Pi backend handles chunking.
                     for dx, dy in [(80, 80)] * 6:
                         await mouse.move(dx, dy)
                         await asyncio.sleep(0.02)
@@ -235,9 +244,32 @@ class FocusAgent(Agent):
                     await kb.send_key_combo(["super"], "Up")
             except Exception as e:
                 logger.warning("Maximise combo (retry) failed: %s", e)
+        elif attempt == 3:
+            # Last-resort DESTRUCTIVE: close the stuck foreground
+            # window. Useful when a small popup (App Center,
+            # software-updater toast, modal dialog) holds WM focus
+            # while a real app is visible behind it. After Alt+F4
+            # closes the popup, the previously-behind app becomes
+            # the foreground naturally — then we maximise it.
+            print(
+                "FocusAgent: attempt 3 — closing focused window with "
+                "Alt+F4 (destructive last resort)"
+            )
+            try:
+                await kb.send_key_combo(["alt"], "F4")
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning("Alt+F4 close failed: %s", e)
+            try:
+                if platform == "macos":
+                    await kb.send_key_combo(["alt", "cmd"], "f")
+                else:
+                    await kb.send_key_combo(["super"], "Up")
+            except Exception as e:
+                logger.warning("Post-close maximise failed: %s", e)
         else:
-            # Last-resort: Alt+F10 (EWMH maximise hint) on Linux,
-            # or repeat the combo for macOS.
+            # 4th+ attempt (only fires when max_attempts is raised
+            # above the default 3): EWMH maximise hint.
             try:
                 if platform == "macos":
                     await kb.send_key_combo(["alt", "cmd"], "f")

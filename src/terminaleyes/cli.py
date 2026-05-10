@@ -136,6 +136,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-llm-fallback", action="store_true",
         help="Disable the LLM-planner fallback when no rule matches",
     )
+    do_parser.add_argument(
+        "--cc-url", type=str, default=None,
+        help="Send the intent to a running Command Center instead of "
+             "running locally (default: auto-detect "
+             "http://127.0.0.1:8765, fall back to local).",
+    )
+    do_parser.add_argument(
+        "--local", action="store_true",
+        help="Force local execution even if a Command Center is "
+             "running. Useful for debugging without UI overhead.",
+    )
 
     focus_parser = subparsers.add_parser(
         "focus",
@@ -945,8 +956,22 @@ async def _build_agent_context(
 
 
 async def _run_controller(settings, args) -> None:
-    """Run the ControllerAgent on a free-form intent."""
+    """Run the ControllerAgent on a free-form intent.
+
+    Auto-routes through a running Command Center when one is
+    detected (so the UI sees every CLI invocation). Falls back to
+    in-process local execution otherwise. Pass ``--local`` to skip
+    the auto-route, or ``--cc-url URL`` to force routing to a
+    specific cc instance.
+    """
     from terminaleyes.agents.controller import ControllerAgent
+
+    if not args.local:
+        cc_url = args.cc_url or "http://127.0.0.1:8765"
+        if await _cc_is_up(cc_url):
+            print(f"Routing through Command Center at {cc_url}")
+            ok = await _route_through_cc(cc_url, args)
+            sys.exit(0 if ok else 1)
 
     ctx, keyboard, mouse, capture = await _build_agent_context(
         settings, with_capture=True, args=args,
@@ -974,6 +999,106 @@ async def _run_controller(settings, args) -> None:
                 pass
         await keyboard.disconnect()
         await mouse.disconnect()
+
+
+async def _cc_is_up(base_url: str, *, timeout: float = 0.5) -> bool:
+    """Lightweight probe: is a cc reachable + reporting state?"""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.get(f"{base_url}/api/state")
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def _route_through_cc(base_url: str, args) -> bool:
+    """POST the intent to a running cc and stream its log SSE to
+    stdout. Returns ``True`` if the run reported success.
+
+    The cc owns the AgentContext for the run (so the webcam, Pi
+    handles, and frame recording all happen in the cc process —
+    the UI sees everything live). This CLI process just starts
+    the run, prints the audit trail, and exits with the right
+    status code.
+    """
+    import json as _json
+    import time as _time
+
+    import httpx
+
+    payload = {
+        "intent": args.intent,
+        "no_focus": bool(args.no_focus),
+        "vault": args.vault,
+        "platform": args.platform,
+        "dry_run": bool(args.dry_run),
+        "allow_llm_fallback": not bool(args.no_llm_fallback),
+    }
+
+    async with httpx.AsyncClient(timeout=None) as c:
+        # 1. Start the run.
+        try:
+            r = await c.post(
+                f"{base_url}/api/run", json=payload, timeout=10.0,
+            )
+        except Exception as e:
+            print(f"✗ Could not POST run to cc: {e}")
+            return False
+        if r.status_code == 409:
+            print(
+                "✗ Command Center is busy with another run; "
+                "wait or use --local"
+            )
+            return False
+        if r.status_code != 200:
+            print(f"✗ cc rejected run: HTTP {r.status_code} {r.text}")
+            return False
+        record = r.json()
+        run_id = record["run_id"]
+        print(f"  cc run_id: {run_id}")
+
+        # 2. Stream the SSE log lines to stdout.
+        try:
+            async with c.stream(
+                "GET",
+                f"{base_url}/api/runs/{run_id}/logs",
+                timeout=None,
+            ) as resp:
+                async for raw in resp.aiter_lines():
+                    if not raw:
+                        continue
+                    if raw.startswith("event: done"):
+                        break
+                    if not raw.startswith("data: "):
+                        continue
+                    body = raw[len("data: "):]
+                    try:
+                        ev = _json.loads(body)
+                    except _json.JSONDecodeError:
+                        continue
+                    msg = ev.get("msg", "")
+                    if msg:
+                        print(msg)
+        except Exception as e:
+            # SSE may close on success; only complain if we never
+            # got a final record below.
+            print(f"  (SSE stream ended: {e})")
+
+        # 3. Read the final record for the exit status.
+        try:
+            r2 = await c.get(
+                f"{base_url}/api/runs/{run_id}", timeout=5.0,
+            )
+            rec = r2.json()
+            status = rec.get("status", "unknown")
+            reason = rec.get("reason") or ""
+            mark = "✓" if status == "succeeded" else "✗"
+            print(f"\n{mark} cc run {status}: {reason}")
+            return status == "succeeded"
+        except Exception as e:
+            print(f"  (could not fetch final record: {e})")
+            return False
 
 
 def _check_port_free(host: str, port: int) -> None:
