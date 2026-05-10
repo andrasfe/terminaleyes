@@ -882,13 +882,35 @@ class ControllerAgent(Agent):
         # 20 minutes ago can mark THIS run as failed.
         pre_lines = await self._snapshot_screen_lines(label="pre_state")
 
-        # Pre-run hygiene: if the baseline shows a stuck shell
+        # Pre-run hygiene #1: wake a sleeping / no-signal display.
+        # A capture card with no HDMI input shows SMPTE color bars
+        # (bright but non-UI). A sleeping monitor shows black. Both
+        # produce essentially-no OCR'd text. If we'd run the plan
+        # without waking, the LLM-emitted keystrokes would go to a
+        # suspended display server. Mouse jiggle reliably wakes
+        # both DPMS-off displays and the X/Wayland input subsystem
+        # without sending any character to a foregrounded app.
+        pre_text = "\n".join(sorted(pre_lines))
+        if len(pre_text.strip()) < 30:
+            print(
+                "Pre-run hygiene: baseline OCR is sparse "
+                f"({len(pre_text)} chars) — target may be asleep / "
+                "showing test pattern; running mouse-jiggle wake"
+            )
+            await self._wake_display()
+            # Re-snapshot so subsequent checks (and the verifier's
+            # NEW-vs-OLD diff) see the post-wake state.
+            pre_lines = await self._snapshot_screen_lines(
+                label="pre_state_after_wake",
+            )
+            pre_text = "\n".join(sorted(pre_lines))
+
+        # Pre-run hygiene #2: if the baseline shows a stuck shell
         # continuation state (`> ` prompts from a prior unmatched
         # quote / paren / backslash), send Ctrl+C before the plan
         # executes. Otherwise any `type` step in the plan would be
         # appended to the open string and never run as a command.
         # Generic — no terminal-specific knowledge required.
-        pre_text = "\n".join(sorted(pre_lines))
         stuck_at_start = _detect_stuck_terminal(pre_text)
         if stuck_at_start:
             print(
@@ -1111,6 +1133,34 @@ class ControllerAgent(Agent):
         )
 
     # ──────────────── final capture + completion verify ────────────────
+
+    async def _wake_display(self) -> None:
+        """Wake a sleeping monitor / DPMS-off display server via
+        mouse-only stimuli — NO keystrokes (so we don't bleed into
+        a foregrounded terminal or editor). Idempotent: jiggles a
+        few times and waits for the display to come back.
+
+        Used by the controller's pre-flight when baseline OCR
+        comes up empty (color bars, lock screen, blank monitor).
+        Separate from :class:`WakeAgent` which can also send a
+        Down arrow — we deliberately avoid that here because the
+        pre-flight runs on EVERY run.
+        """
+        import asyncio as _aio
+        mouse = self.ctx.mouse
+        if mouse is None:
+            return
+        try:
+            for _ in range(8):
+                await mouse.move(15, 0)
+                await _aio.sleep(0.04)
+                await mouse.move(-15, 0)
+                await _aio.sleep(0.04)
+        except Exception as e:
+            logger.warning("display-wake jiggle failed: %s", e)
+        # Generous settle — DPMS wake + display server redraw can
+        # take a second or two on Linux.
+        await _aio.sleep(2.0)
 
     async def _send_terminal_recovery(self) -> bool:
         """Send Ctrl+C to break out of a stuck shell continuation
