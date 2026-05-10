@@ -102,10 +102,26 @@ def create_app(
         await store.stop()
 
     # ── static / index ───────────────────────────────────────────
+    # No-cache headers so iterating on the SPA doesn't require the
+    # user to hard-refresh after every server restart. Static files
+    # are tiny — caching savings aren't worth the dev friction.
+    NO_CACHE = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+
     if STATIC_DIR.exists():
+        class _NoCacheStatic(StaticFiles):
+            async def get_response(self, path, scope):
+                resp = await super().get_response(path, scope)
+                for k, v in NO_CACHE.items():
+                    resp.headers[k] = v
+                return resp
+
         app.mount(
             "/static",
-            StaticFiles(directory=str(STATIC_DIR)),
+            _NoCacheStatic(directory=str(STATIC_DIR)),
             name="static",
         )
 
@@ -114,7 +130,7 @@ def create_app(
         idx = STATIC_DIR / "index.html"
         if not idx.exists():
             raise HTTPException(404, "index.html not found")
-        return FileResponse(str(idx))
+        return FileResponse(str(idx), headers=NO_CACHE)
 
     # ── frames ────────────────────────────────────────────────────
     @app.get("/api/frames")
