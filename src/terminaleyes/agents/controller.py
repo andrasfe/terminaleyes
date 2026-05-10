@@ -48,6 +48,9 @@ from terminaleyes.agents.login import LoginAgent
 from terminaleyes.agents.navigate import NavigateAgent
 from terminaleyes.agents.ocr import OcrAgent
 from terminaleyes.agents.read import ReadAgent
+from terminaleyes.agents.scribe import (
+    ScribeAgent, journal_path, read_tail as _journal_read_tail,
+)
 from terminaleyes.agents.scroll import ScrollAgent
 from terminaleyes.agents.target import TargetAgent
 from terminaleyes.agents.type_text import TypeAgent
@@ -196,6 +199,20 @@ _ERROR_MARKERS: tuple[re.Pattern, ...] = (
 )
 
 
+def _bottom_chunk(text: str, *, frac: float = 0.30, min_lines: int = 5) -> str:
+    """Return the bottom ``frac`` of ``text``'s lines (at least
+    ``min_lines``). Used as a fallback when the new-vs-old line diff
+    comes up empty — the most recent output in a terminal is at the
+    bottom, so scanning the tail is a reasonable approximation."""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    keep = max(min_lines, int(len(lines) * frac))
+    return "\n".join(lines[-keep:])
+
+
 def _scan_for_error(text: str) -> str:
     """Return the first error-marker substring found in ``text``,
     or ``""`` if none. Case-insensitive."""
@@ -341,6 +358,36 @@ def load_memory() -> str:
     except OSError as e:
         logger.debug("could not read memory %s: %s", p, e)
     return ""
+
+
+# Number of recent journal entries to inject into the LLM-planner
+# prompt. Each entry is ~80-150 tokens; 20 fits in <= 3 KB.
+JOURNAL_TAIL_FOR_PLANNER = 20
+
+
+def load_journal_tail(n: int = JOURNAL_TAIL_FOR_PLANNER) -> str:
+    """Return the last ``n`` journal entries joined into a single
+    markdown block, or ``""`` when the journal is empty / missing.
+    Used by the LLM planner as episodic memory of recent runs."""
+    blocks = _journal_read_tail(n)
+    if not blocks:
+        return ""
+    return "\n\n".join(blocks)
+
+
+def _journal_block() -> str:
+    """Format the journal tail as a prompt block, or empty string
+    when there's nothing to inject."""
+    tail = load_journal_tail()
+    if not tail:
+        return ""
+    return (
+        "Recent run history (your own past attempts on this "
+        "machine — last entries first; treat as episodic memory: "
+        "if a similar intent succeeded recently with a clean plan, "
+        "favour that plan):\n"
+        f"{tail}\n\n"
+    )
 
 
 @dataclass
@@ -796,6 +843,13 @@ class ControllerAgent(Agent):
             if extra:
                 print(f"  | ... ({extra} more line(s))")
 
+        # Pre-run OCR baseline. Used by the final-state verifier to
+        # tell NEW screen content (this run's output) apart from
+        # OLD content (scrollback / leftover errors from prior
+        # runs). Without this, an old `Command 'pt' not found` from
+        # 20 minutes ago can mark THIS run as failed.
+        pre_lines = await self._snapshot_screen_lines(label="pre_state")
+
         ck = _cache_key(intent, no_focus, vault_name, platform)
         cached = _cache_get(ck)
         if cached is not None:
@@ -909,6 +963,7 @@ class ControllerAgent(Agent):
                     intent=intent,
                     final_settle_sec=final_settle_sec,
                     verify_completion=verify_completion,
+                    pre_lines=pre_lines,
                 )
                 return ControllerOutcome(
                     success=False,
@@ -947,6 +1002,7 @@ class ControllerAgent(Agent):
             intent=intent,
             final_settle_sec=final_settle_sec,
             verify_completion=verify_completion,
+            pre_lines=pre_lines,
         )
         # Refine the top-line outcome with the verifier's verdict so
         # the cc UI / CLI summary line tells the user whether the
@@ -965,6 +1021,29 @@ class ControllerAgent(Agent):
                 f"completed all {len(plan)} steps; visual "
                 f"verification: {completion.get('reason', '')}"
             )
+
+        # Best-effort scribe — append a journal entry for episodic
+        # memory. Never blocks the run's outcome. The run_id is
+        # carried via the per-run output_dir's name (set by the cc
+        # factory) so the journal entry is traceable back to the
+        # frame folder.
+        run_id = ""
+        out_dir = getattr(self.ctx, "output_dir", None)
+        if out_dir is not None:
+            try:
+                run_id = Path(out_dir).name
+            except Exception:
+                run_id = ""
+        try:
+            await ScribeAgent(self.ctx).run(
+                intent=intent,
+                run_id=run_id,
+                success=success,
+                verdict_reason=reason,
+                ocr_text=completion.get("ocr_text", "") or "",
+            )
+        except Exception as e:
+            logger.debug("scribe failed: %s", e)
         return ControllerOutcome(
             success=success,
             reason=reason,
@@ -980,12 +1059,40 @@ class ControllerAgent(Agent):
 
     # ──────────────── final capture + completion verify ────────────────
 
+    async def _snapshot_screen_lines(self, *, label: str) -> set[str]:
+        """Best-effort OCR snapshot of the current screen, returning
+        the set of (whitespace-stripped) non-empty lines. Used as a
+        baseline so the final-state verifier can tell new content
+        apart from scrollback. Failures swallowed — the caller just
+        gets an empty set and the diff falls through gracefully."""
+        if self.ctx.capture is None or self.ctx.vision_client is None:
+            return set()
+        try:
+            frame = await self.ctx.capture.capture_frame()
+        except Exception as e:
+            logger.debug("baseline capture failed: %s", e)
+            return set()
+        try:
+            outcome = await OcrAgent(self.ctx).run(
+                region="full", image=frame.image, record_label=label,
+            )
+        except Exception as e:
+            logger.debug("baseline OCR failed: %s", e)
+            return set()
+        if not (outcome.success and outcome.data):
+            return set()
+        return {
+            ln.strip() for ln in (outcome.data.get("lines") or [])
+            if ln.strip()
+        }
+
     async def _final_capture_and_verify(
         self,
         *,
         intent: str,
         final_settle_sec: float,
         verify_completion: bool,
+        pre_lines: set[str] | None = None,
     ) -> dict[str, Any]:
         """Wait for the screen to settle, capture a ``final_state``
         frame, and (optionally) ask :class:`VerifyAgent` whether the
@@ -1034,6 +1141,7 @@ class ControllerAgent(Agent):
         # 'ind' not found" — the OCR pass forces the verdict to
         # be based on what's actually on screen.
         ocr_text = ""
+        post_lines: list[str] = []
         try:
             ocr_outcome = await OcrAgent(self.ctx).run(
                 region="full", image=frame.image,
@@ -1041,18 +1149,42 @@ class ControllerAgent(Agent):
             )
             if ocr_outcome.success and ocr_outcome.data:
                 ocr_text = (ocr_outcome.data.get("text") or "").strip()
+                post_lines = list(
+                    ocr_outcome.data.get("lines") or [],
+                )
         except Exception as e:
             logger.debug("final OCR failed: %s", e)
+        # Carry the OCR text in the completion record so the scribe
+        # (and any future post-run analysis) can read it without
+        # re-OCR'ing.
+        info["ocr_text"] = ocr_text
 
-        # Hard heuristic: explicit error markers in the OCR text
-        # short-circuit to FAILURE — but ONLY for intents that
-        # imply the action should produce visible output (run /
-        # find / fetch / navigate / etc.). For non-output intents
-        # (close / open / switch / minimise), errors on screen are
-        # almost always residue from a PRIOR action and don't
-        # reflect on the current request — let the LLM judge based
-        # on whether the requested state change actually happened.
-        err_hit = _scan_for_error(ocr_text)
+        # Compute the lines that are NEW since the run started. A
+        # baseline OCR snapshot was taken before planning kicked
+        # off; lines present then are scrollback and don't reflect
+        # this run's outcome. Scanning only the NEW lines keeps
+        # stale errors from prior runs out of the verdict (e.g.
+        # `Command 'pt' not found` from 20 minutes ago doesn't
+        # mark today's `apt list --upgradable` as failed).
+        if pre_lines is None:
+            pre_lines = set()
+        new_lines = [
+            ln for ln in post_lines
+            if ln.strip() and ln.strip() not in pre_lines
+        ]
+        new_text = "\n".join(new_lines)
+        # Fallback: if the diff is empty (capture race, fully
+        # static screen, etc.) but the screen has content, scan
+        # the bottom 30% of the OCR — that's the most recent
+        # output for terminals / page footers.
+        scan_text = new_text or _bottom_chunk(ocr_text)
+
+        # Hard heuristic: explicit error markers short-circuit to
+        # FAILURE — but ONLY for intents that imply the action
+        # should produce visible output. For close/open/switch/
+        # minimise, errors on screen are almost always residue
+        # from a PRIOR action; let the LLM judge.
+        err_hit = _scan_for_error(scan_text)
         if err_hit and _intent_expects_output(intent):
             info["verified"] = False
             info["reason"] = (
@@ -1208,10 +1340,12 @@ class ControllerAgent(Agent):
                 "Long-lived notes from the user (authoritative):\n"
                 f"{memory}\n\n"
             )
+        journal_block = _journal_block()
         prompt = (
             "You are a JSON planner. Plan the additional agent "
             "steps needed for ONE sub-intent of a larger task.\n\n"
             f"{memory_block}"
+            f"{journal_block}"
             f"Full original intent:\n    {full_intent}\n\n"
             f"Steps already planned (from rule matching):\n    {already}\n\n"
             f"Sub-intent to plan:\n    {chunk}\n\n"
@@ -1268,12 +1402,14 @@ class ControllerAgent(Agent):
                 "real configuration and the user's preferences):\n"
                 f"{memory}\n\n"
             )
+        journal_block = _journal_block()
         prompt = (
             "You are a JSON planner. The user wants to accomplish an "
             "intent on a remote computer that we control via mouse + "
             "keyboard. Decompose the intent into a sequence of agent "
             "calls.\n\n"
             f"{memory_block}"
+            f"{journal_block}"
             f"User intent:\n    {intent}\n\n"
             "Available agents:\n"
             f"{agent_descriptions}\n\n"

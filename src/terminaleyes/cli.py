@@ -307,6 +307,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "clear: delete the file.",
     )
 
+    journal_parser = subparsers.add_parser(
+        "journal",
+        help="Show / tail / clear the controller's episodic "
+             "journal (auto-appended after each run; last entries "
+             "are injected into the LLM-planner prompt).",
+    )
+    journal_parser.add_argument(
+        "journal_action", nargs="?", default="tail",
+        choices=["tail", "show", "path", "clear"],
+        help="tail (default): last 20 entries; "
+             "show: full file; "
+             "path: print the file path; "
+             "clear: delete the file.",
+    )
+    journal_parser.add_argument(
+        "--n", type=int, default=20,
+        help="Number of entries for 'tail' (default 20).",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -655,6 +674,9 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "memory":
         _run_memory(args)
 
+    elif args.command == "journal":
+        _run_journal(args)
+
 
 def _run_memory(args) -> None:
     """show / path / edit / clear the controller's memory file."""
@@ -693,6 +715,46 @@ def _run_memory(args) -> None:
                 encoding="utf-8",
             )
         subprocess.call([editor, str(path)])
+        return
+    if action == "clear":
+        if path.exists():
+            path.unlink()
+            print(f"removed {path}")
+        else:
+            print(f"(nothing to clear — {path} does not exist)")
+        return
+
+
+def _run_journal(args) -> None:
+    """tail / show / path / clear the controller's journal file."""
+    from terminaleyes.agents.scribe import (
+        journal_path, read_tail,
+    )
+
+    path = journal_path()
+    action = getattr(args, "journal_action", "tail") or "tail"
+
+    if action == "path":
+        print(path)
+        return
+    if action == "show":
+        if not path.exists():
+            print(f"(empty — {path} does not exist)")
+            return
+        try:
+            print(f"# {path}")
+            print(path.read_text(encoding="utf-8"))
+        except OSError as e:
+            print(f"could not read {path}: {e}")
+        return
+    if action == "tail":
+        n = int(getattr(args, "n", 20) or 20)
+        blocks = read_tail(n)
+        if not blocks:
+            print(f"(empty — {path} does not exist or has no entries)")
+            return
+        print(f"# {path} — last {len(blocks)} entries")
+        print("\n\n".join(blocks))
         return
     if action == "clear":
         if path.exists():
