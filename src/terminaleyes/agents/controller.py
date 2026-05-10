@@ -239,6 +239,31 @@ def _intent_expects_output(intent: str) -> bool:
     return bool(_OUTPUT_VERBS.search(intent or ""))
 
 
+def _dedup_adjacent_steps(plan: list[PlanStep]) -> list[PlanStep]:
+    """Collapse adjacent steps with identical ``(name, kwargs)``.
+
+    Used after stitching per-chunk LLM plans together: the LLM
+    often emits a ``launch terminal`` step for both "open a
+    terminal" and "run X in a terminal", which means the
+    second launch reopens the app mid-plan and eats the first
+    keystroke of the following type step (we observed `find` →
+    `ind`, `apt update` → `pt update`, etc.). Dedup at the seam
+    is the cleanest fix.
+    """
+    if len(plan) < 2:
+        return list(plan)
+    out: list[PlanStep] = []
+    for s in plan:
+        if out and out[-1].name == s.name and out[-1].kwargs == s.kwargs:
+            logger.info(
+                "Plan dedup: dropping duplicate adjacent %s step",
+                s.name,
+            )
+            continue
+        out.append(s)
+    return out
+
+
 def _filter_kwargs(
     agent_cls: type, kwargs: dict, *, name: str,
 ) -> dict:
@@ -1109,11 +1134,15 @@ class ControllerAgent(Agent):
         resolve any chunk, we fall back to whole-intent planning so
         the controller still has SOMETHING to try.
         """
-        # Walk in source order so chunks that share an insertion
-        # index (the common case where the rule plan was empty and
-        # every chunk falls back to the LLM) land in the user's
-        # original sequence. ``offset`` tracks the cumulative
-        # insertions so subsequent splices land AFTER prior ones.
+        # Walk in source order. ``offset`` tracks cumulative
+        # insertions so later splices land after earlier ones.
+        # ``merged`` is the running plan; we pass it (NOT the
+        # original rule plan) into each subsequent LLM call so
+        # the LLM knows what's already been planned by previous
+        # chunks. Without this, the per-chunk LLM cheerfully
+        # re-emits a ``launch terminal`` for "check for updates"
+        # because it never saw the prior chunk's ``launch
+        # terminal`` for "open a terminal".
         merged = list(plan)
         offset = 0
         any_resolved = False
@@ -1121,7 +1150,7 @@ class ControllerAgent(Agent):
             steps = await self._llm_plan_chunk(
                 chunk=chunk,
                 full_intent=intent,
-                rule_plan=plan,
+                rule_plan=list(merged),
                 no_focus=no_focus,
                 platform=platform,
                 vault_name=vault_name,
@@ -1139,7 +1168,14 @@ class ControllerAgent(Agent):
             else:
                 print(f"  LLM could not resolve chunk {chunk!r}")
         if any_resolved:
-            return merged
+            # Belt-and-braces dedup: even with the cumulative-plan
+            # context, models occasionally still emit duplicates.
+            # An adjacent-pair dedup keyed on (name, kwargs) fixes
+            # most of those without hiding genuine repetition (a
+            # plan that legitimately wants two consecutive ``keys``
+            # of the SAME chord — rare — would also collapse, but
+            # collapsing 2 → 1 of an idempotent step is harmless).
+            return _dedup_adjacent_steps(merged)
         # Total miss — let the caller fall through to whole-intent
         # planning by returning an empty plan.
         return []

@@ -23,7 +23,9 @@ from __future__ import annotations
 import pytest
 
 from terminaleyes.agents.controller import (
-    _cache_get, _cache_key, _filter_kwargs, _intent_expects_output,
+    PlanStep,
+    _cache_get, _cache_key, _dedup_adjacent_steps,
+    _filter_kwargs, _intent_expects_output,
     _scan_for_error, cache_clear, plan_intent,
 )
 
@@ -312,3 +314,55 @@ def test_filter_kwargs_keeps_all_known_for_keys():
 def test_filter_kwargs_empty_dict_passes_through():
     from terminaleyes.agents.focus import FocusAgent
     assert _filter_kwargs(FocusAgent, {}, name="focus") == {}
+
+
+# ── adjacent-step dedup ──────────────────────────────────────────
+
+def test_dedup_collapses_duplicate_launches():
+    """The headline bug: per-chunk LLM emits two identical launch
+    steps for chained intents like 'open a terminal and run X',
+    and the second launch eats the first char of the following
+    type. Dedup at the seam fixes it."""
+    from terminaleyes.agents.launch import LaunchAgent
+    from terminaleyes.agents.type_text import TypeAgent
+    plan = [
+        PlanStep("launch", LaunchAgent,
+                 {"app": "terminal", "platform": "linux"}),
+        PlanStep("launch", LaunchAgent,
+                 {"app": "terminal", "platform": "linux"}),
+        PlanStep("type", TypeAgent,
+                 {"text": "apt update", "submit": True}),
+    ]
+    out = _dedup_adjacent_steps(plan)
+    assert [s.name for s in out] == ["launch", "type"]
+
+
+def test_dedup_keeps_distinct_kwargs():
+    from terminaleyes.agents.launch import LaunchAgent
+    plan = [
+        PlanStep("launch", LaunchAgent, {"app": "terminal"}),
+        PlanStep("launch", LaunchAgent, {"app": "firefox"}),
+    ]
+    out = _dedup_adjacent_steps(plan)
+    assert [s.kwargs["app"] for s in out] == ["terminal", "firefox"]
+
+
+def test_dedup_keeps_non_adjacent_duplicates():
+    """Two identical steps separated by a different step both
+    survive — the bug only happens at the seam."""
+    from terminaleyes.agents.launch import LaunchAgent
+    from terminaleyes.agents.focus import FocusAgent
+    plan = [
+        PlanStep("launch", LaunchAgent, {"app": "terminal"}),
+        PlanStep("focus", FocusAgent, {}),
+        PlanStep("launch", LaunchAgent, {"app": "terminal"}),
+    ]
+    out = _dedup_adjacent_steps(plan)
+    assert [s.name for s in out] == ["launch", "focus", "launch"]
+
+
+def test_dedup_handles_empty_and_single():
+    assert _dedup_adjacent_steps([]) == []
+    from terminaleyes.agents.focus import FocusAgent
+    one = [PlanStep("focus", FocusAgent, {})]
+    assert _dedup_adjacent_steps(one) == one
