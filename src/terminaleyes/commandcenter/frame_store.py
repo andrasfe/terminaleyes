@@ -52,6 +52,11 @@ class FrameMeta:
     def public(self) -> dict:
         d = asdict(self)
         d.pop("path")
+        # JSON.parse in JS rounds 64-bit nanosecond ids to the
+        # nearest representable double (last 3-4 digits silently
+        # zeroed). Send id as a string so the round-trip preserves
+        # exact bits — FastAPI's path handler parses it back to int.
+        d["id"] = str(d["id"])
         return d
 
 
