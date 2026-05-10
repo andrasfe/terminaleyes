@@ -201,16 +201,17 @@ class NavigateAgent(Agent):
             browser_names = ["firefox", "google-chrome", "chromium"]
             name = browser_names[attempt - 1]
             try:
-                # Open activities. A bare Super tap toggles the
-                # overview. If we're already in overview from a
-                # previous attempt, this closes it — so press Esc
-                # first to be safe.
+                # If we're already in overview from a previous attempt
+                # or some other state, Esc dismisses it cleanly.
                 try:
                     await kb.send_keystroke("Escape")
                     await asyncio.sleep(0.2)
                 except Exception:
                     pass
-                await kb.send_keystroke("super")
+                # Tap the bare Super modifier — opens GNOME activities
+                # overview. Pi accepts an empty key as "modifier-only
+                # tap".
+                await kb.send_key_combo(["super"], "")
                 await asyncio.sleep(0.7)
                 # Type the browser name. Activities filters apps as
                 # you type and highlights the best match.
@@ -219,7 +220,7 @@ class NavigateAgent(Agent):
                 await kb.send_keystroke("Enter")
                 return f"GNOME overview + {name!r}"
             except Exception as e:
-                logger.debug(
+                logger.warning(
                     "GNOME overview attempt for %r failed: %s",
                     name, e,
                 )
