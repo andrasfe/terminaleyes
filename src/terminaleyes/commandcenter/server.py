@@ -132,6 +132,33 @@ def create_app(
             raise HTTPException(404, "index.html not found")
         return FileResponse(str(idx), headers=NO_CACHE)
 
+    # ── scripts download ─────────────────────────────────────────
+    # Convenience endpoint so the operator can fetch helper shell
+    # scripts from the target machine with a single curl, avoiding
+    # scp / USB / etc. round-trips. Only ``.sh`` files in the
+    # repo's ``scripts/`` directory are exposed; path traversal is
+    # blocked.
+    _SCRIPTS_DIR = (
+        Path(__file__).parents[3] / "scripts"
+    ).resolve()
+
+    @app.get("/scripts/{name}")
+    def download_script(name: str) -> FileResponse:
+        if "/" in name or ".." in name or not name.endswith(".sh"):
+            raise HTTPException(400, "only .sh filenames are allowed")
+        path = (_SCRIPTS_DIR / name).resolve()
+        try:
+            path.relative_to(_SCRIPTS_DIR)
+        except ValueError:
+            raise HTTPException(400, "path traversal blocked")
+        if not path.is_file():
+            raise HTTPException(404, f"{name} not found")
+        return FileResponse(
+            str(path),
+            media_type="text/x-shellscript",
+            filename=name,
+        )
+
     # ── frames ────────────────────────────────────────────────────
     @app.get("/api/frames")
     def list_frames(
