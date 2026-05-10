@@ -12,6 +12,14 @@ target sees the BT HID device disappear, and the target's BT stack
 doesn't always auto-reconnect. Without this script you have to
 manually toggle Bluetooth or click "Connect" each time.
 
+The script also handles the harder case: if pairing has been lost
+entirely (you cleared the device, the target was reset, etc.), it
+will **scan + pair + trust + connect** on its own — no manual
+clicking. This depends on the Pi running its auto-accept pairing
+agent (`scripts/bt-agent.py` on the Pi side, see project README);
+the script registers a local `NoInputNoOutput` agent on the target
+so neither side prompts the user.
+
 The script runs on the **target** machine (the Ubuntu / Kali / Mac
 that the webcam is watching). It does not run on the dev Mac, and
 does not run on the Pi.
@@ -46,6 +54,40 @@ scp scripts/target_bt_reconnect.sh user@target:~/bin/
 ---
 
 ## Run
+
+### Diagnostics first (recommended)
+
+If the script "does nothing", run a probe to see exactly what
+`bluetoothctl` reports on this host:
+
+```bash
+~/bin/target_bt_reconnect.sh --probe
+```
+
+It prints the bluez version, adapter state, the parsed paired-
+device list, and whether any of `PI_BT_NAMES` matched. Use
+`PI_BT_MAC=AA:BB:CC:DD:EE:FF ./target_bt_reconnect.sh --probe`
+to override the lookup when the MAC is known.
+
+There's also a one-shot mode that runs a single check and exits
+— handy for testing the connect path:
+
+```bash
+~/bin/target_bt_reconnect.sh --once
+DEBUG=1 ~/bin/target_bt_reconnect.sh --once   # verbose
+```
+
+And an explicit re-pair mode that scans for the Pi, pairs, trusts,
+and connects in one go — useful when pairing has been lost
+entirely:
+
+```bash
+~/bin/target_bt_reconnect.sh --pair
+SCAN_TIMEOUT=40 ~/bin/target_bt_reconnect.sh --pair    # more patient
+```
+
+(The main loop also runs this path automatically whenever no
+paired device matches the configured names.)
 
 ### Foreground (logs to stdout)
 
@@ -106,10 +148,11 @@ launching from a shell.
 
 | var | default | what it does |
 |---|---|---|
-| `PI_BT_NAME` | `TerminalEyes HID` | Device name as it appears in `bluetoothctl devices`. Used to look up the MAC. |
-| `PI_BT_MAC` | *(auto-discovered)* | Explicit Pi MAC, e.g. `AA:BB:CC:DD:EE:FF`. Skips the by-name lookup — set it if the Pi's name changes or to shave a few `bluetoothctl` calls per loop. |
+| `PI_BT_NAMES` | `keyboarder,TerminalEyes HID` | Comma-separated names to look up. The Pi has been observed under either `keyboarder` (its hostname) or `TerminalEyes HID` (its BT alias) depending on the pairing flow — the script tries them in order. Override if your Pi has a different name. |
+| `PI_BT_MAC` | *(auto-discovered)* | Explicit Pi MAC, e.g. `AA:BB:CC:DD:EE:FF`. Skips the by-name lookup — set this when `--probe` shows no name match. |
 | `INTERVAL` | `300` | Seconds between checks. Drop to `60` for snappier recovery during active development. |
 | `LOG_FILE` | *(unset)* | Optional path; output is also appended to this file. Useful when running under tmux. |
+| `DEBUG` | `0` | Set to `1` to print every `bluetoothctl` response. |
 
 Example with all knobs:
 
@@ -144,15 +187,29 @@ settings → `TerminalEyes HID` → Pair).
 
 ## Troubleshooting
 
+**The script appears to do nothing.**
+First, run `./target_bt_reconnect.sh --probe`. If it shows
+`no paired device matched`, the script can't find the Pi by
+name. Three likely fixes:
+
+  1. The Pi's BT name on this host isn't in the default list.
+     `bluetoothctl paired-devices` will show what it is. Re-run
+     with `PI_BT_NAMES="that name,keyboarder,TerminalEyes HID"`.
+  2. Pin the MAC: `PI_BT_MAC=AA:BB:CC:DD:EE:FF ./target_bt_reconnect.sh`.
+  3. The device genuinely isn't paired here. Open the OS
+     Bluetooth settings, pair with the Pi once manually, then
+     re-run the script.
+
 **`bluetoothctl: command not found`**
 Install bluez: `sudo apt install -y bluez` (Debian/Ubuntu/Kali).
 
-**`device $PI_BT_NAME not paired`**
+**`device not paired`**
 The script is reading bluetoothctl correctly but no paired device
-matches the name. On the target: open Bluetooth settings, pair
-with `TerminalEyes HID`, then check
-`bluetoothctl paired-devices` shows it. The script will pick it
-up automatically on the next loop.
+matches any name in `PI_BT_NAMES`. On the target: open Bluetooth
+settings, pair with `keyboarder` (or whatever the Pi advertises
+as), then check `bluetoothctl paired-devices` shows it. The
+script will pick it up automatically on the next loop — no
+restart needed.
 
 **`✗ connect failed: br-connection-create-socket`**
 The Pi's L2CAP listener isn't open yet. Common right after
