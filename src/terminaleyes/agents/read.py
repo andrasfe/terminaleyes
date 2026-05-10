@@ -95,6 +95,16 @@ class ReadAgent(Agent):
             )
         )
 
+        # OCR the frame as ground-truth text. Vision models on cheap
+        # tiers (Nemotron-Nano, Gemini Flash) routinely mis-read
+        # specific tokens — e.g. they call "IBM Quantum" → "Bill
+        # Quantum". Feeding them the literal OCR output as
+        # authoritative reference dramatically cuts that class of
+        # hallucination. We deliberately use the OCR-specialised
+        # model (nanonets-ocr-s by default) which reads UI text
+        # cleanly.
+        ocr_text = await self._ocr_for_grounding(image)
+
         prompt = (
             "You are a JSON API. Look at the screen and answer the "
             f"following question:\n\n    {question}\n\n"
@@ -151,7 +161,7 @@ class ReadAgent(Agent):
         # Tight token cap (~300) deters runaway chain-of-thought; the
         # JSON fallback below gets the original budget when needed.
         plain_messages = self._plain_text_retry_messages(
-            question=question, b64=b64,
+            question=question, b64=b64, ocr_text=ocr_text,
         )
         plain_mt = min(max_tokens, 300)
         try:
@@ -566,14 +576,40 @@ class ReadAgent(Agent):
             return "\n".join(f"{i}. {t}" for i, t in enumerate(out, 1))
         return ""
 
+    async def _ocr_for_grounding(self, image) -> str:
+        """Best-effort OCR pass to give the multimodal model literal
+        text as authoritative ground truth. Uses :class:`OcrAgent`
+        (which defaults to the OCR-specialised ``nanonets-ocr-s``
+        model when configured). Failure swallowed — returns ``""``
+        so the model just operates without grounding."""
+        # Late import to avoid a cycle with the controller registry.
+        from terminaleyes.agents.ocr import OcrAgent
+        try:
+            outcome = await OcrAgent(self.ctx).run(
+                region="full", image=image, record_label="read_ocr",
+            )
+        except Exception as e:
+            logger.debug("read-grounding OCR failed: %s", e)
+            return ""
+        if not (outcome.success and outcome.data):
+            return ""
+        return (outcome.data.get("text") or "").strip()
+
     def _plain_text_retry_messages(
-        self, *, question: str, b64: str,
+        self, *, question: str, b64: str, ocr_text: str = "",
     ) -> list[dict]:
         """Stripped-down prompt for the retry path. Asks for a plain
         newline-separated list with no JSON wrapping. Some models
         (notably Gemini Flash via OpenRouter) chain-of-thought
         whenever JSON mode is requested; bypassing it cleans up the
-        output."""
+        output.
+
+        When ``ocr_text`` is supplied, the OCR'd screen contents are
+        included as authoritative ground truth. Vision models on
+        cheap tiers misread specific tokens (we've seen "IBM Quantum"
+        → "Bill Quantum"); giving them the literal OCR'd characters
+        eliminates that class of error.
+        """
         sys_prompt = (
             "Look at the screen and answer the user's question.\n\n"
             "OUTPUT FORMAT — follow exactly:\n"
@@ -592,6 +628,20 @@ class ReadAgent(Agent):
             "  * If the page does not show the requested info, "
             "reply with EXACTLY one line: NOT_FOUND"
         )
+        # Truncate OCR text aggressively for the prompt — most useful
+        # for finding specific tokens; full content would blow tokens.
+        ocr_block = ""
+        if ocr_text:
+            snip = ocr_text.strip()
+            if len(snip) > 3000:
+                snip = snip[:3000] + "\n…(truncated)…"
+            ocr_block = (
+                "\n\nOCR-extracted screen text (AUTHORITATIVE — use "
+                "this for the exact spelling of any text you cite; "
+                "if your visual reading disagrees with the OCR, "
+                "trust the OCR):\n-----\n"
+                f"{snip}\n-----"
+            )
         return [
             {"role": "system", "content": sys_prompt},
             {
@@ -604,7 +654,7 @@ class ReadAgent(Agent):
                             "detail": "high",
                         },
                     },
-                    {"type": "text", "text": question},
+                    {"type": "text", "text": question + ocr_block},
                 ],
             },
         ]

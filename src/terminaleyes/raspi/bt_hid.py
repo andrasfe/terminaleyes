@@ -489,23 +489,48 @@ class BluetoothHidServer:
     async def send_text(self, text: str) -> None:
         """Type a string character by character.
 
-        Pre-flight:
-          * Send an explicit release report to clear any lingering
-            keyboard state from prior reports.
-          * Pause briefly so the receiving end (Linux kernel input
-            subsystem + foreground app's stdin reader) is ready.
-            Without this, the very first character is frequently
-            dropped — the symptom we observed was ``echo hello`` →
-            ``cho hello`` and ``clear`` → ``lear``: always exactly
-            one missing leading character.
+        Pre-flight (defensive against the receiving end's input
+        buffer being busy after a prior keystroke — e.g. Enter
+        from a launch, profile-picker dance, etc.):
+
+          1. Two release reports (with a sleep between) clear any
+             lingering keyboard state and let the kernel + the
+             foreground app consume both before we start typing.
+          2. A **modifier-only "warm-up" tap** (Left Shift alone —
+             no character printed) gives the receiver a soft
+             event to process and gets its input pipeline ready
+             without producing visible output.
+          3. A 300ms settle BEFORE the first real character.
+
+        Without these, the first character of ``text`` lands
+        during the kernel's busy window and is silently dropped.
+        Observed symptoms before the fix: ``echo hello`` →
+        ``cho hello``, ``uname -r`` → ``name -r``, ``clear`` →
+        ``lear`` — always exactly one missing leading character.
         """
         if not text:
             return
+        # Two-release pre-flight.
+        for _ in range(2):
+            try:
+                await self._release_keyboard()
+            except Exception:
+                pass
+            await asyncio.sleep(0.08)
+        # Modifier-only warm-up: Left Shift down briefly, then
+        # release. No character is generated. The kernel sees a
+        # keyboard event, wakes up the input subsystem, and is
+        # ready for the real characters that follow.
         try:
+            await self._send_keyboard_report(
+                MODIFIER_LEFT_SHIFT, 0,
+            )
+            await asyncio.sleep(0.06)
             await self._release_keyboard()
         except Exception:
             pass
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.30)
+
         for char in text:
             modifier, scan_code = char_to_hid(char)
             await self._tap_key(modifier, scan_code)

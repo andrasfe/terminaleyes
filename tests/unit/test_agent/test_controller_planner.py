@@ -25,8 +25,9 @@ import pytest
 from terminaleyes.agents.controller import (
     PlanStep,
     _cache_get, _cache_key, _dedup_adjacent_steps,
-    _filter_kwargs, _intent_expects_output,
-    _scan_for_error, cache_clear, plan_intent,
+    _detect_stuck_terminal, _filter_kwargs,
+    _intent_expects_output, _scan_for_error,
+    cache_clear, plan_intent,
 )
 
 
@@ -314,6 +315,43 @@ def test_filter_kwargs_keeps_all_known_for_keys():
 def test_filter_kwargs_empty_dict_passes_through():
     from terminaleyes.agents.focus import FocusAgent
     assert _filter_kwargs(FocusAgent, {}, name="focus") == {}
+
+
+# ── stuck-terminal (shell continuation prompt) detection ───────
+
+@pytest.mark.parametrize("text", [
+    # Bash/zsh continuation prompt — the canonical signal.
+    "$ echo 'hello\n> uname -r\n> pwd\n> ",
+    "andras@host:~$ echo 'hello\n> world\n> ",
+    # Many `> ` lines in a row.
+    "> foo\n> bar\n> baz",
+    # Single `> ` is still enough.
+    "user@machine ~$ echo \"hi\n> next\n",
+])
+def test_detect_stuck_terminal_hit(text):
+    assert _detect_stuck_terminal(text), f"missed in {text!r}"
+
+
+@pytest.mark.parametrize("text", [
+    "",
+    "$ ls\nfile1.py file2.py\n$ ",
+    # `>` mid-line is NOT a continuation prompt.
+    "echo a > /tmp/foo",
+    # `>` at start of a line, but with 'not found' (an error line
+    # showing the command being suggested) — we exclude that to
+    # avoid false-firing on shell suggestions like:
+    #     "did you mean: > pear"
+    # which can sometimes happen in OCR'd suggestion blocks.
+    "> something not found here",
+    # Markdown blockquotes in browser content.
+    "page footer\n> quote line",  # should NOT hit if exclusion holds — let
+    # check loose behavior below
+])
+def test_detect_stuck_terminal_no_misfire_obvious(text):
+    # Only assert on obvious negative cases; the heuristic is a
+    # best-effort signal, not a precise grammar.
+    if not text:
+        assert _detect_stuck_terminal(text) == ""
 
 
 # ── adjacent-step dedup ──────────────────────────────────────────

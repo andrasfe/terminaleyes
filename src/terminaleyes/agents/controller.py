@@ -213,6 +213,38 @@ def _bottom_chunk(text: str, *, frac: float = 0.30, min_lines: int = 5) -> str:
     return "\n".join(lines[-keep:])
 
 
+# ─────────────── stuck-terminal detection ───────────────
+#
+# Bash/zsh/fish enter a multi-line continuation state when the user
+# types an unmatched quote, parenthesis, or backslash-newline. The
+# prompt changes to `> ` and every subsequent line of input is
+# appended to the unclosed string — not run as a command. The user
+# observed this with `echo hello world` typed after a stray `'`:
+# every following intent's typed text became part of the open string.
+#
+# A line beginning with ``> `` (with a space) at column 0 is the
+# canonical signal. Multiple consecutive ``> `` lines are even
+# stronger evidence. We scan only the latest content (post-baseline
+# diff) so a `>` appearing earlier in scrollback doesn't false-fire.
+_CONTINUATION_PROMPT_RE = re.compile(r"(?m)^> (?!.*\bnot found\b)")
+
+
+def _detect_stuck_terminal(text: str) -> str:
+    """Return a one-line description if ``text`` shows a shell
+    continuation prompt (`> `), or ``""`` otherwise. The match is
+    line-anchored so we don't false-fire on `>` characters embedded
+    in command output (e.g. redirection in echoed commands)."""
+    if not text:
+        return ""
+    matches = _CONTINUATION_PROMPT_RE.findall(text)
+    if not matches:
+        return ""
+    return (
+        f"terminal stuck in continuation/quote mode "
+        f"({len(matches)} '> ' line(s)); send Ctrl+C to recover"
+    )
+
+
 def _scan_for_error(text: str) -> str:
     """Return the first error-marker substring found in ``text``,
     or ``""`` if none. Case-insensitive."""
@@ -850,6 +882,27 @@ class ControllerAgent(Agent):
         # 20 minutes ago can mark THIS run as failed.
         pre_lines = await self._snapshot_screen_lines(label="pre_state")
 
+        # Pre-run hygiene: if the baseline shows a stuck shell
+        # continuation state (`> ` prompts from a prior unmatched
+        # quote / paren / backslash), send Ctrl+C before the plan
+        # executes. Otherwise any `type` step in the plan would be
+        # appended to the open string and never run as a command.
+        # Generic — no terminal-specific knowledge required.
+        pre_text = "\n".join(sorted(pre_lines))
+        stuck_at_start = _detect_stuck_terminal(pre_text)
+        if stuck_at_start:
+            print(
+                "Pre-run hygiene: baseline shows "
+                f"{stuck_at_start} — sending Ctrl+C"
+            )
+            recovered = await self._send_terminal_recovery()
+            if recovered:
+                # Re-snapshot so the verifier's NEW-vs-OLD diff is
+                # against the cleaned-up state, not the stuck one.
+                pre_lines = await self._snapshot_screen_lines(
+                    label="pre_state_after_recovery",
+                )
+
         ck = _cache_key(intent, no_focus, vault_name, platform)
         cached = _cache_get(ck)
         if cached is not None:
@@ -1059,6 +1112,27 @@ class ControllerAgent(Agent):
 
     # ──────────────── final capture + completion verify ────────────────
 
+    async def _send_terminal_recovery(self) -> bool:
+        """Send Ctrl+C to break out of a stuck shell continuation
+        (unmatched quote/paren/backslash → `>` prompt). Returns True
+        if the recovery keystroke was sent, False if no keyboard is
+        wired. The follow-up newline ensures the shell redraws a
+        fresh prompt.
+        """
+        kb = self.ctx.keyboard
+        if kb is None:
+            return False
+        import asyncio as _aio
+        try:
+            await kb.send_key_combo(["ctrl"], "c")
+            await _aio.sleep(0.20)
+            await kb.send_keystroke("Enter")
+            await _aio.sleep(0.30)
+        except Exception as e:
+            logger.warning("terminal recovery (Ctrl+C) failed: %s", e)
+            return False
+        return True
+
     async def _snapshot_screen_lines(self, *, label: str) -> set[str]:
         """Best-effort OCR snapshot of the current screen, returning
         the set of (whitespace-stripped) non-empty lines. Used as a
@@ -1179,6 +1253,51 @@ class ControllerAgent(Agent):
         # output for terminals / page footers.
         scan_text = new_text or _bottom_chunk(ocr_text)
 
+        # Stuck-terminal detection. If the screen shows a shell
+        # continuation prompt (`> ` lines), the previous typing went
+        # into an unclosed string. Auto-recover by sending Ctrl+C,
+        # re-capture, and reflect the recovery in the verdict. This
+        # is generic: any plan whose terminal got stuck because of a
+        # stray quote / unmatched paren / trailing backslash will
+        # now self-heal without operator intervention.
+        stuck = _detect_stuck_terminal(scan_text)
+        if stuck:
+            print(f"   stuck-terminal detected: {stuck}")
+            recovered = await self._send_terminal_recovery()
+            info["stuck_terminal"] = stuck
+            info["recovered"] = recovered
+            if recovered:
+                # Re-capture & re-OCR; the rest of the verify runs
+                # against the cleaned-up screen.
+                try:
+                    frame2 = await self.ctx.capture.capture_frame()
+                    self.ctx.record_frame(
+                        frame2.image, label="final_state_post_ctrlc",
+                    )
+                    ocr_outcome2 = await OcrAgent(self.ctx).run(
+                        region="full", image=frame2.image,
+                        record_label="final_ocr_post_ctrlc",
+                    )
+                    if ocr_outcome2.success and ocr_outcome2.data:
+                        ocr_text = (ocr_outcome2.data.get("text") or "").strip()
+                        post_lines = list(
+                            ocr_outcome2.data.get("lines") or [],
+                        )
+                        new_lines = [
+                            ln for ln in post_lines
+                            if ln.strip() and ln.strip() not in pre_lines
+                        ]
+                        new_text = "\n".join(new_lines)
+                        scan_text = new_text or _bottom_chunk(ocr_text)
+                        info["ocr_text"] = ocr_text
+                except Exception as e:
+                    logger.debug(
+                        "post-recovery re-capture failed: %s", e,
+                    )
+                # The recovery itself counts as a soft-failure of the
+                # current intent — the typed command didn't run as
+                # intended. Don't short-circuit, let the LLM judge.
+
         # Hard heuristic: explicit error markers short-circuit to
         # FAILURE — but ONLY for intents that imply the action
         # should produce visible output. For close/open/switch/
@@ -1191,6 +1310,11 @@ class ControllerAgent(Agent):
                 f"visible error on screen: {err_hit!r}"
             )
             print(f"   final-state verify ✗ (error detected): {err_hit!r}")
+            return info
+
+        if stuck:
+            info["verified"] = False
+            info["reason"] = stuck
             return info
 
         ocr_block = (
