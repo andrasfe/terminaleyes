@@ -59,6 +59,13 @@ class PlanStep:
     name: str
     agent_cls: type
     kwargs: dict[str, Any] = field(default_factory=dict)
+    # When True, a failure of this step logs a warning and the
+    # controller continues to the next step instead of aborting.
+    # Used for "soft" preconditions like the auto-prepended
+    # FocusAgent before navigate/click — the next agent has its own
+    # pre-flight (e.g. NavigateAgent's browser check) that handles
+    # the same concern, so a strict stop on focus failure is wrong.
+    best_effort: bool = False
 
 
 @dataclass
@@ -154,7 +161,13 @@ def _plan_one(
         ).group(1).strip()
         steps: list[PlanStep] = []
         if not no_focus:
-            steps.append(PlanStep("focus", FocusAgent, {"platform": platform}))
+            # Best-effort: NavigateAgent has its own browser-focus
+            # pre-flight, so a failed FocusAgent shouldn't kill the
+            # whole plan.
+            steps.append(PlanStep(
+                "focus", FocusAgent, {"platform": platform},
+                best_effort=True,
+            ))
         steps.append(PlanStep(
             "navigate", NavigateAgent,
             {"url": url, "platform": platform},
@@ -167,7 +180,12 @@ def _plan_one(
         target = click_match.group(1).strip()
         steps = []
         if not no_focus:
-            steps.append(PlanStep("focus", FocusAgent, {"platform": platform}))
+            # Best-effort: ClickAgent's homer can still find a target
+            # on a not-perfectly-maximised window. Don't bail here.
+            steps.append(PlanStep(
+                "focus", FocusAgent, {"platform": platform},
+                best_effort=True,
+            ))
         steps.append(PlanStep(
             "click", ClickAgent, {"target": target},
         ))
@@ -307,7 +325,8 @@ class ControllerAgent(Agent):
 
         results: list[tuple[str, Outcome]] = []
         for i, step in enumerate(plan, 1):
-            print(f"\n[{i}/{len(plan)}] {step.name} ...")
+            tag = " (best-effort)" if step.best_effort else ""
+            print(f"\n[{i}/{len(plan)}] {step.name}{tag} ...")
             agent = step.agent_cls(self.ctx)
             try:
                 outcome = await agent.run(**step.kwargs)
@@ -320,6 +339,16 @@ class ControllerAgent(Agent):
             mark = "✓" if outcome else "✗"
             print(f"   {mark} {step.name}: {outcome.reason}")
             if not outcome:
+                if step.best_effort:
+                    # Soft-fail: log + continue. The next step has its
+                    # own pre-flight (e.g. NavigateAgent's browser
+                    # check, ClickAgent's scroll-and-retry) that
+                    # handles the same concern.
+                    print(
+                        f"   ↺ {step.name} is best-effort; "
+                        "continuing despite failure"
+                    )
+                    continue
                 return ControllerOutcome(
                     success=False,
                     reason=f"stopped at step {i} ({step.name})",

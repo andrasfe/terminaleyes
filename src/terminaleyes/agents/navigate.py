@@ -92,6 +92,36 @@ class NavigateAgent(Agent):
                     success=False,
                     reason=f"could not focus a browser: {reason}",
                 )
+            # Tight check: re-verify immediately before typing. The
+            # initial pre-flight may have spent several seconds on
+            # model calls / activation; in that gap the foreground
+            # can shift (App Center notification popping up, etc.).
+            verifier_tight = VerifyAgent(self.ctx)
+            v_tight = await verifier_tight.run(
+                question=BROWSER_QUESTION, visual_only=True,
+                record_label="navigate_browser_pre_type",
+            )
+            if not v_tight:
+                return NavigateOutcome(
+                    success=False,
+                    reason=(
+                        "browser was focused initially but foreground "
+                        f"shifted before typing: {v_tight.reason}"
+                    ),
+                )
+            # Hard transfer of WM focus to a browser. The verifier
+            # judges by window size, but on GNOME the *actually
+            # focused* app may be something else whose window is
+            # tiny (App Center notification, system dialog, etc.).
+            # GNOME activities + "chrome" + Enter focuses an
+            # existing browser window when one is already running, so
+            # this is idempotent — safe to run even when the browser
+            # already has focus. Clicking the viewport alone is not
+            # enough because clicking inside an unfocused window
+            # doesn't always transfer WM focus (the click is
+            # consumed by the click-to-focus behaviour without a
+            # subsequent typing-ready state).
+            await self._force_activate_browser_for_typing(platform)
 
         # 2. Type the URL.
         focus_mods = ["cmd"] if platform == "macos" else ["ctrl"]
@@ -141,6 +171,84 @@ class NavigateAgent(Agent):
         )
 
     # ─────────────────── browser-focus pre-flight ───────────────────
+
+    async def _force_activate_browser_for_typing(
+        self, platform: str,
+    ) -> None:
+        """Force WM focus to a browser window via GNOME activities.
+
+        Sends ``Esc`` (dismiss any open menu / overview), then taps
+        Super to open activities, types ``chrome``/``firefox``, and
+        presses Enter. When a matching window is already open, GNOME
+        focuses it; otherwise it launches one. Idempotent — safe to
+        run even when the desired browser is already focused.
+        """
+        kb = self.ctx.keyboard
+        if kb is None or platform == "macos":
+            # macOS doesn't have GNOME activities — fall back to
+            # clicking the viewport.
+            await self._click_browser_viewport()
+            return
+        for name in ("google-chrome", "chromium", "firefox"):
+            try:
+                try:
+                    await kb.send_keystroke("Escape")
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    pass
+                await kb.send_key_combo(["super"], "")
+                await asyncio.sleep(0.55)
+                await kb.send_text(name, secret=False)
+                await asyncio.sleep(0.35)
+                await kb.send_keystroke("Enter")
+                await asyncio.sleep(0.6)
+                # Verify the focus actually landed on a browser. If
+                # so, we're done. Otherwise try the next browser.
+                v = await VerifyAgent(self.ctx).run(
+                    question=BROWSER_QUESTION, visual_only=True,
+                    record_label=f"navigate_force_focus_{name}",
+                )
+                if v:
+                    return
+            except Exception as e:
+                logger.warning(
+                    "Force-activate via %r failed: %s", name, e,
+                )
+        # As a last resort fall back to the viewport click. If the
+        # browser still wasn't focused, the post-flight oracle will
+        # catch the failed navigation.
+        await self._click_browser_viewport()
+
+    async def _click_browser_viewport(self) -> None:
+        """Click the centre of the screen so the visible browser
+        window receives WM focus. Slams cursor to the corner first
+        (deterministic start) and then drives it diagonally to the
+        approximate centre using uncalibrated open-loop HID. Most
+        layouts have the browser dominate the screen, so even an
+        approximate centre lands inside it.
+        """
+        if self.ctx.mouse is None:
+            return
+        try:
+            # Slam top-left so the cursor's image position is known
+            # without needing visual confirmation.
+            for _ in range(160):
+                await self.ctx.mouse.move(-20, -20)
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(0.20)
+            # Roughly centre. Without a calibrated ratio, ~960 HID
+            # diagonal puts the cursor near the middle of a 1920×1080
+            # screen for most cursor-acceleration profiles.
+            steps = 48
+            for _ in range(steps):
+                await self.ctx.mouse.move(20, 12)
+                await asyncio.sleep(0.003)
+            await asyncio.sleep(0.20)
+            await self.ctx.mouse.click("left")
+        except Exception as e:
+            logger.warning(
+                "Browser-viewport focus click failed: %s", e,
+            )
 
     async def _ensure_browser_focused(
         self, *, max_attempts: int, platform: str,
