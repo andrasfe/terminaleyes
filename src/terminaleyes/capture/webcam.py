@@ -38,14 +38,14 @@ class WebcamCapture(CaptureSource):
         self._cap: cv2.VideoCapture | None = None
 
     async def open(self) -> None:
-        """Open the webcam device."""
+        """Open the capture device (webcam, capture card, virtual cam, …)."""
         loop = asyncio.get_event_loop()
         self._cap = await loop.run_in_executor(
             None, cv2.VideoCapture, self._device_index
         )
         if not self._cap.isOpened():
             raise CaptureError(
-                f"Failed to open webcam device {self._device_index}"
+                f"Failed to open capture device {self._device_index}"
             )
         if self._resolution:
             w, h = self._resolution
@@ -62,19 +62,21 @@ class WebcamCapture(CaptureSource):
             await asyncio.sleep(0.03)
 
         # Photo Booth mirrors for preview, but OpenCV gets raw data.
-        # Set via config if your specific webcam returns mirrored images.
+        # Set via config if your specific device returns mirrored images.
         self._mirror = False
 
         logger.info(
-            "Opened webcam device %d (%dx%d)",
+            "Opened capture device %d (%dx%d)",
             self._device_index, actual_w, actual_h,
         )
 
     async def close(self) -> None:
-        """Release the webcam device."""
+        """Release the capture device."""
         if self._cap is not None and self._cap.isOpened():
             self._cap.release()
-            logger.debug("Released webcam device %d", self._device_index)
+            logger.debug(
+                "Released capture device %d", self._device_index,
+            )
         self._cap = None
         self._is_open = False
 
