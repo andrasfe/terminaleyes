@@ -53,3 +53,6 @@ run_mcp.sh
 # Password files — never commit
 *.pass
 *.password
+
+# Playwright MCP server logs
+.playwright-mcp/

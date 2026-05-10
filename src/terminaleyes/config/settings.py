@@ -86,6 +86,13 @@ class CommanderConfig(BaseModel):
         default="showui-2b",
         description="Model for vision grounding (cursor/element location). ShowUI-2B via llama.cpp.",
     )
+    lmstudio_ocr_model: str = Field(
+        default="nanonets-ocr-s",
+        description=(
+            "Model for OcrAgent. OCR-specialized small vision model "
+            "served by the LM Studio endpoint."
+        ),
+    )
     vision_base_url: str = Field(
         default="http://127.0.0.1:1235/v1",
         description="Base URL for the vision grounding model (may differ from lmstudio_base_url).",

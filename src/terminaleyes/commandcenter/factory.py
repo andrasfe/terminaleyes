@@ -117,6 +117,7 @@ def make_default_context_factory(
             capture=capture,
             vision_client=client,
             vision_model=cfg.lmstudio_model,
+            ocr_model=cfg.lmstudio_ocr_model,
             evaluator=evaluator,
             output_dir=output_dir,
         )

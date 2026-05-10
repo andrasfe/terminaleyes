@@ -26,6 +26,7 @@ import cv2
 import numpy as np
 
 from terminaleyes.agents.base import Agent, Outcome
+from terminaleyes.agents.launch import LaunchAgent
 from terminaleyes.agents.type_text import TypeAgent
 from terminaleyes.agents.verify import VerifyAgent
 
@@ -175,13 +176,16 @@ class NavigateAgent(Agent):
     async def _force_activate_browser_for_typing(
         self, platform: str,
     ) -> None:
-        """Force WM focus to a browser window via GNOME activities.
+        """Force WM focus to a browser window before typing the URL.
 
-        Sends ``Esc`` (dismiss any open menu / overview), then taps
-        Super to open activities, types ``chrome``/``firefox``, and
-        presses Enter. When a matching window is already open, GNOME
-        focuses it; otherwise it launches one. Idempotent — safe to
-        run even when the desired browser is already focused.
+        Delegates the launch keystrokes to :class:`LaunchAgent`
+        (with ``verify=False`` because we want browser-agnostic
+        verification — any browser surfacing is fine, not just the
+        one we tried to launch). After each launch attempt we run
+        the profile-picker dismissal dance (Tab+Enter twice + Esc)
+        and re-verify with :class:`VerifyAgent` against
+        :data:`BROWSER_QUESTION`. Idempotent — safe even if a
+        browser is already focused.
         """
         kb = self.ctx.keyboard
         if kb is None or platform == "macos":
@@ -191,19 +195,27 @@ class NavigateAgent(Agent):
             return
         for name in ("google-chrome", "chromium", "firefox"):
             try:
+                await LaunchAgent(self.ctx).run(
+                    app=name, platform=platform,
+                    verify=False,
+                    post_launch_settle_ms=1200,
+                    record_label=f"navigate_force_focus_{name}",
+                )
+                # Browser launchers often pop a profile or sign-in
+                # picker. Tab moves focus to the first selectable
+                # card, Enter activates it. Esc clears any leftover
+                # toast / save prompt.
                 try:
+                    for _ in range(2):
+                        await kb.send_keystroke("Tab")
+                        await asyncio.sleep(0.18)
+                        await kb.send_keystroke("Enter")
+                        await asyncio.sleep(0.45)
                     await kb.send_keystroke("Escape")
-                    await asyncio.sleep(0.15)
+                    await asyncio.sleep(0.3)
                 except Exception:
                     pass
-                await kb.send_key_combo(["super"], "")
-                await asyncio.sleep(0.55)
-                await kb.send_text(name, secret=False)
-                await asyncio.sleep(0.35)
-                await kb.send_keystroke("Enter")
-                await asyncio.sleep(0.6)
-                # Verify the focus actually landed on a browser. If
-                # so, we're done. Otherwise try the next browser.
+                # Browser-agnostic verify: any browser is fine here.
                 v = await VerifyAgent(self.ctx).run(
                     question=BROWSER_QUESTION, visual_only=True,
                     record_label=f"navigate_force_focus_{name}",
@@ -306,32 +318,25 @@ class NavigateAgent(Agent):
         """
         kb = self.ctx.keyboard
 
-        # 1. GNOME activities overview + app search (Linux only).
+        # 1. LaunchAgent with the browser name (Linux only).
+        # Caller's outer loop re-verifies via BROWSER_QUESTION, so
+        # we skip LaunchAgent's own verify step (we want
+        # browser-agnostic verification — any browser surfacing is
+        # fine, not just this specific one).
         if platform != "macos" and kb is not None and attempt <= 3:
             browser_names = ["firefox", "google-chrome", "chromium"]
             name = browser_names[attempt - 1]
             try:
-                # If we're already in overview from a previous attempt
-                # or some other state, Esc dismisses it cleanly.
-                try:
-                    await kb.send_keystroke("Escape")
-                    await asyncio.sleep(0.2)
-                except Exception:
-                    pass
-                # Tap the bare Super modifier — opens GNOME activities
-                # overview. Pi accepts an empty key as "modifier-only
-                # tap".
-                await kb.send_key_combo(["super"], "")
-                await asyncio.sleep(0.7)
-                # Type the browser name. Activities filters apps as
-                # you type and highlights the best match.
-                await kb.send_text(name, secret=False)
-                await asyncio.sleep(0.5)
-                await kb.send_keystroke("Enter")
-                return f"GNOME overview + {name!r}"
+                await LaunchAgent(self.ctx).run(
+                    app=name, platform=platform,
+                    verify=False,
+                    post_launch_settle_ms=900,
+                    record_label=f"navigate_activate_{name}_a{attempt:02d}",
+                )
+                return f"LaunchAgent({name!r})"
             except Exception as e:
                 logger.warning(
-                    "GNOME overview attempt for %r failed: %s",
+                    "LaunchAgent attempt for %r failed: %s",
                     name, e,
                 )
 
@@ -376,11 +381,25 @@ class NavigateAgent(Agent):
     async def _verify_url_in_address_bar(
         self, url: str,
     ) -> tuple[bool, str]:
-        """OCR the top strip and check the typed URL appears there.
+        """OCR the URL bar (and, if needed, the whole page) and check
+        the typed URL appears.
+
+        Three-pass:
+
+          1. URL bar strip (top 10%, both polarities).
+          2. Wider top strip (top 18%) — catches URL bar even when
+             a bookmarks bar pushes it down.
+          3. Whole frame — if the URL bar is too small/dark for OCR
+             but the page actually loaded, the hostname stem and
+             path segments will appear in body text (page header,
+             nav links, footer copyright). This is the rescue path
+             for dark-themed Chrome on a webcam.
 
         Tolerant of common letter-substitution garbling (tesseract
         often reads ``r`` as ``t``); we normalise to alphanumerics
-        and substring-match.
+        and substring-match. Each pass is gated on the same
+        candidate set so we never accept a wrong page just because
+        ``reddit`` appears in some unrelated text.
         """
         try:
             frame = await self.ctx.capture.capture_frame()
@@ -390,8 +409,8 @@ class NavigateAgent(Agent):
         h, w = frame.image.shape[:2]
         urlbar = frame.image[: int(h * 0.10), :]
         self.ctx.record_frame(urlbar, label="navigate_postflight_urlbar")
+        wide_top = frame.image[: int(h * 0.18), :]
 
-        # Try OCR (with both polarities).
         try:
             from terminaleyes.commander.ocr_finder import (
                 _preprocess_for_ocr, have_ocr,
@@ -399,20 +418,10 @@ class NavigateAgent(Agent):
             import pytesseract  # type: ignore
             if not have_ocr():
                 return True, "OCR unavailable; trusting keystrokes"
-            normal = pytesseract.image_to_string(urlbar)
-            inv = pytesseract.image_to_string(
-                _preprocess_for_ocr(urlbar, scale=4, invert=True),
-            )
         except Exception as e:
-            return True, f"OCR failed ({e}); trusting keystrokes"
+            return True, f"OCR import failed ({e}); trusting keystrokes"
 
-        text = (normal + " " + inv).lower()
-        text_norm = re.sub(r"[^a-z0-9]", "", text)
-
-        # Extract distinctive "tokens" from the URL: hostname stem
-        # (e.g. "reddit") and the last path segment (e.g. "localllama").
-        # These survive tesseract garbling much better than the full
-        # core string.
+        # Build candidate token set once.
         url_lower = re.sub(r"^https?://", "", url.lower())
         path_segments = [
             re.sub(r"[^a-z0-9]", "", seg)
@@ -420,34 +429,54 @@ class NavigateAgent(Agent):
             if seg.strip()
         ]
         path_segments = [s for s in path_segments if len(s) >= 4]
-        # Hostname stem: first segment, before first '.' or '/'
         host = re.sub(
             r"[^a-z0-9.]", "", url_lower.split("/")[0],
         )
         host_parts = [p for p in host.split(".") if len(p) >= 3]
         candidates = list(dict.fromkeys(path_segments + host_parts))
 
-        # Substring match (cheap).
-        for c in candidates:
-            if c in text_norm:
-                return True, f"address bar contains {c!r}"
-
-        # Fuzzy match: extract alphanumeric runs of ≥4 chars from the
-        # OCR text and compare against each candidate via ratio.
         from difflib import SequenceMatcher
-        words = re.findall(r"[a-z0-9]{4,}", text_norm)
-        for c in candidates:
-            for w in words:
-                if abs(len(w) - len(c)) > max(2, len(c) // 3):
-                    continue
-                ratio = SequenceMatcher(None, c, w).ratio()
-                if ratio >= 0.75:
-                    return True, (
-                        f"address bar fuzz-matches {c!r} ~ {w!r} "
-                        f"(ratio={ratio:.2f})"
-                    )
 
+        def _scan(label: str, region) -> tuple[bool, str] | None:
+            try:
+                normal = pytesseract.image_to_string(region)
+                inv = pytesseract.image_to_string(
+                    _preprocess_for_ocr(region, scale=4, invert=True),
+                )
+            except Exception as e:
+                logger.debug("OCR pass %s failed: %s", label, e)
+                return None
+            text = (normal + " " + inv).lower()
+            text_norm = re.sub(r"[^a-z0-9]", "", text)
+            for c in candidates:
+                if c in text_norm:
+                    return True, f"{label} contains {c!r}"
+            words = re.findall(r"[a-z0-9]{4,}", text_norm)
+            for c in candidates:
+                for w in words:
+                    if abs(len(w) - len(c)) > max(2, len(c) // 3):
+                        continue
+                    ratio = SequenceMatcher(None, c, w).ratio()
+                    if ratio >= 0.75:
+                        return True, (
+                            f"{label} fuzz-matches {c!r} ~ {w!r} "
+                            f"(ratio={ratio:.2f})"
+                        )
+            return False, (
+                f"{label} text {text.strip()[:80]!r} did not match"
+            )
+
+        for label, region in (
+            ("url-bar", urlbar),
+            ("top-strip", wide_top),
+            ("full-frame", frame.image),
+        ):
+            result = _scan(label, region)
+            if result is None:
+                continue
+            ok, msg = result
+            if ok:
+                return True, msg
         return False, (
-            f"address bar text {text.strip()[:120]!r} does not "
-            f"contain any of {candidates!r}"
+            f"no OCR pass matched any of {candidates!r}"
         )

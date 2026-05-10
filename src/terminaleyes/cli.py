@@ -292,6 +292,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "has something to show before the first run.",
     )
 
+    memory_parser = subparsers.add_parser(
+        "memory",
+        help="Show / edit / clear the controller's long-lived "
+             "memory (markdown file injected into the LLM-planner "
+             "prompt at run start).",
+    )
+    memory_parser.add_argument(
+        "memory_action", nargs="?", default="show",
+        choices=["show", "path", "edit", "clear"],
+        help="show (default): print contents; "
+             "path: print the file path; "
+             "edit: open in $EDITOR; "
+             "clear: delete the file.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -637,6 +652,56 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("Starting Command Center")
         asyncio.run(_run_commandcenter(settings, args))
 
+    elif args.command == "memory":
+        _run_memory(args)
+
+
+def _run_memory(args) -> None:
+    """show / path / edit / clear the controller's memory file."""
+    import os
+    import subprocess
+    from terminaleyes.agents.controller import (
+        _memory_path, load_memory,
+    )
+
+    path = _memory_path()
+    action = getattr(args, "memory_action", "show") or "show"
+
+    if action == "path":
+        print(path)
+        return
+    if action == "show":
+        text = load_memory()
+        if not text:
+            print(f"(empty — {path} does not exist or is empty)")
+            return
+        print(f"# {path}")
+        print(text)
+        return
+    if action == "edit":
+        editor = os.environ.get("EDITOR") or "nano"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(
+                "# terminaleyes — controller memory\n"
+                "\n"
+                "Long-lived notes the controller injects into the\n"
+                "LLM-planner prompt on every run. Plain markdown.\n"
+                "Add anything here that the planner should know\n"
+                "across sessions — preferred apps, target machine\n"
+                "quirks, naming conventions.\n",
+                encoding="utf-8",
+            )
+        subprocess.call([editor, str(path)])
+        return
+    if action == "clear":
+        if path.exists():
+            path.unlink()
+            print(f"removed {path}")
+        else:
+            print(f"(nothing to clear — {path} does not exist)")
+        return
+
 
 async def _run_interact(settings, args=None) -> None:
     """Run the interactive visual commander REPL."""
@@ -949,6 +1014,7 @@ async def _build_agent_context(
         capture=capture,
         vision_client=client,
         vision_model=cfg.lmstudio_model,
+        ocr_model=cfg.lmstudio_ocr_model,
         evaluator=evaluator,
         output_dir=output_dir,
     )
@@ -989,6 +1055,11 @@ async def _run_controller(settings, args) -> None:
         )
         if outcome:
             print(f"\n✓ Controller succeeded — {outcome.reason}")
+            answer = (outcome.data or {}).get("answer", "") if outcome.data else ""
+            if answer:
+                print("\nAnswer:")
+                for ln in str(answer).splitlines():
+                    print(f"  {ln}")
         else:
             print(f"\n✗ Controller failed — {outcome.reason}")
     finally:

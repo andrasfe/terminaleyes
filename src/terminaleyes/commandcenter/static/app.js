@@ -275,8 +275,10 @@ $chatForm.addEventListener("submit", async (e) => {
 });
 
 $chatInput.addEventListener("keydown", (e) => {
-  // ⌘/Ctrl+Enter sends.
-  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+  // Enter sends. Shift+Enter inserts a newline so multi-line intents
+  // are still possible. ⌘/Ctrl+Enter is kept for muscle memory.
+  if (e.key === "Enter" && !e.isComposing) {
+    if (e.shiftKey) return;            // Shift+Enter → newline
     e.preventDefault();
     $chatForm.requestSubmit();
   }
@@ -339,8 +341,35 @@ function connectGlobalLogs() {
   state.globalSrc = src;
 }
 
+// ── chat history (replay prior runs on load) ─────────────────────
+async function loadChatHistory() {
+  try {
+    const r = await fetch("/api/runs?limit=50");
+    if (!r.ok) return;
+    const data = await r.json();
+    const items = data.items || [];
+    // The server returns newest-first; chat reads top-to-bottom
+    // oldest-to-newest, so reverse before appending.
+    for (const rec of items.reverse()) {
+      appendChat({
+        runId: rec.run_id,
+        intent: rec.intent,
+        status: rec.status,
+        reason: rec.reason,
+      });
+      // If a run somehow ended up still "running" while the page
+      // was reloaded, resume polling its status so the chat updates
+      // when it eventually completes.
+      if (rec.status === "running" || rec.status === "pending") {
+        pollRunStatus(rec.run_id);
+      }
+    }
+  } catch (_) {}
+}
+
 // ── boot ───────────────────────────────────────────────────────
 async function init() {
+  await loadChatHistory();
   await refreshKnownIds();
   connectGlobalLogs();
   pollLatest();

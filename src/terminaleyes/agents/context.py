@@ -45,6 +45,10 @@ class AgentContext:
     # LLM clients — OpenAI-compatible (LM Studio) for multimodal calls
     vision_client: Any = None        # an openai.AsyncClient or similar
     vision_model: str = ""
+    # OCR-specialised model served by the same vision_client. When
+    # set, OcrAgent uses this model name instead of vision_model so
+    # general-purpose Q&A and pure OCR can use different specialists.
+    ocr_model: str = ""
 
     # ShowUI grounding helper (callable: b64, prompt -> (x, y) | None)
     showui_query: Any = None
