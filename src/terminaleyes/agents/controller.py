@@ -1400,7 +1400,20 @@ class ControllerAgent(Agent):
             "the requested OUTCOME, not just that a step was "
             "attempted. Quote the specific OCR snippet (or the "
             "visible error text) that justifies your verdict in "
-            "your reason."
+            "your reason.\n\n"
+            "SPECIAL CASE — close / quit / dismiss intents:\n"
+            "  For intents about REMOVING something from the "
+            "screen (close the window / quit the app / dismiss "
+            "the dialog / minimise), the ABSENCE of the named "
+            "target IS the success condition. If the user asked "
+            "to 'close the terminal' and the OCR shows no "
+            "terminal prompt / dark monospaced area anywhere — "
+            "answer TRUE, with reason quoting what IS now "
+            "foregrounded (e.g. 'desktop visible' / 'Firefox in "
+            "foreground'). Do NOT answer FALSE just because the "
+            "thing you'd expect to see after the action is "
+            "missing — that's exactly what 'close' is supposed "
+            "to do."
         )
         try:
             v = await VerifyAgent(self.ctx).run(

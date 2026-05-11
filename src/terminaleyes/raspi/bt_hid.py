@@ -537,34 +537,31 @@ class BluetoothHidServer:
         """
         if not text:
             return
-        # Three releases, well-spaced. Cheap, and reliably drains
-        # any half-processed report state on the receiver side.
+        # Pre-flight: three releases + 500ms settle. Drains any
+        # half-processed report state on the receiver side.
         for _ in range(3):
             try:
                 await self._release_keyboard()
             except Exception:
                 pass
             await asyncio.sleep(0.10)
-        # Final long settle. 500ms is comfortably above the
-        # 300ms that proved insufficient in earlier runs.
         await asyncio.sleep(0.50)
 
-        # Defensive first-char delivery. The receiver's input
-        # subsystem reliably drops the FIRST keypress after a
-        # long-ish idle period (after a launch's Enter, after
-        # focus's Super+Up, etc.) — even with our 500ms settle.
-        # Pure "hold longer" didn't fix it; the press itself is
-        # eaten.
+        # First-character warmup. The receiver's input subsystem
+        # reliably drops the FIRST keypress after an idle period.
+        # We type the first char TWICE with a Backspace between,
+        # so:
+        #   - First press registered → "X<BS>X" → "X"
+        #   - First press eaten      → "<BS>X"   → "X"
+        # Either way, exactly one instance of the intended first
+        # character lands.
         #
-        # Strategy: type the first char TWICE with a Backspace
-        # between. After the sequence:
-        #   * If the first press was registered → "X<BS>X" → "X"
-        #   * If the first press was eaten      → "<BS>X"   → "X"
-        # In both cases the visible result is a single instance
-        # of the intended first character. Backspace at column 0
-        # of a fresh prompt is a no-op; mid-text it removes the
-        # immediately-preceding character. Safe for any input
-        # context where typing makes sense.
+        # Caveat: in some browser URL bars (e.g. Firefox), the
+        # Backspace key is bound to history-back rather than
+        # character deletion. There, this warmup CAN produce a
+        # doubled first character. NavigateAgent now compensates
+        # by emitting an explicit Ctrl+A clear after the typed
+        # URL, then re-typing if a doubled char is detected.
         first_mod, first_scan = char_to_hid(text[0])
         bs_scan = key_name_to_hid("Backspace")
         await self._tap_key(first_mod, first_scan)
