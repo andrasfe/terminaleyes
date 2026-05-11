@@ -48,6 +48,7 @@ from terminaleyes.agents.login import LoginAgent
 from terminaleyes.agents.navigate import NavigateAgent
 from terminaleyes.agents.ocr import OcrAgent
 from terminaleyes.agents.read import ReadAgent
+from terminaleyes.agents.script import ScriptAgent
 from terminaleyes.agents.scribe import (
     ScribeAgent, journal_path, read_tail as _journal_read_tail,
 )
@@ -101,6 +102,16 @@ _PLANNER_FEW_SHOT = (
     '  {"name": "launch", "kwargs": {"app": "terminal", "platform": "linux"}},\n'
     '  {"name": "type",   "kwargs": {"text": "uname -r", "submit": true}}\n'
     "]}\n\n"
+    "Intent: google the capital of France and tell me the answer\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "navigate", "kwargs": {"url": "google.com/search?q=capital+of+France", "platform": "linux"}},\n'
+    '  {"name": "read",     "kwargs": {"question": "What is the capital of France according to the answer shown on this Google results page? Reply with just the answer."}}\n'
+    "]}\n\n"
+    "Intent: search google for the boiling point of water and return the answer\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "navigate", "kwargs": {"url": "google.com/search?q=boiling+point+of+water", "platform": "linux"}},\n'
+    '  {"name": "read",     "kwargs": {"question": "What is the boiling point of water according to this Google results page? Reply with just the value (with units)."}}\n'
+    "]}\n\n"
     "Intent: navigate to news.ycombinator.com and tell me the top 3 headlines\n"
     'Reply: {"plan": [\n'
     '  {"name": "navigate", "kwargs": {"url": "news.ycombinator.com", "platform": "linux"}},\n'
@@ -108,7 +119,13 @@ _PLANNER_FEW_SHOT = (
     "]}\n\n"
     "Intent: close the terminal window\n"
     'Reply: {"plan": [\n'
-    '  {"name": "keys", "kwargs": {"modifiers": ["alt"], "key": "F4"}}\n'
+    '  {"name": "launch", "kwargs": {"app": "terminal", "platform": "linux"}},\n'
+    '  {"name": "keys",   "kwargs": {"modifiers": ["alt"], "key": "F4"}}\n'
+    "]}\n\n"
+    "Intent: close the firefox window\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch", "kwargs": {"app": "firefox", "platform": "linux"}},\n'
+    '  {"name": "keys",   "kwargs": {"modifiers": ["alt"], "key": "F4"}}\n'
     "]}\n\n"
     "Intent: save the file\n"
     'Reply: {"plan": [\n'
@@ -125,6 +142,16 @@ _PLANNER_FEW_SHOT = (
     "Intent: read what's in the URL bar via OCR\n"
     'Reply: {"plan": [\n'
     '  {"name": "ocr", "kwargs": {"region": "url_bar"}}\n'
+    "]}\n\n"
+    "Intent: run this script:\\necho hello\\npwd\\nuname -a\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch", "kwargs": {"app": "terminal", "platform": "linux"}},\n'
+    '  {"name": "script", "kwargs": {"script": "echo hello\\npwd\\nuname -a"}}\n'
+    "]}\n\n"
+    "Intent: execute the following shell script: mkdir -p /tmp/foo; echo done > /tmp/foo/x.txt; cat /tmp/foo/x.txt\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch", "kwargs": {"app": "terminal", "platform": "linux"}},\n'
+    '  {"name": "script", "kwargs": {"script": "mkdir -p /tmp/foo\\necho done > /tmp/foo/x.txt\\ncat /tmp/foo/x.txt"}}\n'
     "]}\n"
 )
 
@@ -472,6 +499,14 @@ REGISTRY: dict[str, tuple[type, str]] = {
                  "switch window, Super+Up maximise, Super+H "
                  "minimise."),
     "navigate": (NavigateAgent, "type a URL into a browser address bar (browser-aware)"),
+    "script":   (ScriptAgent,
+                 "type a multi-line shell script into the focused "
+                 "terminal, one Enter-terminated line at a time. "
+                 "kwargs: script (the verbatim shell-script body — "
+                 "use '\\n' between lines). Comments (#...) and blank "
+                 "lines are skipped on the wire. Pair with a prior "
+                 "'launch' (app='terminal') step so the script lands "
+                 "in a shell."),
     "click":    (ClickAgent,    "find a target by description; scroll-and-retry if not visible"),
     "scroll":   (ScrollAgent,   "scroll up/down via the mouse wheel"),
     "read":     (ReadAgent,
@@ -804,6 +839,13 @@ def plan_intent_partial(
     )
 
 
+_SCRIPT_INTENT_RE = re.compile(
+    r"^\s*(?:run|execute)\s+(?:this|the|the\s+following)?\s*"
+    r"(?:shell\s+|bash\s+)?script[\s:]",
+    re.IGNORECASE,
+)
+
+
 def _partial_plan(
     intent: str,
     *,
@@ -815,6 +857,13 @@ def _partial_plan(
     :func:`plan_intent_partial`. Walks each chunk; chunks that
     don't match a rule are recorded as unresolved with the index
     they should be inserted at in the final plan."""
+    # "run this script: ..." bodies must NOT be chain-split — an
+    # ``and`` / ``then`` / comma inside the script body would be
+    # shredded into bogus chunks. Forward the whole intent to the
+    # LLM as a single unresolved chunk; the few-shot teaches it to
+    # emit [launch terminal, script].
+    if _SCRIPT_INTENT_RE.match(intent):
+        return [], [(0, intent.strip())]
     parts = _split_chain(intent)
     plan: list[PlanStep] = []
     unresolved: list[tuple[int, str]] = []
@@ -1567,8 +1616,18 @@ class ControllerAgent(Agent):
             "use the 'type' agent with submit=true.\n"
             "  * Prefer 'keys' over 'click' when a keyboard shortcut "
             "exists.\n"
+            "  * To close/quit a window of a SPECIFIC app, prepend a "
+            "'launch' step for that app (idempotent — also foregrounds "
+            "if already running) BEFORE the keys chord. Bare 'keys' "
+            "without a preceding focus/launch may close the wrong "
+            "window.\n"
+            "  * For a verbatim multi-line shell SCRIPT in the intent, "
+            "use the 'script' agent with the body in kwargs['script'] "
+            "(use '\\n' between lines). Pair with a prior 'launch' "
+            "(app='terminal') so the script lands in a shell.\n"
             "  * NO preamble, NO markdown, NO commentary.\n\n"
-            'Schema: {"plan": [{"name": "<agent>", "kwargs": {...}}, ...]}'
+            'Schema: {"plan": [{"name": "<agent>", "kwargs": {...}}, ...]}\n\n'
+            + _PLANNER_FEW_SHOT
         )
         messages = [
             {"role": "system", "content": prompt},
