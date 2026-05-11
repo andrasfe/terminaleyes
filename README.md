@@ -290,6 +290,73 @@ CLAUDE.md has the full pairing checklist, debugging commands, and the
 hard-won lessons (band steering, persistent NetworkManager
 connections, BlueZ `--noplugin=input`, etc.).
 
+### Keeping the target BT connection alive
+
+Every `systemctl restart terminaleyes-pi` closes the L2CAP sockets,
+so the target sees the Pi HID device disappear. Bluez's autoconnect
+is unreliable — without help, you'd manually toggle Bluetooth on
+the target each time.
+
+[`scripts/target_bt_reconnect.sh`](./scripts/target_bt_reconnect.md)
+runs on the **target machine** and keeps the connection alive. It
+polls every 5 minutes (configurable), and if the Pi's HID device is
+paired-but-disconnected, runs `bluetoothctl connect`. If pairing
+itself has been lost, it scans + pairs + trusts + connects
+automatically (relies on the Pi's auto-accept agent —
+[`scripts/bt-agent.py`](./scripts/bt-agent.py)).
+
+**Run it once-off (foreground):**
+
+```bash
+# On the target — the repo's already cloned here.
+./scripts/target_bt_reconnect.sh --probe   # see what bluez reports
+./scripts/target_bt_reconnect.sh --pair    # one-shot scan + pair + connect
+./scripts/target_bt_reconnect.sh           # forever loop in foreground
+```
+
+**Important**: run it OUTSIDE the foreground terminal the controller
+types into. If the script logs into the same terminal where
+`terminaleyes do` directs keystrokes, the script's `[timestamp]`
+log lines interleave with command output and the final-state
+verifier can't isolate one from the other.
+
+**Detached run (tmux):**
+
+```bash
+tmux new-session -d -s btka './scripts/target_bt_reconnect.sh'
+# attach later: tmux attach -t btka      detach: Ctrl+B then d
+```
+
+**Systemd-user service** (survives reboot, logs to journal — preferred):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/bt-keepalive.service <<'UNIT'
+[Unit]
+Description=Keep TerminalEyes HID BT connection alive
+After=bluetooth.service
+
+[Service]
+ExecStart=%h/terminaleyes/scripts/target_bt_reconnect.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --now bt-keepalive
+# tail logs:
+journalctl --user -fu bt-keepalive
+# Optional: keep running after logout
+sudo loginctl enable-linger $USER
+```
+
+Full reference (env knobs, modes, troubleshooting):
+[`scripts/target_bt_reconnect.md`](./scripts/target_bt_reconnect.md).
+
 ## Installation
 
 ```bash
