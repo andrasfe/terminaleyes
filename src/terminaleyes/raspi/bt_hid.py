@@ -493,43 +493,37 @@ class BluetoothHidServer:
         buffer being busy after a prior keystroke — e.g. Enter
         from a launch, profile-picker dance, etc.):
 
-          1. Two release reports (with a sleep between) clear any
-             lingering keyboard state and let the kernel + the
-             foreground app consume both before we start typing.
-          2. A **modifier-only "warm-up" tap** (Left Shift alone —
-             no character printed) gives the receiver a soft
-             event to process and gets its input pipeline ready
-             without producing visible output.
-          3. A 300ms settle BEFORE the first real character.
+          1. Three release reports (spaced 100ms apart) drain any
+             lingering keyboard state and give the kernel + the
+             foreground app time to consume all of them.
+          2. A 500ms settle BEFORE the first real character.
 
-        Without these, the first character of ``text`` lands
-        during the kernel's busy window and is silently dropped.
-        Observed symptoms before the fix: ``echo hello`` →
-        ``cho hello``, ``uname -r`` → ``name -r``, ``clear`` →
-        ``lear`` — always exactly one missing leading character.
+        We previously tried a modifier-only "warm-up" tap (Shift
+        alone with scan=0) to nudge the receiver's input pipeline
+        awake; on some bluez stacks the receiver interpreted that
+        report as Escape (visible as ``^[`` prefixed to typed
+        text). The plain settle is slower but produces no
+        visible artifact.
+
+        Without this pre-flight the first character of ``text``
+        lands during the kernel's busy window and is silently
+        dropped. Observed symptoms: ``echo hello`` → ``cho hello``,
+        ``uname -r`` → ``name -r``, ``clear`` → ``lear`` — always
+        exactly one missing leading character.
         """
         if not text:
             return
-        # Two-release pre-flight.
-        for _ in range(2):
+        # Three releases, well-spaced. Cheap, and reliably drains
+        # any half-processed report state on the receiver side.
+        for _ in range(3):
             try:
                 await self._release_keyboard()
             except Exception:
                 pass
-            await asyncio.sleep(0.08)
-        # Modifier-only warm-up: Left Shift down briefly, then
-        # release. No character is generated. The kernel sees a
-        # keyboard event, wakes up the input subsystem, and is
-        # ready for the real characters that follow.
-        try:
-            await self._send_keyboard_report(
-                MODIFIER_LEFT_SHIFT, 0,
-            )
-            await asyncio.sleep(0.06)
-            await self._release_keyboard()
-        except Exception:
-            pass
-        await asyncio.sleep(0.30)
+            await asyncio.sleep(0.10)
+        # Final long settle. 500ms is comfortably above the
+        # 300ms that proved insufficient in earlier runs.
+        await asyncio.sleep(0.50)
 
         for char in text:
             modifier, scan_code = char_to_hid(char)
