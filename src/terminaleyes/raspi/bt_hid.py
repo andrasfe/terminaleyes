@@ -459,6 +459,28 @@ class BluetoothHidServer:
         await asyncio.sleep(self._keypress_delay)
         await self._release_keyboard()
 
+    async def _keystroke_preflight(self) -> None:
+        """Clear lingering keyboard state and let the receiver's
+        input subsystem drain before sending a new key.
+
+        Without this, a key sent immediately after a prior burst
+        (e.g. the Enter that follows send_text, or the first key
+        of the next agent step) lands during the kernel's busy
+        window and is silently dropped — same root cause as the
+        first-character-of-text drop. Costs ~350ms per single
+        keystroke, which is acceptable for tap-style calls
+        (Enter / Esc / Tab / chord). send_text bypasses this
+        because its inter-char loop has its own one-shot
+        pre-flight at the top.
+        """
+        for _ in range(2):
+            try:
+                await self._release_keyboard()
+            except Exception:
+                pass
+            await asyncio.sleep(0.08)
+        await asyncio.sleep(0.15)
+
     async def send_keystroke(self, key: str) -> None:
         """Send a named key (e.g., 'Enter', 'Tab', 'a')."""
         if key in SHIFT_CHARS:
@@ -468,6 +490,7 @@ class BluetoothHidServer:
         else:
             scan_code = key_name_to_hid(key)
             modifier = MODIFIER_NONE
+        await self._keystroke_preflight()
         await self._tap_key(modifier, scan_code)
         logger.debug("BT keystroke: %s (mod=0x%02X scan=0x%02X)", key, modifier, scan_code)
 
@@ -480,6 +503,7 @@ class BluetoothHidServer:
             mod_bitmask |= MODIFIER_LEFT_SHIFT
         else:
             scan_code = key_name_to_hid(key)
+        await self._keystroke_preflight()
         await self._tap_key(mod_bitmask, scan_code)
         logger.debug(
             "BT combo: %s+%s (mod=0x%02X scan=0x%02X)",

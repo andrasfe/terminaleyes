@@ -31,7 +31,7 @@ class TypeAgent(Agent):
         text: str,
         secret: bool = False,
         submit: bool = False,
-        post_settle: float = 0.3,
+        post_settle: float = 0.6,
     ) -> TypeOutcome:
         if self.ctx.keyboard is None:
             return TypeOutcome(
