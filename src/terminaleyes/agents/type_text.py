@@ -32,6 +32,7 @@ class TypeAgent(Agent):
         secret: bool = False,
         submit: bool = False,
         post_settle: float = 0.6,
+        warmup: bool = True,
     ) -> TypeOutcome:
         if self.ctx.keyboard is None:
             return TypeOutcome(
@@ -43,7 +44,13 @@ class TypeAgent(Agent):
             )
         try:
             if text:
-                await self.ctx.keyboard.send_text(text, secret=secret)
+                try:
+                    await self.ctx.keyboard.send_text(
+                        text, secret=secret, warmup=warmup,
+                    )
+                except TypeError:
+                    # Backend doesn't support warmup kwarg yet.
+                    await self.ctx.keyboard.send_text(text, secret=secret)
                 await asyncio.sleep(post_settle)
             if submit:
                 await self.ctx.keyboard.send_keystroke("Enter")

@@ -55,6 +55,18 @@ class KeyComboRequest(BaseModel):
 
 class TextInputRequest(BaseModel):
     text: str = Field(description="Text to type")
+    warmup: bool = Field(
+        default=True,
+        description=(
+            "If True (default), send_text uses a double-tap-with-"
+            "backspace warmup for the first character to overcome "
+            "the receiver dropping the first keypress after idle. "
+            "Set False for input contexts where Backspace is bound "
+            "to non-deletion (e.g. some browser URL bars where it "
+            "triggers back-navigation, producing a doubled first "
+            "character)."
+        ),
+    )
 
 
 class MouseMoveRequest(BaseModel):
@@ -320,7 +332,7 @@ def create_app(
     async def bt_text(request: TextInputRequest) -> dict[str, str]:
         bt = _get_bt()
         try:
-            await bt.send_text(request.text)
+            await bt.send_text(request.text, warmup=request.warmup)
         except (ValueError, Exception) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         return {"status": "ok", "length": str(len(request.text)), "transport": "bluetooth"}

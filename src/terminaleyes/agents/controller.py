@@ -1082,9 +1082,24 @@ class ControllerAgent(Agent):
         # Refine the top-line outcome with the verifier's verdict so
         # the cc UI / CLI summary line tells the user whether the
         # intent actually appears to have landed on screen.
+        #
+        # Special case: if the plan included a ``read`` (or
+        # ``ocr``) step that succeeded with a non-empty
+        # ``answer``, the success criterion is the answer text
+        # itself, NOT the final visual state. ReadAgent's
+        # scroll-collect mode iterates scrolling + reading to
+        # gather N titles; the final frame after the iteration
+        # only shows the last scroll position, NOT the whole
+        # collection. The verifier rejecting because "only one
+        # post visible" would override a perfectly valid 5-title
+        # collection. For these intents we treat the agent's
+        # answer as authoritative and surface the verifier's
+        # verdict as a SECONDARY signal in data['completion'].
+        produced_answer = bool(answer)
+
         success = True
         reason = f"completed all {len(plan)} steps"
-        if completion.get("verified") is False:
+        if completion.get("verified") is False and not produced_answer:
             success = False
             reason = (
                 f"completed all {len(plan)} steps but visual "
@@ -1095,6 +1110,11 @@ class ControllerAgent(Agent):
             reason = (
                 f"completed all {len(plan)} steps; visual "
                 f"verification: {completion.get('reason', '')}"
+            )
+        elif produced_answer:
+            reason = (
+                f"completed all {len(plan)} steps; answer extracted "
+                f"({len(answer)} chars)"
             )
 
         # Best-effort scribe — append a journal entry for episodic

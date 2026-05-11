@@ -63,14 +63,25 @@ class HttpKeyboardOutput(KeyboardOutput):
         await self._post(f"{self._prefix}/key-combo", {"modifiers": modifiers, "key": key})
         logger.debug("Sent key combo: %s+%s", "+".join(modifiers), key)
 
-    async def send_text(self, text: str, *, secret: bool = False) -> None:
+    async def send_text(
+        self, text: str, *, secret: bool = False, warmup: bool = True,
+    ) -> None:
         """Send text input via HTTP POST.
 
         ``secret=True`` redacts the text from any logs — use when typing
         passwords or other sensitive content. The Pi side already only
         logs the length.
+
+        ``warmup=False`` tells the Pi to skip the double-tap-with-
+        backspace warmup on the first character. Use this for input
+        contexts (e.g. some browser URL bars) where Backspace is bound
+        to back-navigation rather than character deletion, which would
+        otherwise produce a doubled first character.
         """
-        await self._post(f"{self._prefix}/text", {"text": text})
+        await self._post(
+            f"{self._prefix}/text",
+            {"text": text, "warmup": warmup},
+        )
         if secret:
             logger.debug("Sent text (length=%d, redacted)", len(text))
         else:

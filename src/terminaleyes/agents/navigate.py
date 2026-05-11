@@ -132,8 +132,17 @@ class NavigateAgent(Agent):
             if select_all_first:
                 await self.ctx.keyboard.send_key_combo(focus_mods, "a")
                 await asyncio.sleep(0.25)
+            # Skip the double-tap-with-backspace warmup when typing
+            # into the URL bar. The warmup is designed for bash
+            # readline where Backspace deletes a character; in
+            # Firefox/Chrome URL bars Backspace can be bound to
+            # back-navigation, which leaves the warmup's first
+            # press visible — producing e.g. ``rreddit.com`` for
+            # ``reddit.com``. Without the warmup, the receiver
+            # MIGHT drop the first character; the post-flight OCR
+            # verify catches that and reports it cleanly.
             await TypeAgent(self.ctx).run(
-                text=url, secret=False, submit=False,
+                text=url, secret=False, submit=False, warmup=False,
             )
             await asyncio.sleep(0.4)
             await self.ctx.keyboard.send_keystroke("Enter")

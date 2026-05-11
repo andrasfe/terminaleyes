@@ -510,7 +510,7 @@ class BluetoothHidServer:
             "+".join(modifiers), key, mod_bitmask, scan_code,
         )
 
-    async def send_text(self, text: str) -> None:
+    async def send_text(self, text: str, *, warmup: bool = True) -> None:
         """Type a string character by character.
 
         Pre-flight (defensive against the receiving end's input
@@ -558,20 +558,27 @@ class BluetoothHidServer:
         #
         # Caveat: in some browser URL bars (e.g. Firefox), the
         # Backspace key is bound to history-back rather than
-        # character deletion. There, this warmup CAN produce a
-        # doubled first character. NavigateAgent now compensates
-        # by emitting an explicit Ctrl+A clear after the typed
-        # URL, then re-typing if a doubled char is detected.
-        first_mod, first_scan = char_to_hid(text[0])
-        bs_scan = key_name_to_hid("Backspace")
-        await self._tap_key(first_mod, first_scan)
-        await asyncio.sleep(self._inter_char_delay)
-        await self._tap_key(MODIFIER_NONE, bs_scan)
-        await asyncio.sleep(self._inter_char_delay)
-        await self._tap_key(first_mod, first_scan)
-        await asyncio.sleep(self._inter_char_delay)
+        # character deletion. There, this warmup produces a
+        # doubled first character — pass ``warmup=False`` from
+        # callers that target such contexts (NavigateAgent does
+        # this when typing into a browser URL bar). Without
+        # warmup the first character occasionally drops, but
+        # the caller can detect that via post-OCR and retry.
+        if warmup:
+            first_mod, first_scan = char_to_hid(text[0])
+            bs_scan = key_name_to_hid("Backspace")
+            await self._tap_key(first_mod, first_scan)
+            await asyncio.sleep(self._inter_char_delay)
+            await self._tap_key(MODIFIER_NONE, bs_scan)
+            await asyncio.sleep(self._inter_char_delay)
+            await self._tap_key(first_mod, first_scan)
+            await asyncio.sleep(self._inter_char_delay)
 
-        for char in text[1:]:
+            chars_iter = text[1:]
+        else:
+            chars_iter = text
+
+        for char in chars_iter:
             modifier, scan_code = char_to_hid(char)
             await self._tap_key(modifier, scan_code)
             await asyncio.sleep(self._inter_char_delay)
