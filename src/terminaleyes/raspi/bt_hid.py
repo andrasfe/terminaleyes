@@ -549,7 +549,32 @@ class BluetoothHidServer:
         # 300ms that proved insufficient in earlier runs.
         await asyncio.sleep(0.50)
 
-        for char in text:
+        # Defensive first-char delivery. The receiver's input
+        # subsystem reliably drops the FIRST keypress after a
+        # long-ish idle period (after a launch's Enter, after
+        # focus's Super+Up, etc.) — even with our 500ms settle.
+        # Pure "hold longer" didn't fix it; the press itself is
+        # eaten.
+        #
+        # Strategy: type the first char TWICE with a Backspace
+        # between. After the sequence:
+        #   * If the first press was registered → "X<BS>X" → "X"
+        #   * If the first press was eaten      → "<BS>X"   → "X"
+        # In both cases the visible result is a single instance
+        # of the intended first character. Backspace at column 0
+        # of a fresh prompt is a no-op; mid-text it removes the
+        # immediately-preceding character. Safe for any input
+        # context where typing makes sense.
+        first_mod, first_scan = char_to_hid(text[0])
+        bs_scan = key_name_to_hid("Backspace")
+        await self._tap_key(first_mod, first_scan)
+        await asyncio.sleep(self._inter_char_delay)
+        await self._tap_key(MODIFIER_NONE, bs_scan)
+        await asyncio.sleep(self._inter_char_delay)
+        await self._tap_key(first_mod, first_scan)
+        await asyncio.sleep(self._inter_char_delay)
+
+        for char in text[1:]:
             modifier, scan_code = char_to_hid(char)
             await self._tap_key(modifier, scan_code)
             await asyncio.sleep(self._inter_char_delay)
