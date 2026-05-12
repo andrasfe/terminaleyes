@@ -197,8 +197,14 @@ main#app {
   cursor: not-allowed;
 }
 
-.chat-row.quick-actions { gap: 6px; }
-.chat-row.quick-actions button.quick {
+.frame-quick-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 6px;
+  border-top: 1px solid var(--border);
+}
+.frame-quick-actions button.quick {
   background: var(--bg-elev-2);
   border: 1px solid var(--border);
   color: var(--fg);
@@ -208,16 +214,13 @@ main#app {
   min-height: 32px;
   font-size: 13px;
 }
-.chat-row.quick-actions button.quick:hover { background: #2a2f37; }
-.chat-row.quick-actions button.quick:disabled {
+.frame-quick-actions button.quick:hover { background: #2a2f37; }
+.frame-quick-actions button.quick:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
 #btn-lock { border-color: #5a4040; }
-#btn-unlock {
-  border-color: #2f5a3a;
-  margin-left: auto;
-}
+#btn-unlock { border-color: #2f5a3a; }
 #opt-vault {
   flex: 1;
   min-width: 0;
