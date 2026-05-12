@@ -46,6 +46,8 @@ class RunRequest(BaseModel):
     platform: str = "linux"
     dry_run: bool = False
     allow_llm_fallback: bool = True
+    planner: str = "auto"           # "auto" | "ml" | "rules"
+    ml_adapter: str | None = None   # required when planner == "ml"
 
 
 def _content_type_for(path: str) -> str:
@@ -221,6 +223,8 @@ def create_app(
                 platform=req.platform,
                 dry_run=req.dry_run,
                 allow_llm_fallback=req.allow_llm_fallback,
+                planner=req.planner,
+                ml_adapter=req.ml_adapter,
             )
         except RunnerBusy as e:
             raise HTTPException(409, str(e))

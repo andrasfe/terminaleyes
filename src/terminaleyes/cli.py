@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -146,6 +147,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--local", action="store_true",
         help="Force local execution even if a Command Center is "
              "running. Useful for debugging without UI overhead.",
+    )
+    do_parser.add_argument(
+        "--planner", choices=["auto", "ml", "rules"], default="auto",
+        help=(
+            "Which planner to use: 'auto' (default) = rules + LLM "
+            "fallback (current behaviour); 'ml' = iterative VLA "
+            "planner (MlPlannerAgent) — requires --ml-adapter or "
+            "TERMINALEYES_ML_ADAPTER env var; 'rules' = rules only."
+        ),
+    )
+    do_parser.add_argument(
+        "--ml-adapter", type=str, default=None,
+        help=(
+            "Path to a LoRA adapter directory produced by "
+            "scripts/train_ml_planner.py. Required when --planner=ml."
+        ),
     )
 
     focus_parser = subparsers.add_parser(
@@ -1107,13 +1124,28 @@ async def _run_controller(settings, args) -> None:
     # Wire the vault lazily — only if the plan needs it.
     try:
         agent = ControllerAgent(ctx)
+        planner = getattr(args, "planner", "auto")
+        ml_adapter = (
+            getattr(args, "ml_adapter", None)
+            or os.environ.get("TERMINALEYES_ML_ADAPTER")
+        )
+        if planner == "ml" and not ml_adapter:
+            print(
+                "✗ --planner=ml requires --ml-adapter PATH "
+                "(or TERMINALEYES_ML_ADAPTER env var)",
+            )
+            return
         outcome = await agent.run(
             intent=args.intent,
             no_focus=args.no_focus,
             vault_name=args.vault,
             platform=args.platform,
             dry_run=args.dry_run,
-            allow_llm_fallback=not args.no_llm_fallback,
+            allow_llm_fallback=(
+                not args.no_llm_fallback and planner != "rules"
+            ),
+            planner=planner,
+            ml_adapter=ml_adapter,
         )
         if outcome:
             print(f"\n✓ Controller succeeded — {outcome.reason}")
@@ -1160,13 +1192,22 @@ async def _route_through_cc(base_url: str, args) -> bool:
 
     import httpx
 
+    planner = getattr(args, "planner", "auto")
+    ml_adapter = (
+        getattr(args, "ml_adapter", None)
+        or os.environ.get("TERMINALEYES_ML_ADAPTER")
+    )
     payload = {
         "intent": args.intent,
         "no_focus": bool(args.no_focus),
         "vault": args.vault,
         "platform": args.platform,
         "dry_run": bool(args.dry_run),
-        "allow_llm_fallback": not bool(args.no_llm_fallback),
+        "allow_llm_fallback": (
+            not bool(args.no_llm_fallback) and planner != "rules"
+        ),
+        "planner": planner,
+        "ml_adapter": ml_adapter,
     }
 
     async with httpx.AsyncClient(timeout=None) as c:

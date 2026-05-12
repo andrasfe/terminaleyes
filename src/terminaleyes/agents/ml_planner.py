@@ -49,12 +49,16 @@ DONE_AGENT = "done"
 
 
 class _LoadedModel:
-    """Lazy holder for the HF model + processor.
+    """Lazy holder for the LoRA-adapted base model + processor.
 
-    Loaded once per process and reused across decisions. The
-    quantised 4-bit model + LoRA adapters consume ~6 GB VRAM for a
-    7B base — fits on a single 24 GB card alongside the rest of the
-    terminaleyes stack.
+    Loaded once per process and reused across decisions. Two backend
+    paths are supported via the ``backend`` field of
+    ``terminaleyes_meta.json``:
+
+      * ``"mlx"`` — Apple Silicon path via ``mlx-vlm``. Adapter is
+        a ``adapters.safetensors`` file in the same dir.
+      * ``"hf"`` (default) — CUDA + ``bitsandbytes`` + ``peft`` path
+        for NVIDIA hosts. Same adapter dir.
     """
 
     def __init__(self, adapter_dir: Path) -> None:
@@ -63,11 +67,66 @@ class _LoadedModel:
         self.model: Any = None
         self.base_model_id: str = ""
         self.warp_frames: bool = False
+        self.backend: str = "hf"
         self._loaded = False
 
     def load(self) -> None:
         if self._loaded:
             return
+        meta_path = self.adapter_dir / "terminaleyes_meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"missing terminaleyes_meta.json in {self.adapter_dir} "
+                "(was this adapter produced by a terminaleyes trainer?)"
+            )
+        meta = json.loads(meta_path.read_text("utf-8"))
+        self.base_model_id = str(meta.get("base_model", ""))
+        self.warp_frames = bool(meta.get("warp_frames", False))
+        self.backend = str(meta.get("backend", "hf")).lower()
+        if not self.base_model_id:
+            raise ValueError("base_model missing from terminaleyes_meta.json")
+
+        if self.backend == "mlx":
+            self._load_mlx()
+        else:
+            self._load_hf()
+        self._loaded = True
+
+    # ── MLX backend (Apple Silicon, M-series) ─────────────────────
+    def _load_mlx(self) -> None:
+        from mlx_vlm import load as _mlx_load
+        from mlx_vlm.prompt_utils import apply_chat_template as _act  # noqa: F401
+        logger.info(
+            "MlPlanner[mlx]: loading %s + adapter %s",
+            self.base_model_id, self.adapter_dir,
+        )
+        # mlx-vlm.load returns (model, processor); adapter_path is
+        # a directory or .safetensors file containing the LoRA.
+        self.model, self.processor = _mlx_load(
+            self.base_model_id,
+            adapter_path=str(self.adapter_dir),
+        )
+
+    def _predict_mlx(self, *, prompt: str, image: Any) -> str:
+        from mlx_vlm import generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+        formatted = apply_chat_template(
+            self.processor, getattr(self.model, "config", None),
+            prompt, num_images=1,
+        )
+        out = generate(
+            self.model, self.processor,
+            formatted,
+            image=[image],
+            max_tokens=200,
+            temperature=0.0,
+        )
+        # mlx-vlm.generate returns either a string or a structured
+        # GenerationResult depending on version. Normalise.
+        return getattr(out, "text", out) if not isinstance(out, str) else out
+
+    # ── HF / CUDA backend ─────────────────────────────────────────
+    def _load_hf(self) -> None:
         import torch  # noqa: F401
         from transformers import (
             AutoProcessor,
@@ -76,20 +135,8 @@ class _LoadedModel:
         )
         from peft import PeftModel
 
-        meta_path = self.adapter_dir / "terminaleyes_meta.json"
-        if not meta_path.exists():
-            raise FileNotFoundError(
-                f"missing terminaleyes_meta.json in {self.adapter_dir} "
-                "(was this adapter produced by train_ml_planner.py?)"
-            )
-        meta = json.loads(meta_path.read_text("utf-8"))
-        self.base_model_id = str(meta.get("base_model", ""))
-        self.warp_frames = bool(meta.get("warp_frames", False))
-        if not self.base_model_id:
-            raise ValueError("base_model missing from terminaleyes_meta.json")
-
         logger.info(
-            "MlPlanner: loading processor + 4-bit base %s + LoRA %s",
+            "MlPlanner[hf]: loading processor + 4-bit base %s + LoRA %s",
             self.base_model_id, self.adapter_dir,
         )
         self.processor = AutoProcessor.from_pretrained(
@@ -110,11 +157,8 @@ class _LoadedModel:
         )
         self.model = PeftModel.from_pretrained(base, str(self.adapter_dir))
         self.model.eval()
-        self._loaded = True
 
-    def predict(self, *, prompt: str, image: Any) -> str:
-        if not self._loaded:
-            self.load()
+    def _predict_hf(self, *, prompt: str, image: Any) -> str:
         import torch
         messages = [{"role": "user", "content": [
             {"type": "image"},
@@ -129,15 +173,20 @@ class _LoadedModel:
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
         with torch.no_grad():
             output = self.model.generate(
-                **inputs,
-                max_new_tokens=200,
-                do_sample=False,
-                temperature=0.0,
+                **inputs, max_new_tokens=200,
+                do_sample=False, temperature=0.0,
             )
         gen = output[0, inputs["input_ids"].shape[1]:]
         return self.processor.batch_decode(
             gen.unsqueeze(0), skip_special_tokens=True,
         )[0]
+
+    def predict(self, *, prompt: str, image: Any) -> str:
+        if not self._loaded:
+            self.load()
+        if self.backend == "mlx":
+            return self._predict_mlx(prompt=prompt, image=image)
+        return self._predict_hf(prompt=prompt, image=image)
 
 
 # Module-level singleton so successive MlPlannerAgent calls share

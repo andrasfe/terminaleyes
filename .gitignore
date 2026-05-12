@@ -56,3 +56,7 @@ run_mcp.sh
 
 # Playwright MCP server logs
 .playwright-mcp/
+
+# ML artefacts — adapters, intermediate datasets, checkpoints
+data/ml/
+*.safetensors

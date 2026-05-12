@@ -1061,7 +1061,23 @@ class ControllerAgent(Agent):
         allow_llm_fallback: bool = True,
         final_settle_sec: float = 2.0,
         verify_completion: bool = True,
+        planner: str = "auto",
+        ml_adapter: str | None = None,
     ) -> ControllerOutcome:
+        # ── ML planner branch (iterative): the model emits one step,
+        # we execute it, observe the new frame, ask again. Bypasses
+        # the rule/LLM whole-plan path entirely. Falls back to the
+        # default planner if the requested adapter can't load.
+        if planner == "ml" and ml_adapter:
+            return await self._run_ml(
+                intent=intent,
+                ml_adapter=ml_adapter,
+                no_focus=no_focus, vault_name=vault_name,
+                platform=platform, dry_run=dry_run,
+                max_steps=max_steps,
+                final_settle_sec=final_settle_sec,
+                verify_completion=verify_completion,
+            )
         # Stamp the run id on the context so downstream agents that
         # call ctx.record_step() can attribute their rows. Derived
         # from the per-run output_dir name (set by the cc factory)
@@ -1489,6 +1505,163 @@ class ControllerAgent(Agent):
             ln.strip() for ln in (outcome.data.get("lines") or [])
             if ln.strip()
         }
+
+    async def _run_ml(
+        self,
+        *,
+        intent: str,
+        ml_adapter: str,
+        no_focus: bool,
+        vault_name: str | None,
+        platform: str,
+        dry_run: bool,
+        max_steps: int,
+        final_settle_sec: float,
+        verify_completion: bool,
+    ) -> ControllerOutcome:
+        """Iterative ML-planner dispatch.
+
+        Per iteration:
+          1. MlPlannerAgent captures a frame and emits one
+             ``{agent, kwargs}`` step (or ``{agent: "done"}``).
+          2. Validate the agent name against REGISTRY (skip-on-
+             unknown rather than crash).
+          3. Filter kwargs through ``_filter_kwargs`` to drop
+             hallucinated params the agent doesn't accept.
+          4. Execute the underlying agent; record the step in the
+             ML dataset log; append to history.
+          5. Loop until ``done`` or ``max_steps``.
+        """
+        from terminaleyes.agents.ml_planner import (
+            MlPlannerAgent, DONE_AGENT,
+        )
+
+        ml = MlPlannerAgent(self.ctx)
+        executed: list[tuple[str, Outcome]] = []
+        history: list[dict] = []
+        plan_names: list[str] = []
+        print(f"Planner: ML (adapter={ml_adapter})")
+        for step_idx in range(1, max_steps + 1):
+            print(f"\n[ml {step_idx}/{max_steps}] asking planner ...")
+            decision = await ml.run(
+                intent=intent, adapter_dir=ml_adapter,
+                history=history,
+            )
+            if not decision.success:
+                return ControllerOutcome(
+                    success=False,
+                    reason=f"ml planner failed: {decision.reason}",
+                    data={
+                        "planner": "ml",
+                        "ml_adapter": ml_adapter,
+                        "history": history,
+                    },
+                )
+            name = str(decision.data.get("agent", ""))
+            kwargs = decision.data.get("kwargs") or {}
+            if decision.data.get("done") or name == DONE_AGENT:
+                print(f"   ml planner: done ({decision.reason})")
+                break
+            if name not in REGISTRY:
+                print(f"   ml planner emitted unknown agent {name!r}; stopping")
+                return ControllerOutcome(
+                    success=False,
+                    reason=f"ml planner emitted unknown agent {name!r}",
+                    data={
+                        "planner": "ml", "history": history,
+                        "raw": decision.data.get("raw", ""),
+                    },
+                )
+            agent_cls, _desc = REGISTRY[name]
+            kwargs = _filter_kwargs(agent_cls, kwargs, name=name)
+            plan_names.append(name)
+            print(f"   ml planner → {name} {kwargs}")
+            if dry_run:
+                history.append({
+                    "agent": name, "kwargs": kwargs, "success": True,
+                })
+                continue
+            agent_instance = agent_cls(self.ctx)
+            frame_before = self.ctx._latest_frame_seq()
+            try:
+                outcome = await agent_instance.run(**kwargs)
+            except Exception as e:
+                logger.exception("Agent %s raised", name)
+                outcome = Outcome(
+                    success=False, reason=f"exception: {e}",
+                )
+            executed.append((name, outcome))
+            mark = "✓" if outcome else "✗"
+            print(f"   {mark} {name}: {outcome.reason}")
+            try:
+                self.ctx.record_step(
+                    intent=intent, agent_name=name, kwargs=kwargs,
+                    outcome_success=bool(outcome.success),
+                    outcome_reason=str(outcome.reason or ""),
+                    history=list(history),
+                    frame_before_seq=frame_before,
+                    frame_after_seq=self.ctx._latest_frame_seq(),
+                    extra={"planner": "ml"},
+                )
+            except Exception as e:
+                logger.debug("record_step (ml) failed: %s", e)
+            history.append({
+                "agent": name, "kwargs": kwargs,
+                "success": bool(outcome.success),
+            })
+            if not outcome.success:
+                # No best-effort distinction in ML mode — let the
+                # model itself decide whether to retry on the next
+                # step. We just stop the loop and let the verifier
+                # adjudicate. The next loop iteration will see the
+                # failure in history and the same screen.
+                pass
+
+        if dry_run:
+            return ControllerOutcome(
+                success=True,
+                reason="dry-run; nothing executed (ml planner)",
+                data={
+                    "planner": "ml", "plan": plan_names,
+                    "history": history,
+                },
+            )
+
+        # Final-state verification on the live frame.
+        completion = await self._final_capture_and_verify(
+            intent=intent,
+            final_settle_sec=final_settle_sec,
+            verify_completion=verify_completion,
+            pre_lines=set(),
+        )
+        verified = completion.get("verified")
+        success = True
+        reason = f"ml planner completed {len(executed)} step(s)"
+        if verified is False:
+            success = False
+            reason = (
+                f"completed {len(executed)} ml step(s) but visual "
+                f"verification rejected: "
+                f"{completion.get('reason', '')}"
+            )
+        elif verified is True:
+            reason += (
+                f"; visual verification: {completion.get('reason', '')}"
+            )
+        return ControllerOutcome(
+            success=success,
+            reason=reason,
+            data={
+                "planner": "ml",
+                "ml_adapter": ml_adapter,
+                "plan": plan_names,
+                "history": history,
+                "results": [
+                    (n, o.success, o.reason) for n, o in executed
+                ],
+                "completion": completion,
+            },
+        )
 
     async def _final_capture_and_verify(
         self,

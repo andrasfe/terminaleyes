@@ -91,6 +91,8 @@ class Runner:
         platform: str = "linux",
         dry_run: bool = False,
         allow_llm_fallback: bool = True,
+        planner: str = "auto",
+        ml_adapter: str | None = None,
     ) -> RunRecord:
         async with self._lock:
             if self._active is not None:
@@ -105,6 +107,7 @@ class Runner:
                     "no_focus": no_focus, "vault": vault,
                     "platform": platform, "dry_run": dry_run,
                     "allow_llm_fallback": allow_llm_fallback,
+                    "planner": planner, "ml_adapter": ml_adapter,
                 },
                 status="running",
                 started_at=time.time(),
@@ -142,6 +145,8 @@ class Runner:
                     platform=record.options["platform"],
                     dry_run=record.options["dry_run"],
                     allow_llm_fallback=record.options["allow_llm_fallback"],
+                    planner=record.options.get("planner", "auto"),
+                    ml_adapter=record.options.get("ml_adapter"),
                 )
             record.status = "succeeded" if bool(outcome) else "failed"
             record.reason = outcome.reason

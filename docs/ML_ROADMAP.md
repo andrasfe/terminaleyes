@@ -102,10 +102,28 @@ so reserve this for a model that already mostly works.
 **Pick to start: UI-TARS-7B-DPO + LoRA + homography-warped frames.**
 Action heads already match terminaleyes' agent vocabulary almost
 1:1, and DPO has been done on UI-TARS already so the base behaviour
-is sane. Use `peft` + `bitsandbytes` (4-bit base, LoRA adapters) to
-fit on a single 24 GB GPU. Keep a UI-TARS-2B (or ShowUI-2B) twin
-loaded for fast iteration cycles; promote to 7B once dataset shape
-is proven.
+is sane. Keep a UI-TARS-2B (or ShowUI-2B) twin loaded for fast
+iteration cycles; promote to 7B once dataset shape is proven.
+
+Two training backends are provided:
+
+* **Apple Silicon (default for this repo)** —
+  `scripts/train_ml_planner_mlx.py` uses `mlx-vlm` (Apple
+  ml-explore). Fits an M-series Mac's unified memory; verified
+  end-to-end on M4 Max with `mlx-community/Qwen2-VL-2B-Instruct-4bit`
+  (and `mlx-community/UI-TARS-7B-DPO-4bit` for the production
+  target). Loss converges on a smoke dataset; LoRA adapters land
+  as `adapters.safetensors` alongside a `terminaleyes_meta.json`
+  the runtime reads at load time.
+* **CUDA / Linux** — `scripts/train_ml_planner.py` uses `peft` +
+  `bitsandbytes` (4-bit base, LoRA adapters). Same dataset format,
+  same runtime adapter shape, just a different trainer.
+
+`MlPlannerAgent` detects the backend via `terminaleyes_meta.json`
+and dispatches inference accordingly (`mlx-vlm.load + generate`
+or `transformers + peft`), so a checkpoint trained on either
+backend works at inference on either platform that ships the
+matching runtime.
 
 ### The webcam-OOD problem
 
