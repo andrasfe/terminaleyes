@@ -1062,6 +1062,17 @@ class ControllerAgent(Agent):
         final_settle_sec: float = 2.0,
         verify_completion: bool = True,
     ) -> ControllerOutcome:
+        # Stamp the run id on the context so downstream agents that
+        # call ctx.record_step() can attribute their rows. Derived
+        # from the per-run output_dir name (set by the cc factory)
+        # so the step log lives next to the frames in
+        # <output_dir>/steps.jsonl and joins back to RunRecord.run_id.
+        out_dir_for_id = getattr(self.ctx, "output_dir", None)
+        if out_dir_for_id is not None:
+            try:
+                self.ctx.run_id = Path(out_dir_for_id).name
+            except Exception:
+                self.ctx.run_id = None
         memory = load_memory()
         if memory:
             mem_path = _memory_path()
@@ -1223,9 +1234,14 @@ class ControllerAgent(Agent):
             )
 
         results: list[tuple[str, Outcome]] = []
+        history_for_log: list[dict] = []
         for i, step in enumerate(plan, 1):
             tag = " (best-effort)" if step.best_effort else ""
             print(f"\n[{i}/{len(plan)}] {step.name}{tag} ...")
+            # Frame counter just before the step runs — treated as the
+            # model-input frame for ML logging. The first frame the
+            # step itself captures becomes "frame_after" below.
+            frame_before = self.ctx._latest_frame_seq()
             agent = step.agent_cls(self.ctx)
             try:
                 outcome = await agent.run(**step.kwargs)
@@ -1237,6 +1253,27 @@ class ControllerAgent(Agent):
             results.append((step.name, outcome))
             mark = "✓" if outcome else "✗"
             print(f"   {mark} {step.name}: {outcome.reason}")
+            # ML dataset row: one per executed step, regardless of
+            # success/failure. Best-effort: never blocks the run.
+            try:
+                self.ctx.record_step(
+                    intent=intent,
+                    agent_name=step.name,
+                    kwargs=step.kwargs,
+                    outcome_success=bool(outcome.success),
+                    outcome_reason=str(outcome.reason or ""),
+                    history=list(history_for_log),
+                    frame_before_seq=frame_before,
+                    frame_after_seq=self.ctx._latest_frame_seq(),
+                    extra={"best_effort": bool(step.best_effort)},
+                )
+            except Exception as e:
+                logger.debug("record_step failed: %s", e)
+            history_for_log.append({
+                "agent": step.name,
+                "kwargs": step.kwargs or {},
+                "success": bool(outcome.success),
+            })
             if not outcome:
                 if step.best_effort:
                     # Soft-fail: log + continue. The next step has its

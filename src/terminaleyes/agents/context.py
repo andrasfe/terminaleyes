@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +75,15 @@ class AgentContext:
     # Free-form scratchpad for cross-agent state during a run.
     scratch: dict[str, Any] = field(default_factory=dict)
 
+    # Optional run identifier used in step-log rows. Set per-run by
+    # the controller so each row in ``steps.jsonl`` is joinable to
+    # the cc RunRecord and to the journal entries.
+    run_id: str | None = None
+
+    # Internal step counter for the JSONL step log. Mutated by
+    # :meth:`record_step`; not part of the public API.
+    _step_counter: int = 0
+
     # ───────────────────── frame recording ─────────────────────
 
     def record_frame(
@@ -129,6 +140,79 @@ class AgentContext:
             return None
         self.record_frame(frame.image, label=label)
         return frame.image
+
+    # ───────────────────── step recording (ML dataset) ─────────────────────
+
+    def _latest_frame_seq(self) -> int | None:
+        """Return the current value of the frame counter, or ``None`` if
+        no frames have been recorded yet. Used to stamp step records
+        with the frame that was on disk *before* the step ran (treated
+        as the model-input frame for the upcoming decision)."""
+        return self._frame_counter if self._frame_counter > 0 else None
+
+    def record_step(
+        self,
+        *,
+        intent: str,
+        agent_name: str,
+        kwargs: dict | None,
+        outcome_success: bool,
+        outcome_reason: str,
+        history: list[dict] | None = None,
+        frame_before_seq: int | None = None,
+        frame_after_seq: int | None = None,
+        extra: dict | None = None,
+    ) -> Path | None:
+        """Append one row to ``<output_dir>/steps.jsonl`` describing
+        the decision the controller just made: what intent was being
+        served, which agent was called with which kwargs, what frame
+        sequence numbers were on disk before and after, and the
+        outcome.
+
+        Rows are JSON Lines, one per step. The frame sequence numbers
+        are integers matching the ``NNNN_`` prefix on filenames in
+        ``output_dir``, so a dataset builder can resolve them back to
+        image paths without inspecting filenames.
+
+        Returns the file path written, or ``None`` when no
+        ``output_dir`` is configured (so callers can record
+        unconditionally). Errors are swallowed (logged at debug) —
+        step recording must never break a live run.
+        """
+        if self.output_dir is None:
+            return None
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.debug("steps.jsonl: cannot mkdir %s: %s",
+                         self.output_dir, e)
+            return None
+        self._step_counter += 1
+        row = {
+            "run_id": self.run_id,
+            "step_idx": self._step_counter,
+            "ts": time.time(),
+            "intent": intent,
+            "agent": agent_name,
+            "kwargs": kwargs or {},
+            "history": history or [],
+            "frame_before_seq": frame_before_seq,
+            "frame_after_seq": frame_after_seq,
+            "outcome": {
+                "success": bool(outcome_success),
+                "reason": outcome_reason,
+            },
+        }
+        if extra:
+            row["extra"] = extra
+        path = self.output_dir / "steps.jsonl"
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError as e:
+            logger.debug("steps.jsonl append failed: %s", e)
+            return None
+        return path
 
     def subdir(self, name: str) -> Path | None:
         """Return a subdirectory of ``output_dir`` (creating it lazily).
