@@ -96,15 +96,28 @@ class _LoadedModel:
     def _load_mlx(self) -> None:
         from mlx_vlm import load as _mlx_load
         from mlx_vlm.prompt_utils import apply_chat_template as _act  # noqa: F401
+        # mlx-vlm.load(adapter_path=<dir>) looks for a peft-style
+        # adapter_config.json next to the weights. The mlx_vlm.lora
+        # trainer instead writes plain adapters.safetensors, so we
+        # point load() directly at the .safetensors file when no
+        # adapter_config.json exists.
+        safetensors = self.adapter_dir / "adapters.safetensors"
+        adapter_target: str
+        if (self.adapter_dir / "adapter_config.json").exists():
+            adapter_target = str(self.adapter_dir)
+        elif safetensors.exists():
+            adapter_target = str(safetensors)
+        else:
+            raise FileNotFoundError(
+                f"no adapter weights in {self.adapter_dir} "
+                "(expected adapters.safetensors or adapter_config.json)"
+            )
         logger.info(
             "MlPlanner[mlx]: loading %s + adapter %s",
-            self.base_model_id, self.adapter_dir,
+            self.base_model_id, adapter_target,
         )
-        # mlx-vlm.load returns (model, processor); adapter_path is
-        # a directory or .safetensors file containing the LoRA.
         self.model, self.processor = _mlx_load(
-            self.base_model_id,
-            adapter_path=str(self.adapter_dir),
+            self.base_model_id, adapter_path=adapter_target,
         )
 
     def _predict_mlx(self, *, prompt: str, image: Any) -> str:
