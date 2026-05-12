@@ -50,6 +50,7 @@ from terminaleyes.agents.ocr import OcrAgent
 from terminaleyes.agents.read import ReadAgent
 from terminaleyes.agents.save_as import SaveAsAgent
 from terminaleyes.agents.script import ScriptAgent
+from terminaleyes.agents.shell_run import ShellRunAgent
 from terminaleyes.agents.scribe import (
     ScribeAgent, journal_path, read_tail as _journal_read_tail,
 )
@@ -154,6 +155,16 @@ _PLANNER_FEW_SHOT = (
     'Reply: {"plan": [\n'
     '  {"name": "launch",  "kwargs": {"app": "libreoffice calc", "platform": "linux"}},\n'
     '  {"name": "save_as", "kwargs": {"path": "/tmp/sheet.ods", "platform": "linux"}}\n'
+    "]}\n\n"
+    "Intent: verify the file ~/Downloads/deleteme.odt exists and tell me its size\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch",    "kwargs": {"app": "terminal", "platform": "linux"}},\n'
+    '  {"name": "shell_run", "kwargs": {"command": "ls -l ~/Downloads/deleteme.odt"}}\n'
+    "]}\n\n"
+    "Intent: check the kernel version on the target and report it back\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch",    "kwargs": {"app": "terminal", "platform": "linux"}},\n'
+    '  {"name": "shell_run", "kwargs": {"command": "uname -r"}}\n'
     "]}\n\n"
     "Intent: run this script:\\necho hello\\npwd\\nuname -a\n"
     'Reply: {"plan": [\n'
@@ -521,6 +532,21 @@ REGISTRY: dict[str, tuple[type, str]] = {
                  "prompt). Use this as ONE step instead of emitting "
                  "[keys Ctrl+S, type path, keys Enter] separately — "
                  "small models tend to truncate that sequence."),
+    "shell_run": (ShellRunAgent,
+                  "run ONE shell command on the focused terminal and "
+                  "return its stdout verbatim in data['stdout']. "
+                  "Unlike 'script' (which only types and presses "
+                  "Enter), this wraps the command in unique markers, "
+                  "OCRs the screen between them, and returns the "
+                  "captured text — so the next planner step can react "
+                  "to the actual output rather than guessing from the "
+                  "verifier. Sends a Ctrl+C + 'clear' pre-flight so "
+                  "any foreground process eating keystrokes (e.g. a "
+                  "journalctl tail) is broken first. kwargs: command "
+                  "(str — use ';' or '&&' to chain), timeout (s, "
+                  "default 12), clear_first (default true). Use this "
+                  "whenever you need to verify file existence, read "
+                  "command output, or branch on a shell result."),
     "script":   (ScriptAgent,
                  "type a multi-line shell script into the focused "
                  "terminal, one Enter-terminated line at a time. "
@@ -1161,6 +1187,15 @@ class ControllerAgent(Agent):
                 txt = str(o.data.get("text", "")).strip()
                 if txt:
                     answer = txt
+            elif name == "shell_run":
+                # ShellRunAgent returns the marker-bracketed stdout
+                # of a single shell command. Treat that as the
+                # authoritative answer when present — it's verbatim
+                # output, not a vision summary, so it should override
+                # an earlier OCR/read answer if both ran.
+                out = str(o.data.get("stdout", "")).strip()
+                if out:
+                    answer = out
         completion = await self._final_capture_and_verify(
             intent=intent,
             final_settle_sec=final_settle_sec,
