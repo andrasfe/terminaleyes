@@ -75,6 +75,22 @@ APP_ALIASES: dict[str, _AppAlias] = {
     "chromium":         _AppAlias("chromium", ("chromium", "chrome")),
     "browser":          _AppAlias("firefox", ("firefox", "chrome")),
     "web browser":      _AppAlias("firefox", ("firefox", "chrome")),
+    "libreoffice writer":     _AppAlias("libreoffice writer",
+                                        ("writer", "libreoffice")),
+    "libreoffice-writer":     _AppAlias("libreoffice writer",
+                                        ("writer", "libreoffice")),
+    "writer":                 _AppAlias("libreoffice writer",
+                                        ("writer", "libreoffice")),
+    "libreoffice":            _AppAlias("libreoffice",
+                                        ("libreoffice",)),
+    "libreoffice calc":       _AppAlias("libreoffice calc",
+                                        ("calc", "libreoffice")),
+    "libreoffice-calc":       _AppAlias("libreoffice calc",
+                                        ("calc", "libreoffice")),
+    "libreoffice impress":    _AppAlias("libreoffice impress",
+                                        ("impress", "libreoffice")),
+    "libreoffice-impress":    _AppAlias("libreoffice impress",
+                                        ("impress", "libreoffice")),
 }
 
 

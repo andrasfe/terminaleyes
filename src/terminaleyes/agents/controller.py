@@ -48,6 +48,7 @@ from terminaleyes.agents.login import LoginAgent
 from terminaleyes.agents.navigate import NavigateAgent
 from terminaleyes.agents.ocr import OcrAgent
 from terminaleyes.agents.read import ReadAgent
+from terminaleyes.agents.save_as import SaveAsAgent
 from terminaleyes.agents.script import ScriptAgent
 from terminaleyes.agents.scribe import (
     ScribeAgent, journal_path, read_tail as _journal_read_tail,
@@ -142,6 +143,17 @@ _PLANNER_FEW_SHOT = (
     "Intent: read what's in the URL bar via OCR\n"
     'Reply: {"plan": [\n'
     '  {"name": "ocr", "kwargs": {"region": "url_bar"}}\n'
+    "]}\n\n"
+    'Intent: open libreoffice writer and type "Hello World" then save it into ~/Downloads/note.odt\n'
+    'Reply: {"plan": [\n'
+    '  {"name": "launch",  "kwargs": {"app": "libreoffice writer", "platform": "linux"}},\n'
+    '  {"name": "type",    "kwargs": {"text": "Hello World", "submit": false}},\n'
+    '  {"name": "save_as", "kwargs": {"path": "~/Downloads/note.odt", "platform": "linux"}}\n'
+    "]}\n\n"
+    'Intent: open libreoffice calc and save it into /tmp/sheet.ods\n'
+    'Reply: {"plan": [\n'
+    '  {"name": "launch",  "kwargs": {"app": "libreoffice calc", "platform": "linux"}},\n'
+    '  {"name": "save_as", "kwargs": {"path": "/tmp/sheet.ods", "platform": "linux"}}\n'
     "]}\n\n"
     "Intent: run this script:\\necho hello\\npwd\\nuname -a\n"
     'Reply: {"plan": [\n'
@@ -499,6 +511,16 @@ REGISTRY: dict[str, tuple[type, str]] = {
                  "switch window, Super+Up maximise, Super+H "
                  "minimise."),
     "navigate": (NavigateAgent, "type a URL into a browser address bar (browser-aware)"),
+    "save_as":  (SaveAsAgent,
+                 "save the focused document via Ctrl/Cmd+S, typing "
+                 "an explicit destination path into the save dialog. "
+                 "kwargs: path (str — destination, e.g. "
+                 "'~/Downloads/note.odt'), platform (linux/macos), "
+                 "confirm_format_prompt (bool, default True — sends a "
+                 "second Enter to dismiss LibreOffice's 'keep format' "
+                 "prompt). Use this as ONE step instead of emitting "
+                 "[keys Ctrl+S, type path, keys Enter] separately — "
+                 "small models tend to truncate that sequence."),
     "script":   (ScriptAgent,
                  "type a multi-line shell script into the focused "
                  "terminal, one Enter-terminated line at a time. "
@@ -990,23 +1012,40 @@ class ControllerAgent(Agent):
             )
             plan_source = "rules"
         if unresolved and allow_llm_fallback:
-            # Some chunks didn't rule-match. Ask the LLM to plan
-            # ONLY those chunks (with surrounding context), and
-            # splice each result into the rule plan at the right
-            # spot. This keeps the deterministic rule plan for
-            # what we can match while still handling natural
-            # phrasings for the rest.
-            print(
-                f"Rule-planned {len(plan)} step(s); "
-                f"asking LLM for {len(unresolved)} unresolved "
-                f"chunk(s): {[c for _, c in unresolved]!r}"
-            )
-            plan = await self._fill_unresolved(
-                intent=intent, plan=plan, unresolved=unresolved,
-                no_focus=no_focus, platform=platform,
-                vault_name=vault_name, memory=memory,
-            )
-            plan_source = "rules+llm" if plan else "llm"
+            # Some chunks didn't rule-match.
+            #
+            # Strategy split:
+            #   * If the rule planner matched SOMETHING, ask the LLM
+            #     to fill only the unresolved chunks (per-chunk path).
+            #     This keeps the deterministic rule plan and only
+            #     splices in the LLM's interpretation where rules
+            #     couldn't reach.
+            #   * If rules matched NOTHING (every chunk unresolved),
+            #     fall through to the whole-intent LLM planner. Its
+            #     few-shot set is richer and it sees the full intent,
+            #     which matters for compound flows where chunks would
+            #     otherwise be planned in isolation (e.g. "open X,
+            #     type Y, save it to PATH" — the save chunk has no
+            #     idea X is already open if planned alone).
+            if plan:
+                print(
+                    f"Rule-planned {len(plan)} step(s); "
+                    f"asking LLM for {len(unresolved)} unresolved "
+                    f"chunk(s): {[c for _, c in unresolved]!r}"
+                )
+                plan = await self._fill_unresolved(
+                    intent=intent, plan=plan, unresolved=unresolved,
+                    no_focus=no_focus, platform=platform,
+                    vault_name=vault_name, memory=memory,
+                )
+                plan_source = "rules+llm" if plan else "llm"
+            else:
+                print(
+                    f"Rule-planned 0 step(s) with "
+                    f"{len(unresolved)} unresolved chunk(s); "
+                    f"asking whole-intent LLM planner for full plan"
+                )
+                plan = []  # let the next branch run _llm_plan
         elif unresolved and not allow_llm_fallback:
             # Strict-rules-only and we couldn't fully match — treat
             # as no plan so the existing "no rule matched" failure
