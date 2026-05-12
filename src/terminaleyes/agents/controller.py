@@ -175,6 +175,16 @@ _PLANNER_FEW_SHOT = (
     '  {"name": "launch",     "kwargs": {"app": "terminal", "platform": "linux"}},\n'
     '  {"name": "set_prompt", "kwargs": {"label": "dev"}}\n'
     "]}\n\n"
+    "Intent: change the terminal prompt to mini1 permanently\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch",     "kwargs": {"app": "terminal", "platform": "linux"}},\n'
+    '  {"name": "set_prompt", "kwargs": {"label": "mini1", "persist": true}}\n'
+    "]}\n\n"
+    "Intent: set the bash prompt to box1 and make it stick across reboots\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch",     "kwargs": {"app": "terminal", "platform": "linux"}},\n'
+    '  {"name": "set_prompt", "kwargs": {"label": "box1", "persist": true}}\n'
+    "]}\n\n"
     "Intent: verify the file ~/Downloads/deleteme.odt exists and tell me its size\n"
     'Reply: {"plan": [\n'
     '  {"name": "launch",    "kwargs": {"app": "terminal", "platform": "linux"}},\n'
@@ -554,11 +564,17 @@ REGISTRY: dict[str, tuple[type, str]] = {
     "set_prompt": (SetPromptAgent,
                    "change the focused shell's PS1 to a fixed label. "
                    "kwargs: label (str — text shown before the cursor, "
-                   "no apostrophes), suffix (str, default '$ '). Runtime "
-                   "only — does not persist to .bashrc. Use this when "
-                   "the user asks to change/rename/set the bash prompt "
-                   "to a literal string. Pair with a prior 'launch' "
-                   "(app='terminal') so the shell is focused."),
+                   "no single or double quotes), suffix (str, default "
+                   "'$ '), persist (bool, default false — when true, "
+                   "also writes ~/.terminaleyes_prompt and adds a "
+                   "one-line source to ~/.bashrc so new shells inherit "
+                   "the prompt across reboots; idempotent on repeat "
+                   "runs). Use this when the user asks to change / "
+                   "rename / set the bash prompt to a literal string. "
+                   "Pair with a prior 'launch' (app='terminal') so the "
+                   "shell is focused. Set persist=true when the user "
+                   "says 'permanent', 'persistent', 'every time', "
+                   "'across reboots', or 'forever'."),
     "shell_run": (ShellRunAgent,
                   "run ONE shell command on the focused terminal and "
                   "return its stdout verbatim in data['stdout']. "
