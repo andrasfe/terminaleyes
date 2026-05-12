@@ -1,0 +1,259 @@
+"""MlPlannerAgent — emit the next agent call from a fine-tuned VLA.
+
+Drop-in replacement for the LLM-planner code path in
+:class:`ControllerAgent`. Loads a LoRA adapter trained by
+``scripts/train_ml_planner.py`` and runs one forward pass per step:
+
+  (current frame, intent, history) → {"agent": "<name>", "kwargs": {...}}
+
+The agent is invoked iteratively by the controller: it returns ONE
+step, gets executed, the resulting frame goes back in, repeat until
+the model emits a sentinel ``{"agent": "done"}`` or the step cap.
+
+Inputs come from the same :class:`AgentContext` every other agent
+uses: ``capture`` for the frame, ``vision_client`` is NOT used (we
+go through HF transformers directly so the model can be hosted
+locally without LM Studio in the loop).
+
+This module imports torch/transformers/peft lazily — importing it
+on a machine without those packages just disables ML planning
+without breaking the rest of the agent stack.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from terminaleyes.agents.base import Agent, Outcome
+from terminaleyes.ml.format import (
+    format_history, format_prompt, parse_response,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MlPlannerOutcome(Outcome):
+    """``data['agent']`` and ``data['kwargs']`` carry the planned step."""
+
+
+# Sentinel agent name used to signal "we're done — no more steps".
+DONE_AGENT = "done"
+
+
+class _LoadedModel:
+    """Lazy holder for the HF model + processor.
+
+    Loaded once per process and reused across decisions. The
+    quantised 4-bit model + LoRA adapters consume ~6 GB VRAM for a
+    7B base — fits on a single 24 GB card alongside the rest of the
+    terminaleyes stack.
+    """
+
+    def __init__(self, adapter_dir: Path) -> None:
+        self.adapter_dir = adapter_dir
+        self.processor: Any = None
+        self.model: Any = None
+        self.base_model_id: str = ""
+        self.warp_frames: bool = False
+        self._loaded = False
+
+    def load(self) -> None:
+        if self._loaded:
+            return
+        import torch  # noqa: F401
+        from transformers import (
+            AutoProcessor,
+            AutoModelForVision2Seq,
+            BitsAndBytesConfig,
+        )
+        from peft import PeftModel
+
+        meta_path = self.adapter_dir / "terminaleyes_meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"missing terminaleyes_meta.json in {self.adapter_dir} "
+                "(was this adapter produced by train_ml_planner.py?)"
+            )
+        meta = json.loads(meta_path.read_text("utf-8"))
+        self.base_model_id = str(meta.get("base_model", ""))
+        self.warp_frames = bool(meta.get("warp_frames", False))
+        if not self.base_model_id:
+            raise ValueError("base_model missing from terminaleyes_meta.json")
+
+        logger.info(
+            "MlPlanner: loading processor + 4-bit base %s + LoRA %s",
+            self.base_model_id, self.adapter_dir,
+        )
+        self.processor = AutoProcessor.from_pretrained(
+            str(self.adapter_dir), trust_remote_code=True,
+        )
+        bnb = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=__import__("torch").bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        base = AutoModelForVision2Seq.from_pretrained(
+            self.base_model_id,
+            quantization_config=bnb,
+            device_map="auto",
+            trust_remote_code=True,
+            torch_dtype=__import__("torch").bfloat16,
+        )
+        self.model = PeftModel.from_pretrained(base, str(self.adapter_dir))
+        self.model.eval()
+        self._loaded = True
+
+    def predict(self, *, prompt: str, image: Any) -> str:
+        if not self._loaded:
+            self.load()
+        import torch
+        messages = [{"role": "user", "content": [
+            {"type": "image"},
+            {"type": "text", "text": prompt},
+        ]}]
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self.processor(
+            text=text, images=[image], return_tensors="pt",
+        )
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            output = self.model.generate(
+                **inputs,
+                max_new_tokens=200,
+                do_sample=False,
+                temperature=0.0,
+            )
+        gen = output[0, inputs["input_ids"].shape[1]:]
+        return self.processor.batch_decode(
+            gen.unsqueeze(0), skip_special_tokens=True,
+        )[0]
+
+
+# Module-level singleton so successive MlPlannerAgent calls share
+# the loaded weights. Keyed by adapter directory.
+_LOADED: dict[str, _LoadedModel] = {}
+
+
+def _get_loader(adapter_dir: Path) -> _LoadedModel:
+    key = str(adapter_dir.resolve())
+    if key not in _LOADED:
+        _LOADED[key] = _LoadedModel(adapter_dir)
+    return _LOADED[key]
+
+
+def _warp_if_needed(frame_bgr: np.ndarray, *, warp: bool) -> "Any":
+    """Convert a BGR ndarray (cv2 capture) → PIL image, optionally
+    pre-warping via the homer's screen-flattening helper."""
+    from PIL import Image
+    rgb = frame_bgr[:, :, ::-1]  # BGR → RGB
+    img = Image.fromarray(rgb)
+    if not warp:
+        return img
+    try:
+        from terminaleyes.commander.visual_servo_homer import (
+            warp_frame_to_screenshot,  # type: ignore[attr-defined]
+        )
+        return warp_frame_to_screenshot(img)
+    except Exception:
+        return img
+
+
+class MlPlannerAgent(Agent):
+    """Predict the next agent call from a frame + intent + history."""
+
+    name = "ml_planner"
+
+    async def run(
+        self,
+        *,
+        intent: str,
+        adapter_dir: str | Path,
+        history: list[dict] | None = None,
+        record_label: str = "ml_planner",
+    ) -> MlPlannerOutcome:
+        if self.ctx.capture is None:
+            return MlPlannerOutcome(
+                success=False,
+                reason="no capture in context",
+                data={"agent": "", "kwargs": {}},
+            )
+        adapter = Path(adapter_dir)
+        if not adapter.exists():
+            return MlPlannerOutcome(
+                success=False,
+                reason=f"adapter dir not found: {adapter}",
+                data={"agent": "", "kwargs": {}},
+            )
+        try:
+            frame = await self.ctx.capture.capture_frame()
+        except Exception as e:
+            return MlPlannerOutcome(
+                success=False,
+                reason=f"capture failed: {e}",
+                data={"agent": "", "kwargs": {}},
+            )
+        self.ctx.record_frame(frame.image, label=record_label)
+
+        prompt = format_prompt(intent=intent, history=history or [])
+        loader = _get_loader(adapter)
+
+        # The HF model runs synchronously; offload to a thread so we
+        # don't block the controller's event loop.
+        def _infer() -> str:
+            try:
+                loader.load()
+            except Exception as e:
+                raise RuntimeError(f"ml load failed: {e}") from e
+            pil = _warp_if_needed(frame.image, warp=loader.warp_frames)
+            return loader.predict(prompt=prompt, image=pil)
+
+        try:
+            raw = await asyncio.to_thread(_infer)
+        except Exception as e:
+            return MlPlannerOutcome(
+                success=False,
+                reason=f"inference failed: {e}",
+                data={"agent": "", "kwargs": {}, "history": history or []},
+            )
+
+        parsed = parse_response(raw)
+        if parsed is None:
+            return MlPlannerOutcome(
+                success=False,
+                reason=f"unparseable response: {raw[:120]!r}",
+                data={"agent": "", "kwargs": {}, "raw": raw},
+            )
+        agent = str(parsed.get("agent", "")).strip()
+        kwargs = parsed.get("kwargs") or {}
+        if not agent:
+            return MlPlannerOutcome(
+                success=False,
+                reason="response missing 'agent' field",
+                data={"raw": raw},
+            )
+        is_done = agent == DONE_AGENT
+        return MlPlannerOutcome(
+            success=True,
+            reason=(
+                "done" if is_done
+                else f"emit step {agent}({kwargs})"
+            ),
+            data={
+                "agent": agent,
+                "kwargs": kwargs,
+                "done": is_done,
+                "raw": raw,
+                "history": history or [],
+            },
+        )
