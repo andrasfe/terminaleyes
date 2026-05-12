@@ -49,6 +49,7 @@ from terminaleyes.agents.navigate import NavigateAgent
 from terminaleyes.agents.ocr import OcrAgent
 from terminaleyes.agents.read import ReadAgent
 from terminaleyes.agents.save_as import SaveAsAgent
+from terminaleyes.agents.set_prompt import SetPromptAgent
 from terminaleyes.agents.script import ScriptAgent
 from terminaleyes.agents.shell_run import ShellRunAgent
 from terminaleyes.agents.scribe import (
@@ -163,6 +164,16 @@ _PLANNER_FEW_SHOT = (
     'Reply: {"plan": [\n'
     '  {"name": "launch",  "kwargs": {"app": "libreoffice calc", "platform": "linux"}},\n'
     '  {"name": "save_as", "kwargs": {"path": "/tmp/sheet.ods", "platform": "linux"}}\n'
+    "]}\n\n"
+    "Intent: change the terminal prompt to mini1\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch",     "kwargs": {"app": "terminal", "platform": "linux"}},\n'
+    '  {"name": "set_prompt", "kwargs": {"label": "mini1"}}\n'
+    "]}\n\n"
+    "Intent: rename the bash prompt to dev\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch",     "kwargs": {"app": "terminal", "platform": "linux"}},\n'
+    '  {"name": "set_prompt", "kwargs": {"label": "dev"}}\n'
     "]}\n\n"
     "Intent: verify the file ~/Downloads/deleteme.odt exists and tell me its size\n"
     'Reply: {"plan": [\n'
@@ -540,6 +551,14 @@ REGISTRY: dict[str, tuple[type, str]] = {
                  "prompt). Use this as ONE step instead of emitting "
                  "[keys Ctrl+S, type path, keys Enter] separately — "
                  "small models tend to truncate that sequence."),
+    "set_prompt": (SetPromptAgent,
+                   "change the focused shell's PS1 to a fixed label. "
+                   "kwargs: label (str — text shown before the cursor, "
+                   "no apostrophes), suffix (str, default '$ '). Runtime "
+                   "only — does not persist to .bashrc. Use this when "
+                   "the user asks to change/rename/set the bash prompt "
+                   "to a literal string. Pair with a prior 'launch' "
+                   "(app='terminal') so the shell is focused."),
     "shell_run": (ShellRunAgent,
                   "run ONE shell command on the focused terminal and "
                   "return its stdout verbatim in data['stdout']. "
