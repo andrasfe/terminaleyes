@@ -133,6 +133,10 @@ _PLANNER_FEW_SHOT = (
     'Reply: {"plan": [\n'
     '  {"name": "keys", "kwargs": {"modifiers": ["ctrl"], "key": "s"}}\n'
     "]}\n\n"
+    "Intent: lock the screen\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "keys", "kwargs": {"modifiers": ["super"], "key": "l"}}\n'
+    "]}\n\n"
     "Intent: click the Run button\n"
     'Reply: {"plan": [\n'
     '  {"name": "click", "kwargs": {"target": "the Run button"}}\n'
@@ -1556,7 +1560,19 @@ class ControllerAgent(Agent):
             "foreground'). Do NOT answer FALSE just because the "
             "thing you'd expect to see after the action is "
             "missing — that's exactly what 'close' is supposed "
-            "to do."
+            "to do.\n\n"
+            "SPECIAL CASE — lock / sleep / suspend intents:\n"
+            "  For intents like 'lock the screen', 'put the "
+            "machine to sleep', 'turn off the display', SMPTE "
+            "color bars OR a fully black/no-signal frame OR a "
+            "GDM/login screen are all valid success conditions. "
+            "When the lock kicks in, the GPU often stops "
+            "outputting video entirely; the webcam then sees the "
+            "monitor's own 'no signal' test pattern (vertical "
+            "rainbow stripes) — that means the lock SUCCEEDED, "
+            "not that something is broken. Answer TRUE in that "
+            "case, with reason 'monitor in no-signal mode after "
+            "lock'."
         )
         try:
             v = await VerifyAgent(self.ctx).run(
@@ -1787,6 +1803,7 @@ class ControllerAgent(Agent):
             "      quit app       → ctrl+q\n"
             "      switch window  → alt+Tab\n"
             "      maximise/min   → super+Up / super+h\n"
+            "      lock screen    → {\"modifiers\":[\"super\"],\"key\":\"l\"}\n"
             "      press Enter    → {\"modifiers\":[],\"key\":\"Enter\"}\n\n"
             "Respond with ONLY a JSON object — no preamble, no "
             "markdown.\n\n"
