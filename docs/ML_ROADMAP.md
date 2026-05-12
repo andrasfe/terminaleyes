@@ -172,6 +172,31 @@ outcome is cheaper than *taking* it. For terminaleyes:
 
 ---
 
+## Live results so far
+
+| Adapter | Base | Rank | Iters | Train rows | Val rows | Top-1 agent | Exact (a+kw) |
+|---|---|---|---|---|---|---|---|
+| `qwen2vl-2b-v2`  | `mlx-community/Qwen2-VL-2B-Instruct-4bit` | 16 | 500 | 46 | 5 | 5/5 (100%) | 3/5 (60%) |
+| `uitars-7b-v3`   | `mlx-community/UI-TARS-7B-DPO-4bit`        | 8  | 600 | 57 | 7 | 6/7 (85.7%) | 3/7 (42.9%) |
+
+Reading the numbers: v3 ran on a *different* (harder) val split that
+included the `exec_script` envelope and singleton `lock the screen`
+examples — both of which had ~1 training row, so the model couldn't
+generalise them. On the rows the two adapters share in shape, both
+agree (correct agent, occasional kwarg drift). The bottleneck is
+dataset coverage, not parameter count. UI-TARS's GUI prior didn't
+overcome the agent-class imbalance.
+
+Concrete next-iteration moves visible from per-row error analysis:
+
+- More `exec_script` envelope examples (≥5) and `lock the screen`
+  examples to teach Super+L.
+- Re-label the failed no-vault unlock trajectories — their gold is
+  `login {}` which is wrong; should be excluded or corrected.
+- Once trajectories cross ~200, mine `(success, failure)` pairs from
+  the same `(intent, frame)` and add an ORPO pass on top of the SFT
+  adapter (`mlx_vlm.lora --train-mode orpo`).
+
 ## Minimum viable loop to start
 
 1. **Decision-time logging hook** (1 day): emit
