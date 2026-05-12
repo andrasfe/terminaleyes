@@ -2,7 +2,10 @@
 
 Tier-3 workflow primitive. Most apps' Save-As is the same sequence:
 
-  1. Ctrl+S (or Cmd+S on macOS).
+  1. Ctrl+Shift+S (or Cmd+Shift+S on macOS) — Save AS, NOT plain
+     Save. Plain Ctrl+S silently re-saves an already-saved document
+     and never opens the dialog, which leaves the path + Enter
+     keystrokes to fall into the document body instead.
   2. Wait for the save dialog to mount.
   3. Type the destination path (overwriting any pre-selected
      default filename).
@@ -61,12 +64,14 @@ class SaveAsAgent(Agent):
                 data={"path": ""},
             )
 
-        save_mod = "cmd" if platform == "macos" else "ctrl"
+        primary_mod = "cmd" if platform == "macos" else "ctrl"
+        save_mods = [primary_mod, "shift"]
+        chord_name = f"{primary_mod}+shift+s"
         try:
-            await self.ctx.keyboard.send_key_combo([save_mod], "s")
+            await self.ctx.keyboard.send_key_combo(save_mods, "s")
         except Exception as e:
             return SaveAsOutcome(
-                success=False, reason=f"Ctrl+S failed: {e}",
+                success=False, reason=f"{chord_name} failed: {e}",
                 data={"path": target},
             )
         await asyncio.sleep(dialog_settle)
