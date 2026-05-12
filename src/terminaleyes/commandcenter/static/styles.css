@@ -233,6 +233,103 @@ main#app {
   font-family: var(--mono);
 }
 #opt-vault:focus { border-color: var(--accent); outline: none; }
+#btn-exec-script { border-color: #4a4a82; }
+
+/* ── Execute-Script modal ──────────────────────────────────── */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 12px;
+}
+.modal.hidden { display: none; }
+
+.modal-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: min(720px, 100%);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+.modal-header button {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 20px;
+  cursor: pointer;
+  line-height: 1;
+}
+.modal-header button:hover { color: var(--fg); }
+
+.modal-body {
+  padding: 12px 14px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+#exec-script-body {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  resize: vertical;
+  background: var(--bg-elev-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  font-family: var(--mono);
+  font-size: 13px;
+  outline: none;
+}
+#exec-script-body:focus { border-color: var(--accent); }
+.modal-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+.modal-footer button {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+  min-height: 32px;
+}
+.modal-footer button:hover { background: #2a2f37; }
+.modal-footer button.primary {
+  background: var(--accent);
+  color: #001a26;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.modal-footer button.primary:hover { filter: brightness(1.1); }
 
 /* ── log pane ───────────────────────────────────────────────── */
 .log-header {

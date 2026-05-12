@@ -18,6 +18,12 @@ const $optPlatform = document.getElementById("opt-platform");
 const $optVault = document.getElementById("opt-vault");
 const $btnLock = document.getElementById("btn-lock");
 const $btnUnlock = document.getElementById("btn-unlock");
+const $btnExecScript = document.getElementById("btn-exec-script");
+const $execModal = document.getElementById("exec-modal");
+const $execScriptBody = document.getElementById("exec-script-body");
+const $execModalClose = document.getElementById("exec-modal-close");
+const $execModalCancel = document.getElementById("exec-modal-cancel");
+const $execModalRun = document.getElementById("exec-modal-run");
 
 const $logView = document.getElementById("log-view");
 const $btnClearLogs = document.getElementById("btn-clear-logs");
@@ -228,6 +234,7 @@ async function pollRunStatus(runId) {
         $btnSend.disabled = false;
         if ($btnLock) $btnLock.disabled = false;
         if ($btnUnlock) $btnUnlock.disabled = false;
+        if ($btnExecScript) $btnExecScript.disabled = false;
         return;
       }
     } catch (_) {}
@@ -259,6 +266,7 @@ $chatForm.addEventListener("submit", async (e) => {
       $btnSend.disabled = false;
       if ($btnLock) $btnLock.disabled = false;
       if ($btnUnlock) $btnUnlock.disabled = false;
+      if ($btnExecScript) $btnExecScript.disabled = false;
       return;
     }
     if (!r.ok) {
@@ -268,6 +276,7 @@ $chatForm.addEventListener("submit", async (e) => {
       $btnSend.disabled = false;
       if ($btnLock) $btnLock.disabled = false;
       if ($btnUnlock) $btnUnlock.disabled = false;
+      if ($btnExecScript) $btnExecScript.disabled = false;
       return;
     }
     const rec = await r.json();
@@ -282,6 +291,7 @@ $chatForm.addEventListener("submit", async (e) => {
     $btnSend.disabled = false;
     if ($btnLock) $btnLock.disabled = false;
     if ($btnUnlock) $btnUnlock.disabled = false;
+    if ($btnExecScript) $btnExecScript.disabled = false;
   }
 });
 
@@ -292,6 +302,7 @@ async function startRun(body, fallbackIntent) {
   $btnSend.disabled = true;
   $btnLock.disabled = true;
   $btnUnlock.disabled = true;
+  if ($btnExecScript) $btnExecScript.disabled = true;
   try {
     const r = await fetch("/api/run", {
       method: "POST",
@@ -352,6 +363,51 @@ $btnUnlock.addEventListener("click", () => {
     platform: $optPlatform.value,
     vault,
   }, "unlock the screen");
+});
+
+// ── Execute Script modal ──────────────────────────────────────
+function openExecModal() {
+  $execModal.classList.remove("hidden");
+  $execModal.setAttribute("aria-hidden", "false");
+  // Focus the textarea, but don't clobber an existing draft.
+  setTimeout(() => $execScriptBody.focus(), 30);
+}
+
+function closeExecModal() {
+  $execModal.classList.add("hidden");
+  $execModal.setAttribute("aria-hidden", "true");
+}
+
+$btnExecScript.addEventListener("click", openExecModal);
+$execModalClose.addEventListener("click", closeExecModal);
+$execModalCancel.addEventListener("click", closeExecModal);
+
+// ESC closes the modal when it's open.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$execModal.classList.contains("hidden")) {
+    closeExecModal();
+  }
+});
+
+$execModalRun.addEventListener("click", () => {
+  const body = ($execScriptBody.value || "").trim();
+  if (!body) {
+    appendSystemLog("ERROR", "Execute Script: empty body");
+    return;
+  }
+  // Envelope the body so the controller's _partial_plan bypasses
+  // chain-split + LLM and routes straight to ExecScriptAgent.
+  const intent =
+    "__EXEC_SCRIPT__\n" + body + "\n__EXEC_SCRIPT_END__";
+  // chat label: short preview, not the marker envelope.
+  const preview = body.split("\n", 1)[0].slice(0, 60) || "script";
+  closeExecModal();
+  startRun({
+    intent,
+    no_focus: false,
+    dry_run: $optDryRun.checked,
+    platform: $optPlatform.value,
+  }, `exec script: ${preview}…`);
 });
 
 $chatInput.addEventListener("keydown", (e) => {

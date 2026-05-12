@@ -48,6 +48,7 @@ from terminaleyes.agents.login import LoginAgent
 from terminaleyes.agents.navigate import NavigateAgent
 from terminaleyes.agents.ocr import OcrAgent
 from terminaleyes.agents.read import ReadAgent
+from terminaleyes.agents.exec_script import ExecScriptAgent
 from terminaleyes.agents.save_as import SaveAsAgent
 from terminaleyes.agents.set_prompt import SetPromptAgent
 from terminaleyes.agents.script import ScriptAgent
@@ -590,6 +591,20 @@ REGISTRY: dict[str, tuple[type, str]] = {
                   "default 12), clear_first (default true). Use this "
                   "whenever you need to verify file existence, read "
                   "command output, or branch on a shell result."),
+    "exec_script": (ExecScriptAgent,
+                    "write a multi-line shell script to /tmp via a "
+                    "quoted heredoc, chmod +x, execute it, and capture "
+                    "stdout between markers. kwargs: script (str — the "
+                    "verbatim body; #!/bin/bash is prepended if no "
+                    "shebang), filename (str, optional — defaults to "
+                    "te-script-<id>.sh), capture_output (bool, default "
+                    "true). Differs from 'script' (line-by-line type) "
+                    "in that shell metacharacters in the body are "
+                    "preserved verbatim (heredoc 'EOF' is quoted), and "
+                    "the file is reusable. Use this when the user "
+                    "wants to LOAD-and-EXECUTE a verbatim script, "
+                    "especially via the Command Center 'Execute "
+                    "Script…' button."),
     "script":   (ScriptAgent,
                  "type a multi-line shell script into the focused "
                  "terminal, one Enter-terminated line at a time. "
@@ -950,6 +965,16 @@ _SCRIPT_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Verbatim-body envelope used by the cc "Execute Script…" button.
+# Anything between the open and close markers is fed straight to
+# ExecScriptAgent.script — NO LLM rewriting, NO chain splitting,
+# no quote-escape gymnastics. The markers are intentionally noisy
+# so they can't appear in normal prose.
+_EXEC_SCRIPT_ENVELOPE_RE = re.compile(
+    r"^\s*__EXEC_SCRIPT__\s*\n(?P<body>.*?)\n__EXEC_SCRIPT_END__\s*$",
+    re.DOTALL,
+)
+
 
 def _partial_plan(
     intent: str,
@@ -962,6 +987,24 @@ def _partial_plan(
     :func:`plan_intent_partial`. Walks each chunk; chunks that
     don't match a rule are recorded as unresolved with the index
     they should be inserted at in the final plan."""
+    # cc "Execute Script…" envelope bypasses everything: the body
+    # between __EXEC_SCRIPT__ markers goes verbatim into
+    # ExecScriptAgent. No LLM, no chain split. This is the path
+    # the cc UI takes when the user submits the modal textarea.
+    m = _EXEC_SCRIPT_ENVELOPE_RE.match(intent)
+    if m:
+        body = m.group("body")
+        plan: list[PlanStep] = []
+        if not no_focus:
+            plan.append(PlanStep(
+                "launch", LaunchAgent,
+                {"app": "terminal", "platform": platform},
+            ))
+        plan.append(PlanStep(
+            "exec_script", ExecScriptAgent, {"script": body},
+        ))
+        return plan, []
+
     # "run this script: ..." bodies must NOT be chain-split — an
     # ``and`` / ``then`` / comma inside the script body would be
     # shredded into bogus chunks. Forward the whole intent to the

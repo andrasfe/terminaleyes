@@ -30,6 +30,8 @@
                title="Vault entry name used by Unlock" />
         <button id="btn-unlock" type="button" class="quick"
                 title="Unlock the target screen using the named vault entry">Unlock</button>
+        <button id="btn-exec-script" type="button" class="quick"
+                title="Open a textarea, paste a shell script, run it on the target">Execute Script…</button>
       </div>
     </section>
 
@@ -64,6 +66,35 @@
       <pre id="log-view"></pre>
     </section>
   </main>
+
+  <!-- Execute-Script modal: paste a shell script body and submit -->
+  <div id="exec-modal" class="modal hidden" aria-hidden="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span>Execute script on target</span>
+        <button id="exec-modal-close" type="button" title="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <textarea
+          id="exec-script-body"
+          rows="14"
+          placeholder="#!/bin/bash&#10;echo hello&#10;pwd&#10;uname -a"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+        ></textarea>
+        <p class="modal-hint">
+          Body goes verbatim into a quoted heredoc on /tmp,
+          chmod +x, then runs. Captures stdout between markers.
+        </p>
+      </div>
+      <div class="modal-footer">
+        <button id="exec-modal-cancel" type="button">Cancel</button>
+        <button id="exec-modal-run" type="button" class="primary">Run</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/app.js"></script>
 </body>
 </html>
