@@ -15,6 +15,9 @@ const $btnSend = document.getElementById("btn-send");
 const $optDryRun = document.getElementById("opt-dry-run");
 const $optNoFocus = document.getElementById("opt-no-focus");
 const $optPlatform = document.getElementById("opt-platform");
+const $optVault = document.getElementById("opt-vault");
+const $btnLock = document.getElementById("btn-lock");
+const $btnUnlock = document.getElementById("btn-unlock");
 
 const $logView = document.getElementById("log-view");
 const $btnClearLogs = document.getElementById("btn-clear-logs");
@@ -223,6 +226,8 @@ async function pollRunStatus(runId) {
       if (rec.status !== "running" && rec.status !== "pending") {
         state.busy = false;
         $btnSend.disabled = false;
+        if ($btnLock) $btnLock.disabled = false;
+        if ($btnUnlock) $btnUnlock.disabled = false;
         return;
       }
     } catch (_) {}
@@ -252,6 +257,8 @@ $chatForm.addEventListener("submit", async (e) => {
       appendSystemLog("ERROR", "another run is already in progress");
       state.busy = false;
       $btnSend.disabled = false;
+      if ($btnLock) $btnLock.disabled = false;
+      if ($btnUnlock) $btnUnlock.disabled = false;
       return;
     }
     if (!r.ok) {
@@ -259,6 +266,8 @@ $chatForm.addEventListener("submit", async (e) => {
       appendSystemLog("ERROR", `run rejected: ${t}`);
       state.busy = false;
       $btnSend.disabled = false;
+      if ($btnLock) $btnLock.disabled = false;
+      if ($btnUnlock) $btnUnlock.disabled = false;
       return;
     }
     const rec = await r.json();
@@ -271,7 +280,78 @@ $chatForm.addEventListener("submit", async (e) => {
     appendSystemLog("ERROR", String(err));
     state.busy = false;
     $btnSend.disabled = false;
+    if ($btnLock) $btnLock.disabled = false;
+    if ($btnUnlock) $btnUnlock.disabled = false;
   }
+});
+
+// ── quick actions: Lock / Unlock ──────────────────────────────
+async function startRun(body, fallbackIntent) {
+  if (state.busy) return;
+  state.busy = true;
+  $btnSend.disabled = true;
+  $btnLock.disabled = true;
+  $btnUnlock.disabled = true;
+  try {
+    const r = await fetch("/api/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (r.status === 409) {
+      appendSystemLog("ERROR", "another run is already in progress");
+      return;
+    }
+    if (!r.ok) {
+      const t = await r.text();
+      appendSystemLog("ERROR", `run rejected: ${t}`);
+      return;
+    }
+    const rec = await r.json();
+    appendChat({
+      runId: rec.run_id,
+      intent: rec.intent || fallbackIntent,
+      status: rec.status,
+    });
+    pollRunStatus(rec.run_id);
+  } catch (err) {
+    appendSystemLog("ERROR", String(err));
+  } finally {
+    // pollRunStatus re-enables Send on terminal status, but for the
+    // synchronous error paths above we have to release the buttons
+    // here. pollRunStatus also re-enables, so calling twice is fine.
+    if (state.busy) {
+      // poll is still running; leave buttons disabled.
+    } else {
+      $btnSend.disabled = false;
+      $btnLock.disabled = false;
+      $btnUnlock.disabled = false;
+    }
+  }
+}
+
+$btnLock.addEventListener("click", () => {
+  startRun({
+    intent: "lock the screen",
+    no_focus: true,
+    dry_run: $optDryRun.checked,
+    platform: $optPlatform.value,
+  }, "lock the screen");
+});
+
+$btnUnlock.addEventListener("click", () => {
+  const vault = ($optVault.value || "").trim();
+  if (!vault) {
+    appendSystemLog("ERROR", "Unlock requires a vault entry name");
+    return;
+  }
+  startRun({
+    intent: "unlock the screen",
+    no_focus: true,
+    dry_run: $optDryRun.checked,
+    platform: $optPlatform.value,
+    vault,
+  }, "unlock the screen");
 });
 
 $chatInput.addEventListener("keydown", (e) => {

@@ -197,6 +197,40 @@ main#app {
   cursor: not-allowed;
 }
 
+.chat-row.quick-actions { gap: 6px; }
+.chat-row.quick-actions button.quick {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  min-height: 32px;
+  font-size: 13px;
+}
+.chat-row.quick-actions button.quick:hover { background: #2a2f37; }
+.chat-row.quick-actions button.quick:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+#btn-lock { border-color: #5a4040; }
+#btn-unlock {
+  border-color: #2f5a3a;
+  margin-left: auto;
+}
+#opt-vault {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: var(--mono);
+}
+#opt-vault:focus { border-color: var(--accent); outline: none; }
+
 /* ── log pane ───────────────────────────────────────────────── */
 .log-header {
   display: flex;
