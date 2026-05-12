@@ -137,6 +137,10 @@ _PLANNER_FEW_SHOT = (
     'Reply: {"plan": [\n'
     '  {"name": "keys", "kwargs": {"modifiers": ["super"], "key": "l"}}\n'
     "]}\n\n"
+    "Intent: unlock the screen\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "login", "kwargs": {}}\n'
+    "]}\n\n"
     "Intent: click the Run button\n"
     'Reply: {"plan": [\n'
     '  {"name": "click", "kwargs": {"target": "the Run button"}}\n'
@@ -793,6 +797,20 @@ def _plan_one(
     sl = s.lower()
 
     if sl == "login" or sl.startswith("log in"):
+        return [PlanStep(
+            "login", LoginAgent,
+            {"vault_name": vault_name} if vault_name else {},
+        )]
+
+    # Unlock = wake the display + type the password into the lock
+    # screen. LoginAgent does exactly that (Wake → VerifyAgent
+    # confirms a login/lock screen visually → Type(secret) → Enter)
+    # and refuses to type if no lock screen is visible, so this is
+    # safe even if the screen is already unlocked.
+    if sl in (
+        "unlock", "unlock the screen", "unlock screen",
+        "unlock the machine", "log back in", "wake and unlock",
+    ):
         return [PlanStep(
             "login", LoginAgent,
             {"vault_name": vault_name} if vault_name else {},
@@ -1572,7 +1590,20 @@ class ControllerAgent(Agent):
             "rainbow stripes) — that means the lock SUCCEEDED, "
             "not that something is broken. Answer TRUE in that "
             "case, with reason 'monitor in no-signal mode after "
-            "lock'."
+            "lock'.\n\n"
+            "SPECIAL CASE — unlock / log back in / wake intents:\n"
+            "  For intents like 'unlock the screen', 'log back "
+            "in', 'wake the machine', the ABSENCE of a lock "
+            "screen IS the success condition. If the OCR shows a "
+            "normal desktop (taskbar, app windows like terminal/"
+            "browser/files, top bar with menus) and there is NO "
+            "'click to unlock' / 'password' / 'enter password' / "
+            "GDM clock overlay / GNOME login background visible — "
+            "answer TRUE, with reason quoting what desktop "
+            "elements ARE visible (e.g. 'terminal window and "
+            "taskbar visible, no lock screen elements'). Do NOT "
+            "answer FALSE because a regular app window is on "
+            "screen — that's literally the unlocked state."
         )
         try:
             v = await VerifyAgent(self.ctx).run(
