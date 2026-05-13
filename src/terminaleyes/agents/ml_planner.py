@@ -127,12 +127,19 @@ class _LoadedModel:
             self.processor, getattr(self.model, "config", None),
             prompt, num_images=1,
         )
+        # Tiny temperature instead of pure greedy. Some 4-bit
+        # quantised LoRA models (UI-TARS-7B-DPO-4bit observed) hit
+        # degenerate token sequences at temp=0 that produce invalid
+        # UTF-8, which mlx-vlm's detokenizer silently swallows ->
+        # empty string output. A small temperature breaks the
+        # degenerate path without meaningfully reducing accuracy
+        # on instruction-following tasks.
         out = generate(
             self.model, self.processor,
             formatted,
             image=[image],
             max_tokens=200,
-            temperature=0.0,
+            temperature=0.1,
         )
         # mlx-vlm.generate returns either a string or a structured
         # GenerationResult depending on version. Normalise.

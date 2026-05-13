@@ -174,28 +174,56 @@ outcome is cheaper than *taking* it. For terminaleyes:
 
 ## Live results so far
 
-| Adapter | Base | Rank | Iters | Train rows | Val rows | Top-1 agent | Exact (a+kw) |
-|---|---|---|---|---|---|---|---|
-| `qwen2vl-2b-v2`  | `mlx-community/Qwen2-VL-2B-Instruct-4bit` | 16 | 500 | 46 | 5 | 5/5 (100%) | 3/5 (60%) |
-| `uitars-7b-v3`   | `mlx-community/UI-TARS-7B-DPO-4bit`        | 8  | 600 | 57 | 7 | 6/7 (85.7%) | 3/7 (42.9%) |
+| Adapter | Base | Rank | Dropout | Iters | Train rows | Val rows | Top-1 agent | Exact (a+kw) |
+|---|---|---|---|---|---|---|---|---|
+| `qwen2vl-2b-v2`  | `mlx-community/Qwen2-VL-2B-Instruct-4bit` | 16 | 0.05 | 500 | 46 | 5 | 5/5 (100%)  | 3/5 (60%) |
+| `uitars-7b-v3`   | `mlx-community/UI-TARS-7B-DPO-4bit`        | 8  | 0.05 | 600 | 57 | 7 | 6/7 (85.7%) | 3/7 (42.9%) |
+| `uitars-7b-v4`   | `mlx-community/UI-TARS-7B-DPO-4bit`        | 8  | 0.05 | 600 | 98 | 9 | **0/9** — babble |
+| `uitars-7b-v5`   | `mlx-community/UI-TARS-7B-DPO-4bit`        | 16 | 0.10 | 800 | 68 | 9 | **0/9** — empty on long prompts |
 
-Reading the numbers: v3 ran on a *different* (harder) val split that
-included the `exec_script` envelope and singleton `lock the screen`
-examples — both of which had ~1 training row, so the model couldn't
-generalise them. On the rows the two adapters share in shape, both
-agree (correct agent, occasional kwarg drift). The bottleneck is
-dataset coverage, not parameter count. UI-TARS's GUI prior didn't
-overcome the agent-class imbalance.
+### Lesson learned: UI-TARS-DPO is a poor SFT base for our format
 
-Concrete next-iteration moves visible from per-row error analysis:
+Trained four adapters on the same pipeline, only one (Qwen2-VL-2B
+base) produces parseable JSON on held-out evals. The three on
+`UI-TARS-7B-DPO-4bit` all degraded as we added more data:
 
-- More `exec_script` envelope examples (≥5) and `lock the screen`
-  examples to teach Super+L.
-- Re-label the failed no-vault unlock trajectories — their gold is
-  `login {}` which is wrong; should be excluded or corrected.
-- Once trajectories cross ~200, mine `(success, failure)` pairs from
-  the same `(intent, frame)` and add an ORPO pass on top of the SFT
-  adapter (`mlx_vlm.lora --train-mode orpo`).
+- **v3** (57 rows, rank 8) gave 6/7 top-1 agent accuracy on the
+  smallest val split — the apparent best result.
+- **v4** (same hyperparams, 98 rows) babbled `<SYSTEM>` fragments
+  on every row. Hypothesis: the new `__EXEC_SCRIPT__` envelope
+  intents leaked template-shaped text into the user prompt, and
+  the LoRA's low rank couldn't separate "imitate prompt shape"
+  from "emit JSON".
+- **v5** (envelope rows filtered, rank 16, dropout 0.10, 800
+  iters) went the other way — empty output on all val rows.
+  Direct sanity check: the v5-adapter model produces *something*
+  for simple short prompts ("What is 2+2?") but emits empty
+  strings for our long `<SYSTEM>...</SYSTEM>` system prompt. The
+  base UI-TARS-DPO model works fine for both shapes; only the
+  LoRA-fine-tuned model breaks on our format.
+
+The common factor: UI-TARS-DPO was DPO'd by ByteDance to respond
+to a very specific (image, GUI instruction) → action-call format,
+not our `<SYSTEM> / <USER>` template. Our SFT at LR 2e-5 only
+*nudges* against that DPO prior; under prompt distribution shift
+(our long format) the prior surfaces as degenerate tokens.
+
+**Working baseline**: `qwen2vl-2b-v2`. Generic VL base with weak
+priors → easy to override with small SFT.
+
+### What we'd try next (un-touched)
+
+- **Try `mlx-community/UI-TARS-7B-SFT-4bit`** (the non-DPO variant).
+  Same backbone, GUI prior preserved, but without the DPO layer
+  that's fighting our SFT.
+- **Reshape the prompt** to match UI-TARS's expected format more
+  closely — drop the `<SYSTEM>` envelope, embed the agent
+  registry as a system message via `apply_chat_template`'s system
+  role rather than as inline tags. Test whether v3-rerun on
+  reshaped prompts climbs back.
+- More targeted data collection. Once trajectories cross ~200, mine
+  `(success, failure)` pairs from the same `(intent, frame)` and
+  add an ORPO pass (`mlx_vlm.lora --train-mode orpo`).
 
 ## Minimum viable loop to start
 

@@ -67,8 +67,55 @@ def _iter_run_steps(run_dir: Path):
         return
 
 
-def build_rows(runs_root: Path) -> list[dict]:
+def _is_mislabelled(intent: str, agent: str, kwargs: dict,
+                    outcome: dict) -> bool:
+    """Drop rows whose ``(intent, agent, kwargs)`` triple doesn't
+    actually teach the model anything useful.
+
+    Currently filters ONE pattern: ``unlock``-style intent → ``login``
+    agent with **empty kwargs**. These rows came from an early script
+    bug where the unlock intent was invoked without ``--vault desktop``,
+    so the recorded action is ``login {}`` — the agent had no password
+    to type and (correctly) refused. Training on this teaches the model
+    that "unlock the screen" means "call login with no arguments,"
+    which is the opposite of what we want.
+
+    Add more patterns here as we surface them via per-row eval
+    analysis.
+    """
+    intent_l = (intent or "").lower()
+    if (
+        "unlock" in intent_l
+        and agent == "login"
+        and not (kwargs or {})
+    ):
+        return True
+    # Envelope intents (__EXEC_SCRIPT__ … __EXEC_SCRIPT_END__) shove
+    # template-like text into the user prompt. SFT on them taught a
+    # rank-8 LoRA to mimic the envelope shape instead of emitting
+    # clean JSON actions — the v4 7B model started echoing
+    # "<SYSTEM>" fragments on every val row. The intent format is
+    # an internal cc UI convention, not something the model needs
+    # to interpret; the controller's _partial_plan already routes
+    # it deterministically.
+    if (
+        "__EXEC_SCRIPT__" in (intent or "")
+        or "__EXEC_SCRIPT_END__" in (intent or "")
+    ):
+        return True
+    return False
+
+
+def build_rows(
+    runs_root: Path, *, exclude_broken: bool = True,
+) -> tuple[list[dict], dict[str, int]]:
+    """Walk every run dir's steps.jsonl and yield (rows, dropped).
+
+    ``dropped`` is a per-reason counter so the manifest can record
+    how much of the raw log got filtered out.
+    """
     rows: list[dict] = []
+    dropped: dict[str, int] = {"mislabelled": 0}
     for run_dir in sorted(p for p in runs_root.iterdir() if p.is_dir()):
         run_id = run_dir.name
         for raw in _iter_run_steps(run_dir):
@@ -78,21 +125,30 @@ def build_rows(runs_root: Path) -> list[dict]:
             frame_after = _find_frame_path(
                 run_dir, raw.get("frame_after_seq"),
             )
+            agent = raw.get("agent", "")
+            kwargs = raw.get("kwargs", {})
+            intent = raw.get("intent", "")
+            outcome = raw.get("outcome", {})
+            if exclude_broken and _is_mislabelled(
+                intent, agent, kwargs, outcome,
+            ):
+                dropped["mislabelled"] += 1
+                continue
             rows.append({
                 "trajectory_id": run_id,
                 "step_idx": raw.get("step_idx"),
                 "ts": raw.get("ts"),
-                "intent": raw.get("intent", ""),
+                "intent": intent,
                 "history": raw.get("history", []),
                 "frame_before": frame_before,
                 "frame_after": frame_after,
                 "action": {
-                    "agent": raw.get("agent", ""),
-                    "kwargs": raw.get("kwargs", {}),
+                    "agent": agent,
+                    "kwargs": kwargs,
                 },
-                "outcome": raw.get("outcome", {}),
+                "outcome": outcome,
             })
-    return rows
+    return rows, dropped
 
 
 def split_by_run(
@@ -166,13 +222,27 @@ def main() -> int:
              "+ manifest.json are written here.",
     )
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--include-broken", action="store_true",
+        help=(
+            "Don't filter out rows whose (intent, agent, kwargs) "
+            "triple is known-mislabelled. Off by default — see "
+            "_is_mislabelled in this file for the current rules."
+        ),
+    )
     args = ap.parse_args()
 
     if not args.runs_root.exists():
         print(f"runs root not found: {args.runs_root}", file=sys.stderr)
         return 2
 
-    rows = build_rows(args.runs_root)
+    rows, dropped = build_rows(
+        args.runs_root, exclude_broken=not args.include_broken,
+    )
+    if dropped.get("mislabelled"):
+        print(
+            f"  filtered {dropped['mislabelled']} mislabelled row(s)"
+        )
     if not rows:
         print(
             f"no steps.jsonl rows found under {args.runs_root}. "
