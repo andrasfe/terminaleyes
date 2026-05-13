@@ -29,6 +29,7 @@ Defaults that make the controller "safe":
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -1540,6 +1541,15 @@ class ControllerAgent(Agent):
         executed: list[tuple[str, Outcome]] = []
         history: list[dict] = []
         plan_names: list[str] = []
+        # Repeat-detector — current v2 adapter was trained one-shot
+        # (no `done` sentinel in the data), so left to itself it just
+        # re-emits the same step indefinitely once the intent is
+        # visually accomplished. Treat ``REPEAT_HALT`` identical
+        # consecutive emissions as an implicit "done" so single-step
+        # intents like "open a terminal" actually terminate.
+        REPEAT_HALT = 2
+        repeat_streak: tuple[str, str] | None = None
+        repeat_count = 0
         print(f"Planner: ML (adapter={ml_adapter})")
         for step_idx in range(1, max_steps + 1):
             print(f"\n[ml {step_idx}/{max_steps}] asking planner ...")
@@ -1562,6 +1572,21 @@ class ControllerAgent(Agent):
             if decision.data.get("done") or name == DONE_AGENT:
                 print(f"   ml planner: done ({decision.reason})")
                 break
+            # Implicit-done detector — `REPEAT_HALT` identical
+            # (agent, kwargs) emissions in a row → halt.
+            signature = (name, json.dumps(kwargs, sort_keys=True))
+            if signature == repeat_streak:
+                repeat_count += 1
+                if repeat_count >= REPEAT_HALT:
+                    print(
+                        f"   ml planner: implicit done — {name}("
+                        f"{kwargs}) emitted {repeat_count + 1}x in a "
+                        f"row, stopping"
+                    )
+                    break
+            else:
+                repeat_streak = signature
+                repeat_count = 0
             if name not in REGISTRY:
                 print(f"   ml planner emitted unknown agent {name!r}; stopping")
                 return ControllerOutcome(
