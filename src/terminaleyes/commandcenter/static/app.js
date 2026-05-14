@@ -913,16 +913,36 @@ async function _pasteSubmit() {
     const data = await r.json();
     if (data.verify) {
       const v = data.verify;
-      const tag = v.match ? "✓ MATCH" : "✗ MISMATCH";
+      const tag = v.match ? "✓ SHA MATCH" : "✗ SHA MISMATCH";
+      const rounds = Array.isArray(v.rounds) ? v.rounds : [];
+      const lastRound = rounds[rounds.length - 1] || {};
       appendSystemLog(
         v.match ? "INFO" : "ERROR",
-        `${tag} similarity=${v.similarity} sent=${v.sent_norm_chars}c ocr=${v.ocr_norm_chars}c`,
+        `${tag} after ${rounds.length} round(s) ` +
+          `(${v.n_chunks} chunks @ ${v.chunk_size}B). ` +
+          `local=${(v.local_sha || "").slice(0, 12)}… ` +
+          `host=${(lastRound.host_sha || "?").slice(0, 12)}…`,
       );
-      if (!v.match && v.ocr_sample) {
-        appendSystemLog("INFO", `OCR sample: ${v.ocr_sample.slice(0, 240).replace(/\n/g, " | ")}`);
+      // Surface each repair round's bad-chunk set so failures are
+      // diagnosable from the chat log alone.
+      for (const r of rounds) {
+        const bad = Array.isArray(r.bad_indices) ? r.bad_indices : null;
+        if (bad && bad.length) {
+          appendSystemLog(
+            "INFO",
+            `round ${r.round}: ${bad.length} chunk(s) repaired ` +
+              `[${bad.slice(0, 24).join(",")}${bad.length > 24 ? ",…" : ""}]`,
+          );
+        }
+        if (r.abort_reason) {
+          appendSystemLog("ERROR", `round ${r.round} abort: ${r.abort_reason}`);
+        }
       }
     } else {
-      appendSystemLog("INFO", `paste-file ok: wrote ${data.wrote_path} (${data.sent_chars} chars)`);
+      appendSystemLog(
+        "INFO",
+        `paste-file ok: wrote ${data.wrote_path} (${data.sent_chars} chars)`,
+      );
     }
   } catch (e) {
     appendSystemLog("ERROR", `paste-file failed: ${e}`);

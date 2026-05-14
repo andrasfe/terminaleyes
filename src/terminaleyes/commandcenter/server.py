@@ -699,68 +699,196 @@ def create_app(
                 "sent_lines": len(lines),
             }
 
-            # 5) Verify via cat + OCR.
+            # 5) Verify + auto-repair via SHA-256 + chunked MD5 diff.
+            # Replaces the old "cat file → SequenceMatcher" heuristic
+            # with a cryptographic check whose verdict is
+            # deterministic (modulo SHA collisions). Repair is
+            # automatic — bad chunks are identified and overwritten
+            # in place via base64 + dd seek=. Up to 3 rounds.
             if req.verify and capture is not None:
-                await kb.send_text(f"cat {req.path}")
-                await kb.send_keystroke("Enter")
-                # Give the terminal a moment to render.
-                await asyncio.sleep(1.6)
+                from terminaleyes.commandcenter import paste_protocol as pp
+                content_bytes = req.content.encode("utf-8")
+                local_sha = pp.file_sha256(content_bytes)
+                local_chunks = pp.chunk_hashes(content_bytes)
+                nchunks = pp.n_chunks(len(content_bytes))
+                MAX_REPAIR_ROUNDS = 3
 
-                from datetime import datetime
-                import cv2
-                frame = await capture.capture_frame()
+                async def _ocr_now(label: str) -> tuple[str, "Path"]:
+                    """Capture, save under manual/, OCR, return (text, path)."""
+                    from datetime import datetime
+                    import cv2
+                    frame = await capture.capture_frame()
+                    out_dir = store.watch_dir / "manual"
+                    try:
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        pass
+                    seq = int(datetime.now().timestamp() * 1000) % 10_000
+                    ts = datetime.now().strftime("%H%M%S")
+                    fpath = out_dir / f"{seq:04d}_{ts}_{label}.png"
+                    try:
+                        cv2.imwrite(str(fpath), frame.image)
+                    except Exception as e:
+                        logger.warning("imwrite failed: %s", e)
+                    text = ""
+                    try:
+                        import pytesseract
+                        text = pytesseract.image_to_string(frame.image)
+                    except Exception as e:
+                        logger.warning("OCR failed: %s", e)
+                    return text, fpath
 
-                out_dir = store.watch_dir / "manual"
-                try:
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                except OSError:
-                    pass
-                seq = int(datetime.now().timestamp() * 1000) % 10_000
-                ts = datetime.now().strftime("%H%M%S")
-                vpath = out_dir / f"{seq:04d}_{ts}_paste_verify.png"
-                try:
-                    cv2.imwrite(str(vpath), frame.image)
-                except Exception as e:
-                    logger.warning("verify frame imwrite failed: %s", e)
+                async def _read_host_sha() -> tuple[str | None, "Path"]:
+                    """Type the SHA-print command; OCR-retry up to 3
+                    times since the hash line is small + structured
+                    and an OCR miss is recoverable by reprinting."""
+                    last_path = None
+                    for ocr_try in range(3):
+                        await kb.send_text(pp.cmd_sha_print(req.path))
+                        await kb.send_keystroke("Enter")
+                        await asyncio.sleep(1.4)
+                        text, last_path = await _ocr_now(
+                            f"paste_sha_r{ocr_try}",
+                        )
+                        h = pp.parse_sha_from_ocr(text)
+                        if h is not None:
+                            return h, last_path
+                        logger.info(
+                            "SHA OCR retry %d/3 — no parse", ocr_try + 1,
+                        )
+                    return None, last_path
 
-                ocr_text = ""
-                try:
-                    import pytesseract
-                    ocr_text = pytesseract.image_to_string(frame.image)
-                except Exception as e:
-                    logger.warning("OCR failed: %s", e)
+                async def _read_host_chunks() -> tuple[dict[int, str], "Path"]:
+                    last_path = None
+                    for ocr_try in range(3):
+                        await kb.send_text(
+                            pp.cmd_chunks_print(req.path, nchunks),
+                        )
+                        await kb.send_keystroke("Enter")
+                        # Give the loop time — each iteration does a
+                        # dd + openssl. Crude estimate: ~80 ms per
+                        # chunk, plus a startup tax.
+                        await asyncio.sleep(0.6 + 0.08 * nchunks)
+                        text, last_path = await _ocr_now(
+                            f"paste_chunks_r{ocr_try}",
+                        )
+                        hashes = pp.parse_chunks_from_ocr(text)
+                        if hashes:
+                            return hashes, last_path
+                        logger.info(
+                            "chunks OCR retry %d/3 — no parse",
+                            ocr_try + 1,
+                        )
+                    return {}, last_path
 
-                # Normalise: rstrip each line, drop blanks, collapse
-                # leading/trailing whitespace. OCR rarely preserves
-                # exact whitespace.
-                def _norm(s: str) -> str:
-                    out = "\n".join(
-                        ln.rstrip() for ln in s.replace("\r", "").split("\n")
-                        if ln.strip()
+                rounds_log: list[dict] = []
+                final_frame: Path | None = None
+                matched = False
+
+                def _emit(msg: str, level: str = "INFO") -> None:
+                    """Publish progress to the LogBus so the SSE
+                    stream shows it in the operator's log pane in
+                    real time, not just when the endpoint returns."""
+                    try:
+                        from terminaleyes.commandcenter.log_bus import (
+                            LogEvent,
+                        )
+                        import time as _time
+                        bus.publish(LogEvent(
+                            ts=_time.time(), level=level,
+                            source="paste-file", msg=msg, run_id=None,
+                        ))
+                    except Exception:
+                        pass
+
+                _emit(
+                    f"verify start: {nchunks} chunks @ "
+                    f"{pp.CHUNK_SIZE}B, local SHA={local_sha[:12]}…",
+                )
+
+                for repair_round in range(MAX_REPAIR_ROUNDS + 1):
+                    _emit(f"round {repair_round}: reading host SHA…")
+                    host_sha, sha_frame = await _read_host_sha()
+                    if sha_frame is not None:
+                        final_frame = sha_frame
+                    round_info: dict = {
+                        "round": repair_round,
+                        "host_sha": host_sha,
+                        "local_sha": local_sha,
+                    }
+                    if host_sha == local_sha:
+                        _emit(
+                            f"round {repair_round}: ✓ SHA match "
+                            f"({host_sha[:12]}…)",
+                        )
+                        round_info["match"] = True
+                        rounds_log.append(round_info)
+                        matched = True
+                        break
+                    round_info["match"] = False
+                    rounds_log.append(round_info)
+                    _emit(
+                        f"round {repair_round}: SHA mismatch "
+                        f"(host={(host_sha or '?')[:12]}…)",
+                        level="WARNING",
                     )
-                    return out.strip()
+                    if repair_round >= MAX_REPAIR_ROUNDS:
+                        break
 
-                import difflib
-                sent_norm = _norm(req.content)
-                ocr_norm = _norm(ocr_text)
-                ratio = difflib.SequenceMatcher(
-                    None, sent_norm, ocr_norm,
-                ).ratio() if sent_norm else 0.0
+                    # Mismatch — identify bad chunks and overwrite.
+                    _emit(
+                        f"round {repair_round}: reading chunk hashes…",
+                    )
+                    host_chunks, chunks_frame = await _read_host_chunks()
+                    if chunks_frame is not None:
+                        final_frame = chunks_frame
+                    diff = pp.diff_chunks(local_chunks, host_chunks)
+                    # Defensive: chunks the OCR couldn't read at all
+                    # are treated as bad too — they may be wrong.
+                    bad = sorted(set(diff.bad_indices + diff.unknown_indices))
+                    round_info["bad_indices"] = bad
+                    round_info["unknown_indices"] = diff.unknown_indices
+                    if not bad:
+                        # SHA disagreed but per-chunk hashes all
+                        # agree — usually OCR couldn't parse the
+                        # chunk block at all. Bail rather than spin.
+                        round_info["abort_reason"] = (
+                            "no parseable bad chunks; "
+                            "OCR likely failed on chunks block"
+                        )
+                        _emit(
+                            f"round {repair_round}: aborting — "
+                            f"chunk-hash OCR yielded nothing parseable",
+                            level="ERROR",
+                        )
+                        break
 
-                # Compact diff: first ~10 changed regions.
-                diff_chunks = list(difflib.ndiff(
-                    sent_norm.splitlines()[:80],
-                    ocr_norm.splitlines()[:80],
-                ))[:200]
+                    _emit(
+                        f"round {repair_round}: repairing "
+                        f"{len(bad)}/{nchunks} chunks "
+                        f"({len(diff.unknown_indices)} unknown)",
+                    )
+                    for idx in bad:
+                        start = idx * pp.CHUNK_SIZE
+                        payload = content_bytes[start : start + pp.CHUNK_SIZE]
+                        if not payload:
+                            continue
+                        cmd = pp.cmd_overwrite_chunk(
+                            req.path, idx, payload,
+                        )
+                        await kb.send_text(cmd)
+                        await kb.send_keystroke("Enter")
+                        # Small settle — the dd is bounded by chunk
+                        # size, and the host shouldn't queue these.
+                        await asyncio.sleep(0.25)
 
                 result["verify"] = {
-                    "similarity": round(ratio, 3),
-                    "match": ratio >= 0.85,
-                    "sent_norm_chars": len(sent_norm),
-                    "ocr_norm_chars": len(ocr_norm),
-                    "ocr_sample": ocr_text[:1000],
-                    "diff_sample": "\n".join(diff_chunks),
-                    "frame": str(vpath.name),
+                    "match": matched,
+                    "local_sha": local_sha,
+                    "rounds": rounds_log,
+                    "n_chunks": nchunks,
+                    "chunk_size": pp.CHUNK_SIZE,
+                    "frame": (final_frame.name if final_frame else None),
                 }
 
             return JSONResponse(result)
