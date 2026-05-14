@@ -565,11 +565,17 @@ $frame.addEventListener("click", async (e) => {
     "INFO",
     `mouse click_at (${x_pct.toFixed(3)}, ${y_pct.toFixed(3)})`,
   );
-  await postMouse(
+  const result = await postMouse(
     "/api/mouse/click_at",
     { x_pct, y_pct, button: "left" },
     "homing cursor…",
   );
+  // The host now has focus on whatever the user clicked; auto-focus
+  // the passthrough field so they can immediately start typing.
+  if (result && result.ok && $passInput) {
+    $passInput.value = "";
+    $passInput.focus();
+  }
 });
 
 // Block the default context menu when right-clicking on the
