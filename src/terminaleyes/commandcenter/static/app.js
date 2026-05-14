@@ -651,22 +651,23 @@ async function _kbDrain() {
   }
 }
 
-// Map browser key names to Pi keystroke names. Pi-side accepts the
-// lowercase string for special keys (enter, backspace, etc.).
+// Map browser key names to Pi keystroke names. Pi's HID-codes map is
+// case-sensitive PascalCase ("Enter", not "enter") for special keys —
+// see raspi/hid_codes.py KEY_CODES.
 const _PASS_SPECIAL = {
-  "Enter": "enter",
-  "Backspace": "backspace",
-  "Tab": "tab",
-  "Escape": "escape",
-  "ArrowUp": "up",
-  "ArrowDown": "down",
-  "ArrowLeft": "left",
-  "ArrowRight": "right",
-  "Home": "home",
-  "End": "end",
-  "PageUp": "pageup",
-  "PageDown": "pagedown",
-  "Delete": "delete",
+  "Enter": "Enter",
+  "Backspace": "Backspace",
+  "Tab": "Tab",
+  "Escape": "Escape",
+  "ArrowUp": "Up",
+  "ArrowDown": "Down",
+  "ArrowLeft": "Left",
+  "ArrowRight": "Right",
+  "Home": "Home",
+  "End": "End",
+  "PageUp": "PageUp",
+  "PageDown": "PageDown",
+  "Delete": "Delete",
 };
 
 function _passthroughHandleKey(e) {
@@ -695,13 +696,13 @@ function _passthroughHandleKey(e) {
       body: { key: special, modifiers: mods },
     });
     // Mirror the action locally for visual feedback.
-    if (special === "backspace") {
+    if (special === "Backspace") {
       $passInput.value = $passInput.value.slice(0, -1);
-    } else if (special === "enter") {
+    } else if (special === "Enter") {
       $passInput.value = "";
-    } else if (special === "tab") {
+    } else if (special === "Tab") {
       $passInput.value += "\t";
-    } else if (special === "escape") {
+    } else if (special === "Escape") {
       $passInput.value = "";
     }
     return;
@@ -744,21 +745,21 @@ if ($passInput) {
 if ($btnPassEnter)
   $btnPassEnter.addEventListener("click", () => {
     _kbEnqueue({
-      path: "/api/keyboard/key", body: { key: "enter", modifiers: [] },
+      path: "/api/keyboard/key", body: { key: "Enter", modifiers: [] },
     });
     if ($passInput) $passInput.value = "";
   });
 if ($btnPassTab)
   $btnPassTab.addEventListener("click", () => {
     _kbEnqueue({
-      path: "/api/keyboard/key", body: { key: "tab", modifiers: [] },
+      path: "/api/keyboard/key", body: { key: "Tab", modifiers: [] },
     });
     if ($passInput) $passInput.value += "\t";
   });
 if ($btnPassEsc)
   $btnPassEsc.addEventListener("click", () => {
     _kbEnqueue({
-      path: "/api/keyboard/key", body: { key: "escape", modifiers: [] },
+      path: "/api/keyboard/key", body: { key: "Escape", modifiers: [] },
     });
   });
 if ($btnPassClear)
