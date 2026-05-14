@@ -565,14 +565,16 @@ $frame.addEventListener("click", async (e) => {
     "INFO",
     `mouse click_at (${x_pct.toFixed(3)}, ${y_pct.toFixed(3)})`,
   );
-  const result = await postMouse(
+  await postMouse(
     "/api/mouse/click_at",
     { x_pct, y_pct, button: "left" },
     "homing cursor…",
   );
-  // The host now has focus on whatever the user clicked; auto-focus
-  // the passthrough field so they can immediately start typing.
-  if (result && result.ok && $passInput) {
+  // Always auto-focus the passthrough so typing flows to the host
+  // regardless of whether the homer ultimately reported success.
+  // (Without this, a single "cursor_not_found" outcome leaves the
+  // operator stuck wondering why their keypresses do nothing.)
+  if ($passInput) {
     $passInput.value = "";
     $passInput.focus();
   }
@@ -726,6 +728,30 @@ function _passthroughHandleKey(e) {
     $passInput.value += e.key;
   }
 }
+
+// Global key capture: when the user hasn't focused another text input
+// (chat, vault, exec body), forward keystrokes to the host. Makes the
+// "click on icon → start typing" flow work without the operator
+// remembering to click the passthrough field.
+const _GLOBAL_PASSTHRU_SKIP_IDS = new Set([
+  "chat-input", "opt-vault", "exec-script-body",
+]);
+function _shouldGlobalCapture() {
+  const a = document.activeElement;
+  if (!a) return true;
+  if (a === $passInput) return false;     // field handles it itself
+  if (a.id && _GLOBAL_PASSTHRU_SKIP_IDS.has(a.id)) return false;
+  const tag = (a.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") {
+    return false;
+  }
+  if (a.isContentEditable) return false;
+  return true;
+}
+document.addEventListener("keydown", (e) => {
+  if (!_shouldGlobalCapture()) return;
+  _passthroughHandleKey(e);
+}, true);
 
 if ($passInput) {
   $passInput.addEventListener("keydown", _passthroughHandleKey);
