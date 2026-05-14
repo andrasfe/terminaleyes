@@ -300,6 +300,7 @@ class VisualServoHomer:
             history=history, target_desc=target_desc,
             verify_navigation=True, last_proof=last_proof,
             confirm_frames=CONFIRM_FRAMES,
+            click_tol_pct=CLICK_TOL_PCT,
         )
 
     async def _servo_loop(
@@ -314,6 +315,7 @@ class VisualServoHomer:
         verify_navigation: bool,
         last_proof: str | None,
         confirm_frames: int = CONFIRM_FRAMES,
+        click_tol_pct: float = CLICK_TOL_PCT,
     ) -> ClickOutcome:
         """Run the visual-servo loop until cursor lands on target_aim.
 
@@ -332,13 +334,13 @@ class VisualServoHomer:
             dy_pct = target_aim[1] - cursor_img[1]
             residual = math.hypot(dx_pct, dy_pct)
 
-            if residual <= CLICK_TOL_PCT:
+            if residual <= click_tol_pct:
                 confirm_count += 1
                 print(
                     f"  [{step:02d}] cursor=({cursor_img[0]:.2%},"
                     f"{cursor_img[1]:.2%}) aim=({target_aim[0]:.2%},"
                     f"{target_aim[1]:.2%}) residual={residual:.2%} ≤ "
-                    f"{CLICK_TOL_PCT:.0%} — confirm {confirm_count}/{confirm_frames}"
+                    f"{click_tol_pct:.1%} — confirm {confirm_count}/{confirm_frames}"
                 )
                 if confirm_count >= confirm_frames:
                     if not verify_navigation:
@@ -640,12 +642,18 @@ class VisualServoHomer:
         else:
             target_aim = target_img
 
+        # Manual clicks demand higher accuracy than the controller's
+        # "click on this OCR'd word" flow: an operator picks an exact
+        # pixel and expects the cursor to land *there*, not 20px off.
+        # Cursor-detection precision (~5–8 px on a 1080p webcam) is
+        # the real floor; we set the gate just above that.
         return await self._servo_loop(
             target_aim=target_aim, target_img=target_img,
             cursor_img=cursor_img, button=button, run_dir=run_dir,
             history=history, target_desc="<manual>",
             verify_navigation=False, last_proof=None,
             confirm_frames=1,
+            click_tol_pct=0.006,
         )
 
     # ────────────────────── target localization ──────────────────────
