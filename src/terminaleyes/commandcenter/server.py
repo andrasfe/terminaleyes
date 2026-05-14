@@ -458,6 +458,24 @@ def create_app(
             outcome = await homer.home_to_pixel(
                 req.x_pct, req.y_pct, button=req.button,
             )
+            # Drop a post-click frame at the watch-dir top level so
+            # FrameStore (one-level-deep scan) picks it up and the UI
+            # long-poll refreshes. The homer's own proof frames live
+            # under <ctx.output_dir>/homer/<ts>/ which FrameStore
+            # doesn't recurse into.
+            try:
+                from datetime import datetime
+                import cv2
+                await asyncio.sleep(0.35)
+                frame = await capture.capture_frame()
+                out_dir = store.watch_dir / "manual"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                seq = int(datetime.now().timestamp() * 1000) % 10_000
+                ts = datetime.now().strftime("%H%M%S")
+                path = out_dir / f"{seq:04d}_{ts}_click_at.png"
+                cv2.imwrite(str(path), frame.image)
+            except Exception as e:
+                logger.warning("post-click snapshot failed: %s", e)
             return JSONResponse({
                 "ok": bool(outcome.clicked),
                 "reason": outcome.reason,
