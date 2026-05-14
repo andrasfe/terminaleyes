@@ -15,12 +15,24 @@
       <div class="frame-wrap">
         <img id="frame" alt="latest frame" />
         <div id="frame-empty" class="empty">No frames yet — send an instruction.</div>
+        <div id="click-marker" class="click-marker hidden"></div>
       </div>
       <div class="frame-controls">
         <button id="btn-prev" title="Older">◀</button>
         <span id="frame-meta">—</span>
         <button id="btn-next" title="Newer">▶</button>
         <button id="btn-live" class="live" title="Jump to latest">⏵ Live</button>
+      </div>
+      <div class="frame-mouse-controls">
+        <label class="opt mouse-toggle" title="Click on the screenshot drives the host cursor">
+          <input type="checkbox" id="opt-click-to-move" checked /> click-to-move
+        </label>
+        <button id="btn-mouse-left" type="button" class="mouse-btn"
+                title="Left-click on host">⌧ Left</button>
+        <button id="btn-mouse-middle" type="button" class="mouse-btn"
+                title="Middle-click on host">⌧ Middle</button>
+        <button id="btn-mouse-right" type="button" class="mouse-btn"
+                title="Right-click on host">⌧ Right</button>
       </div>
       <div class="frame-quick-actions">
         <button id="btn-lock" type="button" class="quick"

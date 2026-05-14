@@ -28,6 +28,12 @@ const $execModalRun = document.getElementById("exec-modal-run");
 const $logView = document.getElementById("log-view");
 const $btnClearLogs = document.getElementById("btn-clear-logs");
 
+const $clickMarker = document.getElementById("click-marker");
+const $optClickToMove = document.getElementById("opt-click-to-move");
+const $btnMouseLeft = document.getElementById("btn-mouse-left");
+const $btnMouseMiddle = document.getElementById("btn-mouse-middle");
+const $btnMouseRight = document.getElementById("btn-mouse-right");
+
 // ── state ──────────────────────────────────────────────────────
 const state = {
   liveMode: true,
@@ -460,6 +466,102 @@ $logView.addEventListener("scroll", () => {
 $btnClearLogs.addEventListener("click", () => {
   $logView.innerHTML = "";
 });
+
+// ── manual mouse control ───────────────────────────────────────
+// The screenshot is laid out with object-fit:contain inside its
+// wrapper, so the rendered image fills only part of the element box
+// in one axis. To map a click to a screen percentage we need the
+// rendered image rect, not the box rect.
+function imageRect() {
+  const w = $frame.naturalWidth;
+  const h = $frame.naturalHeight;
+  const box = $frame.getBoundingClientRect();
+  if (!w || !h || !box.width || !box.height) return null;
+  const scale = Math.min(box.width / w, box.height / h);
+  const renderedW = w * scale;
+  const renderedH = h * scale;
+  const offsetX = (box.width - renderedW) / 2;
+  const offsetY = (box.height - renderedH) / 2;
+  return {
+    left: box.left + offsetX,
+    top: box.top + offsetY,
+    width: renderedW,
+    height: renderedH,
+  };
+}
+
+function showClickMarker(clientX, clientY) {
+  const wrap = $frame.parentElement.getBoundingClientRect();
+  $clickMarker.style.left = (clientX - wrap.left) + "px";
+  $clickMarker.style.top = (clientY - wrap.top) + "px";
+  $clickMarker.classList.remove("hidden");
+  // Restart animation
+  $clickMarker.style.animation = "none";
+  // Force reflow to restart CSS animation.
+  void $clickMarker.offsetWidth;
+  $clickMarker.style.animation = "";
+  setTimeout(() => $clickMarker.classList.add("hidden"), 700);
+}
+
+async function postMouse(path, body) {
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      let t = "";
+      try { t = await r.text(); } catch (_) {}
+      appendSystemLog("ERROR", `${path} → ${r.status} ${t}`);
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    appendSystemLog("ERROR", `${path} failed: ${e}`);
+    return null;
+  }
+}
+
+$frame.addEventListener("click", async (e) => {
+  if (!$optClickToMove || !$optClickToMove.checked) return;
+  if ($frame.classList.contains("empty")) return;
+  const rect = imageRect();
+  if (!rect) return;
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  if (x < 0 || y < 0 || x > rect.width || y > rect.height) return;
+  const x_pct = Math.max(0, Math.min(1, x / rect.width));
+  const y_pct = Math.max(0, Math.min(1, y / rect.height));
+  showClickMarker(e.clientX, e.clientY);
+  appendSystemLog(
+    "INFO",
+    `mouse click_at (${x_pct.toFixed(3)}, ${y_pct.toFixed(3)})`,
+  );
+  await postMouse("/api/mouse/click_at", {
+    x_pct, y_pct, button: "left",
+  });
+});
+
+// Block the default context menu when right-clicking on the
+// screenshot — operators usually want to fire a remote right-click
+// instead of opening the browser menu. We expose right-click via
+// the Right button; suppress the menu so it's not a distraction.
+$frame.addEventListener("contextmenu", (e) => {
+  if ($optClickToMove && $optClickToMove.checked) e.preventDefault();
+});
+
+async function fireButton(button) {
+  appendSystemLog("INFO", `mouse click button=${button}`);
+  await postMouse("/api/mouse/click", { button });
+}
+
+if ($btnMouseLeft)
+  $btnMouseLeft.addEventListener("click", () => fireButton("left"));
+if ($btnMouseMiddle)
+  $btnMouseMiddle.addEventListener("click", () => fireButton("middle"));
+if ($btnMouseRight)
+  $btnMouseRight.addEventListener("click", () => fireButton("right"));
 
 function connectGlobalLogs() {
   if (state.globalSrc) state.globalSrc.close();

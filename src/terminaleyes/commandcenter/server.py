@@ -50,6 +50,24 @@ class RunRequest(BaseModel):
     ml_adapter: str | None = None   # required when planner == "ml"
 
 
+class MouseClickAtRequest(BaseModel):
+    x_pct: float = Field(ge=0.0, le=1.0)
+    y_pct: float = Field(ge=0.0, le=1.0)
+    button: str = Field(default="left", pattern="^(left|right|middle)$")
+    # Optional overrides; defaults come from settings.commander.
+    screen_width: int | None = Field(default=None, gt=0)
+    screen_height: int | None = Field(default=None, gt=0)
+
+
+class MouseClickRequest(BaseModel):
+    button: str = Field(default="left", pattern="^(left|right|middle)$")
+
+
+class MouseMoveRequest(BaseModel):
+    dx: int = Field(ge=-127, le=127)
+    dy: int = Field(ge=-127, le=127)
+
+
 def _content_type_for(path: str) -> str:
     p = path.lower()
     if p.endswith(".png"):
@@ -76,6 +94,7 @@ def create_app(
     *,
     frame_store: FrameStore | None = None,
     bus: LogBus | None = None,
+    settings: Any = None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -293,15 +312,94 @@ def create_app(
             },
         )
 
+    # ── manual mouse control ─────────────────────────────────────
+    # Lets the UI drive the host cursor directly: click a point on the
+    # screenshot or fire a button. Refuses while a run is in flight
+    # because the runner owns the mouse for that window.
+    def _commander_cfg():
+        if settings is None:
+            class _Default:
+                pi_base_url = "http://10.0.0.2:8080"
+                transport = "bt"
+                screen_width = 1920
+                screen_height = 1080
+            return _Default()
+        return settings.commander
+
+    async def _with_mouse(action):
+        if runner.is_busy():
+            raise HTTPException(409, "a run is currently in progress")
+        from terminaleyes.mouse.http_backend import HttpMouseOutput
+        cfg = _commander_cfg()
+        mouse = HttpMouseOutput(
+            base_url=cfg.pi_base_url,
+            timeout=10.0,
+            transport=cfg.transport,
+        )
+        try:
+            await mouse.connect()
+        except Exception as e:
+            raise HTTPException(502, f"mouse connect failed: {e}")
+        try:
+            return await action(mouse)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"mouse action failed: {e}")
+        finally:
+            try:
+                await mouse.disconnect()
+            except Exception:
+                pass
+
+    @app.post("/api/mouse/click_at")
+    async def mouse_click_at(req: MouseClickAtRequest) -> JSONResponse:
+        cfg = _commander_cfg()
+        sw = req.screen_width or cfg.screen_width
+        sh = req.screen_height or cfg.screen_height
+
+        async def go(mouse):
+            await mouse.click_at(
+                req.x_pct, req.y_pct,
+                button=req.button,
+                screen_width=sw, screen_height=sh,
+            )
+            return JSONResponse({
+                "ok": True, "x_pct": req.x_pct, "y_pct": req.y_pct,
+                "button": req.button,
+                "screen_width": sw, "screen_height": sh,
+            })
+
+        return await _with_mouse(go)
+
+    @app.post("/api/mouse/click")
+    async def mouse_click(req: MouseClickRequest) -> JSONResponse:
+        async def go(mouse):
+            await mouse.click(req.button)
+            return JSONResponse({"ok": True, "button": req.button})
+
+        return await _with_mouse(go)
+
+    @app.post("/api/mouse/move")
+    async def mouse_move(req: MouseMoveRequest) -> JSONResponse:
+        async def go(mouse):
+            await mouse.move(req.dx, req.dy)
+            return JSONResponse({"ok": True, "dx": req.dx, "dy": req.dy})
+
+        return await _with_mouse(go)
+
     @app.get("/api/state")
     def state() -> JSONResponse:
         latest = store.latest()
         active = runner.active()
+        cfg = _commander_cfg()
         return JSONResponse({
             "busy": runner.is_busy(),
             "latest_id": latest.id if latest else None,
             "frame_count": store.count(),
             "active_run": active.public() if active else None,
+            "screen_width": cfg.screen_width,
+            "screen_height": cfg.screen_height,
         })
 
     return app
