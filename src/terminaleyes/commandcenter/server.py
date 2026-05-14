@@ -421,26 +421,63 @@ def create_app(
 
     @app.post("/api/mouse/click_at")
     async def mouse_click_at(req: MouseClickAtRequest) -> JSONResponse:
-        cfg = _commander_cfg()
-        sw = req.screen_width or cfg.screen_width
-        sh = req.screen_height or cfg.screen_height
+        """Closed-loop visual-servo click at a webcam-image pixel.
 
-        async def go(mouse):
-            await mouse.click_at(
-                req.x_pct, req.y_pct,
-                button=req.button,
-                screen_width=sw, screen_height=sh,
-            )
-            return JSONResponse({
-                "ok": True, "x_pct": req.x_pct, "y_pct": req.y_pct,
-                "button": req.button,
-                "screen_width": sw, "screen_height": sh,
-            })
+        Routes through ``VisualServoHomer.home_to_pixel`` so the cursor
+        is actually homed to the supplied pixel using the same CV that
+        the controller uses. Open-loop ``MouseOutput.click_at`` was
+        wrong on macOS because BT HID relative moves are subject to
+        non-linear pointer acceleration.
+        """
+        if runner.is_busy():
+            raise HTTPException(409, "a run is currently in progress")
+        # Late import: pulls heavy CV deps only when actually used.
+        from terminaleyes.agents.login import _SessionAdapter
+        from terminaleyes.commander.visual_servo_homer import (
+            VisualServoHomer,
+        )
+
+        ctx = keyboard = mouse = capture = None
+        try:
+            ctx, keyboard, mouse, capture = await context_factory()
+        except Exception as e:
+            if capture is not None:
+                try: await capture.close()
+                except Exception: pass
+            if keyboard is not None:
+                try: await keyboard.disconnect()
+                except Exception: pass
+            if mouse is not None:
+                try: await mouse.disconnect()
+                except Exception: pass
+            raise HTTPException(502, f"context_factory failed: {e}")
 
         try:
-            return await _with_mouse(go)
+            adapter = _SessionAdapter(ctx)
+            homer = VisualServoHomer(session=adapter)
+            outcome = await homer.home_to_pixel(
+                req.x_pct, req.y_pct, button=req.button,
+            )
+            return JSONResponse({
+                "ok": bool(outcome.clicked),
+                "reason": outcome.reason,
+                "steps": outcome.steps,
+                "x_pct": req.x_pct, "y_pct": req.y_pct,
+                "button": req.button,
+            })
+        except Exception as e:
+            logger.exception("home_to_pixel failed")
+            raise HTTPException(502, f"home_to_pixel failed: {e}")
         finally:
-            _schedule_snapshot("manual_click_at")
+            if capture is not None:
+                try: await capture.close()
+                except Exception: pass
+            if keyboard is not None:
+                try: await keyboard.disconnect()
+                except Exception: pass
+            if mouse is not None:
+                try: await mouse.disconnect()
+                except Exception: pass
 
     @app.post("/api/mouse/click")
     async def mouse_click(req: MouseClickRequest) -> JSONResponse:
