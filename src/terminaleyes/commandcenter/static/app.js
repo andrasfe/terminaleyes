@@ -594,6 +594,172 @@ if ($btnMouseMiddle)
 if ($btnMouseRight)
   $btnMouseRight.addEventListener("click", () => fireButton("right"));
 
+// ── keyboard passthrough ───────────────────────────────────────
+// Each keystroke in the passthrough field is forwarded to the host.
+// Requests are serialized so typing fast doesn't reorder them: HTTP
+// + Pi+BT HID don't guarantee in-order delivery across concurrent
+// requests, but a single in-flight FIFO does.
+const $passInput = document.getElementById("passthrough-input");
+const $btnPassEnter = document.getElementById("btn-passthrough-enter");
+const $btnPassTab = document.getElementById("btn-passthrough-tab");
+const $btnPassEsc = document.getElementById("btn-passthrough-esc");
+const $btnPassClear = document.getElementById("btn-passthrough-clear");
+
+const _kbQueue = [];
+let _kbDraining = false;
+
+function _kbEnqueue(job) {
+  _kbQueue.push(job);
+  _kbDrain();
+}
+
+async function _kbDrain() {
+  if (_kbDraining) return;
+  _kbDraining = true;
+  if ($passInput) $passInput.classList.add("busy");
+  try {
+    while (_kbQueue.length > 0) {
+      const job = _kbQueue.shift();
+      try {
+        const r = await fetch(job.path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(job.body),
+        });
+        if (!r.ok) {
+          let t = "";
+          try { t = await r.text(); } catch (_) {}
+          appendSystemLog("ERROR", `${job.path} → ${r.status} ${t}`);
+          _kbQueue.length = 0;       // give up on this typing burst
+          break;
+        }
+      } catch (e) {
+        appendSystemLog("ERROR", `${job.path} failed: ${e}`);
+        _kbQueue.length = 0;
+        break;
+      }
+    }
+  } finally {
+    _kbDraining = false;
+    if ($passInput) $passInput.classList.remove("busy");
+  }
+}
+
+// Map browser key names to Pi keystroke names. Pi-side accepts the
+// lowercase string for special keys (enter, backspace, etc.).
+const _PASS_SPECIAL = {
+  "Enter": "enter",
+  "Backspace": "backspace",
+  "Tab": "tab",
+  "Escape": "escape",
+  "ArrowUp": "up",
+  "ArrowDown": "down",
+  "ArrowLeft": "left",
+  "ArrowRight": "right",
+  "Home": "home",
+  "End": "end",
+  "PageUp": "pageup",
+  "PageDown": "pagedown",
+  "Delete": "delete",
+};
+
+function _passthroughHandleKey(e) {
+  if (!$passInput) return;
+  // Let the browser handle navigation modifier-only events.
+  if (e.key === "Shift" || e.key === "Control" || e.key === "Alt"
+      || e.key === "Meta") {
+    return;
+  }
+  e.preventDefault();
+
+  const hasCtrl = e.ctrlKey;
+  const hasMeta = e.metaKey;
+  const hasAlt = e.altKey;
+  const hasShift = e.shiftKey;
+  const mods = [];
+  if (hasCtrl) mods.push("ctrl");
+  if (hasMeta) mods.push("cmd");
+  if (hasAlt) mods.push("alt");
+  if (hasShift) mods.push("shift");
+
+  const special = _PASS_SPECIAL[e.key];
+  if (special) {
+    _kbEnqueue({
+      path: "/api/keyboard/key",
+      body: { key: special, modifiers: mods },
+    });
+    // Mirror the action locally for visual feedback.
+    if (special === "backspace") {
+      $passInput.value = $passInput.value.slice(0, -1);
+    } else if (special === "enter") {
+      $passInput.value = "";
+    } else if (special === "tab") {
+      $passInput.value += "\t";
+    } else if (special === "escape") {
+      $passInput.value = "";
+    }
+    return;
+  }
+
+  // Single printable character.
+  if (e.key.length === 1) {
+    // If modifier present (other than shift), send as combo.
+    const nonShiftMods = mods.filter(m => m !== "shift");
+    if (nonShiftMods.length > 0) {
+      _kbEnqueue({
+        path: "/api/keyboard/key",
+        body: { key: e.key.toLowerCase(), modifiers: mods },
+      });
+      return;
+    }
+    _kbEnqueue({
+      path: "/api/keyboard/text",
+      body: { text: e.key },
+    });
+    $passInput.value += e.key;
+  }
+}
+
+if ($passInput) {
+  $passInput.addEventListener("keydown", _passthroughHandleKey);
+  // Block paste/cut/contextmenu autofill — only keystrokes go through.
+  $passInput.addEventListener("paste", (e) => {
+    e.preventDefault();
+    const text = (e.clipboardData || window.clipboardData).getData("text");
+    if (!text) return;
+    _kbEnqueue({
+      path: "/api/keyboard/text",
+      body: { text },
+    });
+    $passInput.value += text;
+  });
+}
+
+if ($btnPassEnter)
+  $btnPassEnter.addEventListener("click", () => {
+    _kbEnqueue({
+      path: "/api/keyboard/key", body: { key: "enter", modifiers: [] },
+    });
+    if ($passInput) $passInput.value = "";
+  });
+if ($btnPassTab)
+  $btnPassTab.addEventListener("click", () => {
+    _kbEnqueue({
+      path: "/api/keyboard/key", body: { key: "tab", modifiers: [] },
+    });
+    if ($passInput) $passInput.value += "\t";
+  });
+if ($btnPassEsc)
+  $btnPassEsc.addEventListener("click", () => {
+    _kbEnqueue({
+      path: "/api/keyboard/key", body: { key: "escape", modifiers: [] },
+    });
+  });
+if ($btnPassClear)
+  $btnPassClear.addEventListener("click", () => {
+    if ($passInput) $passInput.value = "";
+  });
+
 function connectGlobalLogs() {
   if (state.globalSrc) state.globalSrc.close();
   const src = new EventSource("/api/logs?tail=200");

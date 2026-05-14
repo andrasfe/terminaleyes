@@ -147,6 +147,47 @@ main#app {
   color: var(--muted);
   margin-right: auto;
 }
+
+.frame-keyboard-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 6px;
+  border-top: 1px solid var(--border);
+}
+.frame-keyboard-controls .passthrough {
+  flex: 1;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-family: var(--mono);
+  font-size: 13px;
+  min-height: 32px;
+}
+.frame-keyboard-controls .passthrough:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.frame-keyboard-controls .passthrough.busy {
+  opacity: 0.6;
+}
+.frame-keyboard-controls .kb-btn {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  min-height: 32px;
+  font-family: var(--mono);
+}
+.frame-keyboard-controls .kb-btn:active { background: #2a2f37; }
+.frame-keyboard-controls .kb-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .empty {
   color: var(--muted);
   font-size: 13px;

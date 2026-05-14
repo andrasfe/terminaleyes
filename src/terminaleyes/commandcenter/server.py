@@ -68,6 +68,16 @@ class MouseMoveRequest(BaseModel):
     dy: int = Field(ge=-127, le=127)
 
 
+class KeyboardTextRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4096)
+    warmup: bool = False
+
+
+class KeyboardKeyRequest(BaseModel):
+    key: str = Field(min_length=1, max_length=32)
+    modifiers: list[str] = Field(default_factory=list)
+
+
 def _content_type_for(path: str) -> str:
     p = path.lower()
     if p.endswith(".png"):
@@ -518,6 +528,52 @@ def create_app(
             return await _with_mouse(go)
         finally:
             _schedule_snapshot("manual_move")
+
+    # ── manual keyboard control ──────────────────────────────────
+    async def _with_keyboard(action):
+        if runner.is_busy():
+            raise HTTPException(409, "a run is currently in progress")
+        from terminaleyes.keyboard.http_backend import HttpKeyboardOutput
+        cfg = _commander_cfg()
+        kb = HttpKeyboardOutput(
+            base_url=cfg.pi_base_url,
+            timeout=10.0,
+            transport=cfg.transport,
+        )
+        try:
+            await kb.connect()
+        except Exception as e:
+            raise HTTPException(502, f"keyboard connect failed: {e}")
+        try:
+            return await action(kb)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"keyboard action failed: {e}")
+        finally:
+            try:
+                await kb.disconnect()
+            except Exception:
+                pass
+
+    @app.post("/api/keyboard/text")
+    async def keyboard_text(req: KeyboardTextRequest) -> JSONResponse:
+        async def go(kb):
+            await kb.send_text(req.text, warmup=req.warmup)
+            return JSONResponse({"ok": True, "length": len(req.text)})
+        return await _with_keyboard(go)
+
+    @app.post("/api/keyboard/key")
+    async def keyboard_key(req: KeyboardKeyRequest) -> JSONResponse:
+        async def go(kb):
+            if req.modifiers:
+                await kb.send_key_combo(req.modifiers, req.key)
+            else:
+                await kb.send_keystroke(req.key)
+            return JSONResponse({
+                "ok": True, "key": req.key, "modifiers": req.modifiers,
+            })
+        return await _with_keyboard(go)
 
     @app.post("/api/snapshot")
     async def manual_snapshot() -> JSONResponse:
