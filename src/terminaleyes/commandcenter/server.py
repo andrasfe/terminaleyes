@@ -113,6 +113,10 @@ def create_app(
     app.state.bus = bus
     app.state.runner = runner
 
+    # Serializes manual-control webcam captures so a click and a
+    # background follow-up snapshot don't fight over the device.
+    _manual_capture_lock = asyncio.Lock()
+
     @app.on_event("startup")
     async def _on_startup() -> None:
         bus.bind_loop(asyncio.get_event_loop())
@@ -316,6 +320,66 @@ def create_app(
     # Lets the UI drive the host cursor directly: click a point on the
     # screenshot or fire a button. Refuses while a run is in flight
     # because the runner owns the mouse for that window.
+    async def _snapshot_after_manual_action(label: str) -> None:
+        """Grab one webcam frame and drop it in ``watch_dir/manual/``.
+
+        Without this, manual mouse actions never produce a fresh frame
+        in the watch dir, so the UI's long-poll sits on the stale
+        last-run screenshot and the operator can't see the cursor
+        actually moved. Capture is serialized; the webcam is opened
+        and closed per call so a real run can still claim the device.
+        """
+        if settings is None:
+            return
+        if runner.is_busy():
+            # Capture would race with the run's own webcam handle.
+            return
+        async with _manual_capture_lock:
+            from datetime import datetime
+            import cv2
+            from terminaleyes.capture.webcam import WebcamCapture
+            resolution = None
+            if (settings.capture.resolution_width
+                    and settings.capture.resolution_height):
+                resolution = (
+                    settings.capture.resolution_width,
+                    settings.capture.resolution_height,
+                )
+            cap = WebcamCapture(
+                device_index=settings.capture.device_index,
+                resolution=resolution,
+            )
+            try:
+                await cap.open()
+                # Let the cursor settle visually before grabbing.
+                await asyncio.sleep(0.25)
+                frame = await cap.capture_frame()
+            except Exception as e:
+                logger.warning("manual snapshot failed: %s", e)
+                try:
+                    await cap.close()
+                except Exception:
+                    pass
+                return
+            try:
+                await cap.close()
+            except Exception:
+                pass
+            out_dir = store.watch_dir / "manual"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return
+            seq = int(datetime.now().timestamp() * 1000) % 10_000
+            ts = datetime.now().strftime("%H%M%S")
+            path = out_dir / f"{seq:04d}_{ts}_{label}.png"
+            try:
+                ok = cv2.imwrite(str(path), frame.image)
+                if not ok:
+                    logger.warning("imwrite returned False for %s", path)
+            except Exception as e:
+                logger.warning("imwrite failed for %s: %s", path, e)
+
     def _commander_cfg():
         if settings is None:
             class _Default:
@@ -352,6 +416,9 @@ def create_app(
             except Exception:
                 pass
 
+    def _schedule_snapshot(label: str) -> None:
+        asyncio.create_task(_snapshot_after_manual_action(label))
+
     @app.post("/api/mouse/click_at")
     async def mouse_click_at(req: MouseClickAtRequest) -> JSONResponse:
         cfg = _commander_cfg()
@@ -370,7 +437,10 @@ def create_app(
                 "screen_width": sw, "screen_height": sh,
             })
 
-        return await _with_mouse(go)
+        try:
+            return await _with_mouse(go)
+        finally:
+            _schedule_snapshot("manual_click_at")
 
     @app.post("/api/mouse/click")
     async def mouse_click(req: MouseClickRequest) -> JSONResponse:
@@ -378,7 +448,10 @@ def create_app(
             await mouse.click(req.button)
             return JSONResponse({"ok": True, "button": req.button})
 
-        return await _with_mouse(go)
+        try:
+            return await _with_mouse(go)
+        finally:
+            _schedule_snapshot(f"manual_click_{req.button}")
 
     @app.post("/api/mouse/move")
     async def mouse_move(req: MouseMoveRequest) -> JSONResponse:
@@ -386,7 +459,16 @@ def create_app(
             await mouse.move(req.dx, req.dy)
             return JSONResponse({"ok": True, "dx": req.dx, "dy": req.dy})
 
-        return await _with_mouse(go)
+        try:
+            return await _with_mouse(go)
+        finally:
+            _schedule_snapshot("manual_move")
+
+    @app.post("/api/snapshot")
+    async def manual_snapshot() -> JSONResponse:
+        """Capture a fresh webcam frame on demand (no mouse action)."""
+        await _snapshot_after_manual_action("manual_snapshot")
+        return JSONResponse({"ok": True})
 
     @app.get("/api/state")
     def state() -> JSONResponse:
