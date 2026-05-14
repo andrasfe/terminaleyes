@@ -188,6 +188,59 @@ main#app {
   opacity: 0.45;
   cursor: not-allowed;
 }
+
+#paste-modal .modal-card {
+  width: min(560px, 96vw);
+}
+#paste-modal .paste-meta {
+  margin-bottom: 8px;
+}
+#paste-modal label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 8px 0 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+#paste-modal #paste-path {
+  width: 100%;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+#paste-modal #paste-content {
+  width: 100%;
+  resize: vertical;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+#paste-modal .paste-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 10px 0 4px;
+  align-items: center;
+}
+#paste-modal .paste-options .opt {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 13px;
+  color: var(--fg);
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
 .empty {
   color: var(--muted);
   font-size: 13px;

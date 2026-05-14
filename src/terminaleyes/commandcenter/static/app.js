@@ -793,6 +793,153 @@ if ($btnPassClear)
     if ($passInput) $passInput.value = "";
   });
 
+// ── paste-file: pick a local file, type it on the host ────────
+const $btnPasteFile = document.getElementById("btn-paste-file");
+const $pasteFilePicker = document.getElementById("paste-file-picker");
+const $pasteModal = document.getElementById("paste-modal");
+const $pasteModalClose = document.getElementById("paste-modal-close");
+const $pasteModalCancel = document.getElementById("paste-modal-cancel");
+const $pasteModalSend = document.getElementById("paste-modal-send");
+const $pasteMetaName = document.getElementById("paste-meta-name");
+const $pasteMetaStats = document.getElementById("paste-meta-stats");
+const $pastePath = document.getElementById("paste-path");
+const $pasteContent = document.getElementById("paste-content");
+const $pasteOptMaximize = document.getElementById("paste-opt-maximize");
+const $pasteOptVerify = document.getElementById("paste-opt-verify");
+const $pasteOptPlatform = document.getElementById("paste-opt-platform");
+
+const PASTE_MAX_BYTES = 50_000;
+
+function _pasteOpenModal() {
+  $pasteModal.classList.remove("hidden");
+  $pasteModal.setAttribute("aria-hidden", "false");
+  setTimeout(() => $pasteContent && $pasteContent.focus(), 30);
+}
+
+function _pasteCloseModal() {
+  $pasteModal.classList.add("hidden");
+  $pasteModal.setAttribute("aria-hidden", "true");
+}
+
+function _pasteShowStats(name, content) {
+  const lines = content.split("\n").length;
+  const bytes = new Blob([content]).size;
+  $pasteMetaName.textContent = name;
+  $pasteMetaStats.textContent =
+    `${bytes} bytes · ${lines} lines · ~${Math.round(bytes / 35)}s to type at 35 cps`;
+}
+
+if ($btnPasteFile)
+  $btnPasteFile.addEventListener("click", () => {
+    if ($pasteFilePicker) $pasteFilePicker.click();
+  });
+
+if ($pasteFilePicker)
+  $pasteFilePicker.addEventListener("change", async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (file.size > PASTE_MAX_BYTES) {
+      appendSystemLog(
+        "ERROR",
+        `${file.name}: ${file.size} bytes exceeds ${PASTE_MAX_BYTES} cap`,
+      );
+      $pasteFilePicker.value = "";
+      return;
+    }
+    let text = "";
+    try {
+      text = await file.text();
+    } catch (err) {
+      appendSystemLog("ERROR", `read failed: ${err}`);
+      return;
+    }
+    $pasteContent.value = text;
+    // Default host filename = local basename, under /tmp.
+    const safe = (file.name || "cc_paste.txt")
+      .replace(/[^A-Za-z0-9._-]/g, "_")
+      .slice(0, 80);
+    $pastePath.value = `/tmp/${safe}`;
+    _pasteShowStats(file.name, text);
+    _pasteOpenModal();
+    // Reset so picking the same file again still fires change.
+    $pasteFilePicker.value = "";
+  });
+
+// Re-compute stats live as the operator edits the buffer.
+if ($pasteContent)
+  $pasteContent.addEventListener("input", () => {
+    const name = $pasteMetaName.textContent || "buffer";
+    _pasteShowStats(name, $pasteContent.value);
+  });
+
+if ($pasteModalClose) $pasteModalClose.addEventListener("click", _pasteCloseModal);
+if ($pasteModalCancel) $pasteModalCancel.addEventListener("click", _pasteCloseModal);
+
+async function _pasteSubmit() {
+  const content = $pasteContent.value;
+  if (!content) {
+    appendSystemLog("ERROR", "paste-file: empty content");
+    return;
+  }
+  if (new Blob([content]).size > PASTE_MAX_BYTES) {
+    appendSystemLog("ERROR", "paste-file: content over 50 KB cap");
+    return;
+  }
+  const body = {
+    content,
+    path: ($pastePath.value || "/tmp/cc_paste.txt").trim(),
+    platform: $pasteOptPlatform.value,
+    maximize: !!$pasteOptMaximize.checked,
+    verify: !!$pasteOptVerify.checked,
+  };
+  _pasteCloseModal();
+  setMouseBusy(true, "pasting file…");
+  appendSystemLog(
+    "INFO",
+    `paste-file → ${body.path} (${content.length} chars, verify=${body.verify})`,
+  );
+  try {
+    const r = await fetch("/api/paste-file", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      let t = "";
+      try { t = await r.text(); } catch (_) {}
+      appendSystemLog("ERROR", `paste-file → ${r.status} ${t}`);
+      return;
+    }
+    const data = await r.json();
+    if (data.verify) {
+      const v = data.verify;
+      const tag = v.match ? "✓ MATCH" : "✗ MISMATCH";
+      appendSystemLog(
+        v.match ? "INFO" : "ERROR",
+        `${tag} similarity=${v.similarity} sent=${v.sent_norm_chars}c ocr=${v.ocr_norm_chars}c`,
+      );
+      if (!v.match && v.ocr_sample) {
+        appendSystemLog("INFO", `OCR sample: ${v.ocr_sample.slice(0, 240).replace(/\n/g, " | ")}`);
+      }
+    } else {
+      appendSystemLog("INFO", `paste-file ok: wrote ${data.wrote_path} (${data.sent_chars} chars)`);
+    }
+  } catch (e) {
+    appendSystemLog("ERROR", `paste-file failed: ${e}`);
+  } finally {
+    setMouseBusy(false);
+  }
+}
+
+if ($pasteModalSend) $pasteModalSend.addEventListener("click", _pasteSubmit);
+
+// ESC closes paste modal when open.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && $pasteModal && !$pasteModal.classList.contains("hidden")) {
+    _pasteCloseModal();
+  }
+});
+
 function connectGlobalLogs() {
   if (state.globalSrc) state.globalSrc.close();
   const src = new EventSource("/api/logs?tail=200");

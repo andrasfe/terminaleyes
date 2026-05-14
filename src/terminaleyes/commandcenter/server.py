@@ -78,6 +78,18 @@ class KeyboardKeyRequest(BaseModel):
     modifiers: list[str] = Field(default_factory=list)
 
 
+class PasteFileRequest(BaseModel):
+    # 50 KB cap: BT HID throughput on this stack is roughly
+    # 30–50 chars/sec; bigger payloads turn into multi-minute waits
+    # with very low odds of clean OCR verification.
+    content: str = Field(min_length=1, max_length=50_000)
+    filename: str = Field(default="cc_paste.txt", max_length=128)
+    path: str = Field(default="/tmp/cc_paste.txt", max_length=256)
+    platform: str = Field(default="macos", pattern="^(macos|linux)$")
+    maximize: bool = True
+    verify: bool = True
+
+
 def _content_type_for(path: str) -> str:
     p = path.lower()
     if p.endswith(".png"):
@@ -574,6 +586,191 @@ def create_app(
                 "ok": True, "key": req.key, "modifiers": req.modifiers,
             })
         return await _with_keyboard(go)
+
+    # ── paste-file: type a local file's contents on the host ────
+    @app.post("/api/paste-file")
+    async def paste_file(req: PasteFileRequest) -> JSONResponse:
+        """Type a local file's contents into a focused terminal on the
+        host, then verify the round-trip via OCR.
+
+        Sequence:
+          1. Maximize the focused window (optional).
+          2. ``cat > {path}`` + Enter — start cat reading from stdin.
+          3. Type content line-by-line, with Enter between lines and
+             Tab handled separately (HID has no \\n / \\t scancode).
+          4. Ctrl+D — close stdin, cat closes the file.
+          5. ``cat {path}`` + Enter — print it back so we can see it.
+          6. Capture a webcam frame, OCR the terminal, normalise
+             both texts and compute a similarity ratio.
+        """
+        if runner.is_busy():
+            raise HTTPException(409, "a run is currently in progress")
+        if settings is None:
+            raise HTTPException(500, "settings not wired into app")
+
+        from terminaleyes.capture.webcam import WebcamCapture
+        from terminaleyes.keyboard.http_backend import HttpKeyboardOutput
+
+        cfg = _commander_cfg()
+        kb = HttpKeyboardOutput(
+            base_url=cfg.pi_base_url,
+            timeout=20.0,
+            transport=cfg.transport,
+        )
+        capture = None
+        if req.verify:
+            resolution = None
+            if (settings.capture.resolution_width
+                    and settings.capture.resolution_height):
+                resolution = (
+                    settings.capture.resolution_width,
+                    settings.capture.resolution_height,
+                )
+            capture = WebcamCapture(
+                device_index=settings.capture.device_index,
+                resolution=resolution,
+            )
+
+        async def _cleanup():
+            if capture is not None:
+                try:
+                    await capture.close()
+                except Exception:
+                    pass
+            try:
+                await kb.disconnect()
+            except Exception:
+                pass
+
+        try:
+            await kb.connect()
+            if capture is not None:
+                await capture.open()
+        except Exception as e:
+            await _cleanup()
+            raise HTTPException(502, f"paste-file connect failed: {e}")
+
+        try:
+            # 1) Maximize the focused window.
+            if req.maximize:
+                if req.platform == "macos":
+                    # Cmd+Ctrl+F — native macOS full-screen toggle.
+                    await kb.send_key_combo(["ctrl", "meta"], "f")
+                else:
+                    # GNOME: Super+Up maximises.
+                    await kb.send_key_combo(["meta"], "Up")
+                await asyncio.sleep(1.0)
+
+            # 2) Start cat reading stdin → file.
+            await kb.send_text(f"cat > {req.path}")
+            await asyncio.sleep(0.05)
+            await kb.send_keystroke("Enter")
+            await asyncio.sleep(0.35)
+
+            # 3) Type content. Split by \n (Enter) and within each
+            # line split by \t (Tab) since neither has a printable
+            # HID mapping. Empty lines just send Enter.
+            lines = req.content.split("\n")
+            # If content ends with "\n", split produces a trailing
+            # empty string; that becomes a final Enter, which matches
+            # operator intent.
+            for line in lines:
+                if "\t" in line:
+                    parts = line.split("\t")
+                    for j, part in enumerate(parts):
+                        if part:
+                            await kb.send_text(part)
+                        if j < len(parts) - 1:
+                            await kb.send_keystroke("Tab")
+                            await asyncio.sleep(0.02)
+                elif line:
+                    await kb.send_text(line)
+                await kb.send_keystroke("Enter")
+                await asyncio.sleep(0.04)
+
+            # 4) Ctrl+D closes cat's stdin.
+            await kb.send_key_combo(["ctrl"], "d")
+            await asyncio.sleep(0.35)
+
+            result: dict = {
+                "ok": True,
+                "wrote_path": req.path,
+                "sent_chars": len(req.content),
+                "sent_lines": len(lines),
+            }
+
+            # 5) Verify via cat + OCR.
+            if req.verify and capture is not None:
+                await kb.send_text(f"cat {req.path}")
+                await kb.send_keystroke("Enter")
+                # Give the terminal a moment to render.
+                await asyncio.sleep(1.6)
+
+                from datetime import datetime
+                import cv2
+                frame = await capture.capture_frame()
+
+                out_dir = store.watch_dir / "manual"
+                try:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
+                seq = int(datetime.now().timestamp() * 1000) % 10_000
+                ts = datetime.now().strftime("%H%M%S")
+                vpath = out_dir / f"{seq:04d}_{ts}_paste_verify.png"
+                try:
+                    cv2.imwrite(str(vpath), frame.image)
+                except Exception as e:
+                    logger.warning("verify frame imwrite failed: %s", e)
+
+                ocr_text = ""
+                try:
+                    import pytesseract
+                    ocr_text = pytesseract.image_to_string(frame.image)
+                except Exception as e:
+                    logger.warning("OCR failed: %s", e)
+
+                # Normalise: rstrip each line, drop blanks, collapse
+                # leading/trailing whitespace. OCR rarely preserves
+                # exact whitespace.
+                def _norm(s: str) -> str:
+                    out = "\n".join(
+                        ln.rstrip() for ln in s.replace("\r", "").split("\n")
+                        if ln.strip()
+                    )
+                    return out.strip()
+
+                import difflib
+                sent_norm = _norm(req.content)
+                ocr_norm = _norm(ocr_text)
+                ratio = difflib.SequenceMatcher(
+                    None, sent_norm, ocr_norm,
+                ).ratio() if sent_norm else 0.0
+
+                # Compact diff: first ~10 changed regions.
+                diff_chunks = list(difflib.ndiff(
+                    sent_norm.splitlines()[:80],
+                    ocr_norm.splitlines()[:80],
+                ))[:200]
+
+                result["verify"] = {
+                    "similarity": round(ratio, 3),
+                    "match": ratio >= 0.85,
+                    "sent_norm_chars": len(sent_norm),
+                    "ocr_norm_chars": len(ocr_norm),
+                    "ocr_sample": ocr_text[:1000],
+                    "diff_sample": "\n".join(diff_chunks),
+                    "frame": str(vpath.name),
+                }
+
+            return JSONResponse(result)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("paste-file failed")
+            raise HTTPException(502, f"paste-file failed: {e}")
+        finally:
+            await _cleanup()
 
     @app.post("/api/snapshot")
     async def manual_snapshot() -> JSONResponse:

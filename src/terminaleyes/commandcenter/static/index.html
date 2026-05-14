@@ -54,6 +54,10 @@
                 title="Send Escape to host">␛</button>
         <button id="btn-passthrough-clear" type="button" class="kb-btn"
                 title="Clear local field (does not send)">✕</button>
+        <button id="btn-paste-file" type="button" class="kb-btn"
+                title="Pick a local text file, paste its contents into a terminal on the host">📄 file</button>
+        <input id="paste-file-picker" type="file" hidden
+               accept=".txt,.md,.json,.yaml,.yml,.sh,.py,.js,.ts,.css,.html,.xml,.conf,.cfg,.ini,.toml,.log,.csv,.tsv,text/*" />
       </div>
       <div class="frame-quick-actions">
         <button id="btn-lock" type="button" class="quick"
@@ -124,6 +128,55 @@
       <div class="modal-footer">
         <button id="exec-modal-cancel" type="button">Cancel</button>
         <button id="exec-modal-run" type="button" class="primary">Run</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Paste-file modal: preview + confirm before typing on host -->
+  <div id="paste-modal" class="modal hidden" aria-hidden="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span>Paste file to host</span>
+        <button id="paste-modal-close" type="button" title="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="paste-meta">
+          <div><strong id="paste-meta-name">—</strong></div>
+          <div id="paste-meta-stats" class="modal-hint">—</div>
+        </div>
+        <label for="paste-path">Host path</label>
+        <input id="paste-path" type="text" value="/tmp/cc_paste.txt"
+               autocomplete="off" spellcheck="false" />
+        <label for="paste-content">Content (editable before send)</label>
+        <textarea id="paste-content" rows="14"
+                  autocomplete="off" autocapitalize="off"
+                  spellcheck="false"></textarea>
+        <div class="paste-options">
+          <label class="opt">
+            <input type="checkbox" id="paste-opt-maximize" checked />
+            maximize terminal first (⌃⌘F)
+          </label>
+          <label class="opt">
+            <input type="checkbox" id="paste-opt-verify" checked />
+            verify via cat + OCR
+          </label>
+          <label class="opt">
+            platform
+            <select id="paste-opt-platform">
+              <option value="macos" selected>macos</option>
+              <option value="linux">linux</option>
+            </select>
+          </label>
+        </div>
+        <p class="modal-hint">
+          Cursor must be on the focused terminal before you click Send.
+          Typing rate over BT HID is ~30–50 chars/sec — a few KB will
+          take a minute. Don't touch the host keyboard while it runs.
+        </p>
+      </div>
+      <div class="modal-footer">
+        <button id="paste-modal-cancel" type="button">Cancel</button>
+        <button id="paste-modal-send" type="button" class="primary">Send</button>
       </div>
     </div>
   </div>
