@@ -29,6 +29,10 @@ const $logView = document.getElementById("log-view");
 const $btnClearLogs = document.getElementById("btn-clear-logs");
 
 const $clickMarker = document.getElementById("click-marker");
+const $frameBusy = document.getElementById("frame-busy");
+const $frameBusyLabel = $frameBusy
+  ? $frameBusy.querySelector(".frame-busy-label")
+  : null;
 const $optClickToMove = document.getElementById("opt-click-to-move");
 const $btnMouseLeft = document.getElementById("btn-mouse-left");
 const $btnMouseMiddle = document.getElementById("btn-mouse-middle");
@@ -503,7 +507,27 @@ function showClickMarker(clientX, clientY) {
   setTimeout(() => $clickMarker.classList.add("hidden"), 700);
 }
 
-async function postMouse(path, body) {
+// One in-flight manual-mouse call at a time; the homer holds the
+// webcam, and the UI shouldn't queue conflicting requests.
+let _mouseBusy = false;
+
+function setMouseBusy(busy, label) {
+  _mouseBusy = !!busy;
+  if ($frameBusy) {
+    $frameBusy.classList.toggle("hidden", !busy);
+    if ($frameBusyLabel && label) $frameBusyLabel.textContent = label;
+  }
+  for (const b of [$btnMouseLeft, $btnMouseMiddle, $btnMouseRight]) {
+    if (b) b.disabled = !!busy;
+  }
+}
+
+async function postMouse(path, body, busyLabel) {
+  if (_mouseBusy) {
+    appendSystemLog("INFO", "mouse busy — skipping click");
+    return null;
+  }
+  setMouseBusy(true, busyLabel || "working…");
   try {
     const r = await fetch(path, {
       method: "POST",
@@ -520,6 +544,8 @@ async function postMouse(path, body) {
   } catch (e) {
     appendSystemLog("ERROR", `${path} failed: ${e}`);
     return null;
+  } finally {
+    setMouseBusy(false);
   }
 }
 
@@ -533,14 +559,17 @@ $frame.addEventListener("click", async (e) => {
   if (x < 0 || y < 0 || x > rect.width || y > rect.height) return;
   const x_pct = Math.max(0, Math.min(1, x / rect.width));
   const y_pct = Math.max(0, Math.min(1, y / rect.height));
+  if (_mouseBusy) return;
   showClickMarker(e.clientX, e.clientY);
   appendSystemLog(
     "INFO",
     `mouse click_at (${x_pct.toFixed(3)}, ${y_pct.toFixed(3)})`,
   );
-  await postMouse("/api/mouse/click_at", {
-    x_pct, y_pct, button: "left",
-  });
+  await postMouse(
+    "/api/mouse/click_at",
+    { x_pct, y_pct, button: "left" },
+    "homing cursor…",
+  );
 });
 
 // Block the default context menu when right-clicking on the
@@ -553,7 +582,9 @@ $frame.addEventListener("contextmenu", (e) => {
 
 async function fireButton(button) {
   appendSystemLog("INFO", `mouse click button=${button}`);
-  await postMouse("/api/mouse/click", { button });
+  await postMouse(
+    "/api/mouse/click", { button }, `clicking ${button}…`,
+  );
 }
 
 if ($btnMouseLeft)

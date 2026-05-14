@@ -299,6 +299,7 @@ class VisualServoHomer:
             cursor_img=cursor_img, button=button, run_dir=run_dir,
             history=history, target_desc=target_desc,
             verify_navigation=True, last_proof=last_proof,
+            confirm_frames=CONFIRM_FRAMES,
         )
 
     async def _servo_loop(
@@ -312,6 +313,7 @@ class VisualServoHomer:
         target_desc: str,
         verify_navigation: bool,
         last_proof: str | None,
+        confirm_frames: int = CONFIRM_FRAMES,
     ) -> ClickOutcome:
         """Run the visual-servo loop until cursor lands on target_aim.
 
@@ -336,9 +338,9 @@ class VisualServoHomer:
                     f"  [{step:02d}] cursor=({cursor_img[0]:.2%},"
                     f"{cursor_img[1]:.2%}) aim=({target_aim[0]:.2%},"
                     f"{target_aim[1]:.2%}) residual={residual:.2%} ≤ "
-                    f"{CLICK_TOL_PCT:.0%} — confirm {confirm_count}/{CONFIRM_FRAMES}"
+                    f"{CLICK_TOL_PCT:.0%} — confirm {confirm_count}/{confirm_frames}"
                 )
-                if confirm_count >= CONFIRM_FRAMES:
+                if confirm_count >= confirm_frames:
                     if not verify_navigation:
                         # Manual mode: geometric confirm is enough.
                         # Click once, capture proof, return success.
@@ -643,6 +645,7 @@ class VisualServoHomer:
             cursor_img=cursor_img, button=button, run_dir=run_dir,
             history=history, target_desc="<manual>",
             verify_navigation=False, last_proof=None,
+            confirm_frames=1,
         )
 
     # ────────────────────── target localization ──────────────────────
