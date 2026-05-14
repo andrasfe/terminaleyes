@@ -50,6 +50,46 @@ class RunRequest(BaseModel):
     ml_adapter: str | None = None   # required when planner == "ml"
 
 
+class MouseClickAtRequest(BaseModel):
+    x_pct: float = Field(ge=0.0, le=1.0)
+    y_pct: float = Field(ge=0.0, le=1.0)
+    button: str = Field(default="left", pattern="^(left|right|middle)$")
+    # Optional overrides; defaults come from settings.commander.
+    screen_width: int | None = Field(default=None, gt=0)
+    screen_height: int | None = Field(default=None, gt=0)
+
+
+class MouseClickRequest(BaseModel):
+    button: str = Field(default="left", pattern="^(left|right|middle)$")
+
+
+class MouseMoveRequest(BaseModel):
+    dx: int = Field(ge=-127, le=127)
+    dy: int = Field(ge=-127, le=127)
+
+
+class KeyboardTextRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4096)
+    warmup: bool = False
+
+
+class KeyboardKeyRequest(BaseModel):
+    key: str = Field(min_length=1, max_length=32)
+    modifiers: list[str] = Field(default_factory=list)
+
+
+class PasteFileRequest(BaseModel):
+    # 50 KB cap: BT HID throughput on this stack is roughly
+    # 30–50 chars/sec; bigger payloads turn into multi-minute waits
+    # with very low odds of clean OCR verification.
+    content: str = Field(min_length=1, max_length=50_000)
+    filename: str = Field(default="cc_paste.txt", max_length=128)
+    path: str = Field(default="/tmp/cc_paste.txt", max_length=256)
+    platform: str = Field(default="macos", pattern="^(macos|linux)$")
+    maximize: bool = True
+    verify: bool = True
+
+
 def _content_type_for(path: str) -> str:
     p = path.lower()
     if p.endswith(".png"):
@@ -76,6 +116,7 @@ def create_app(
     *,
     frame_store: FrameStore | None = None,
     bus: LogBus | None = None,
+    settings: Any = None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -93,6 +134,10 @@ def create_app(
     app.state.store = store
     app.state.bus = bus
     app.state.runner = runner
+
+    # Serializes manual-control webcam captures so a click and a
+    # background follow-up snapshot don't fight over the device.
+    _manual_capture_lock = asyncio.Lock()
 
     @app.on_event("startup")
     async def _on_startup() -> None:
@@ -293,15 +338,458 @@ def create_app(
             },
         )
 
+    # ── manual mouse control ─────────────────────────────────────
+    # Lets the UI drive the host cursor directly: click a point on the
+    # screenshot or fire a button. Refuses while a run is in flight
+    # because the runner owns the mouse for that window.
+    async def _snapshot_after_manual_action(label: str) -> None:
+        """Grab one webcam frame and drop it in ``watch_dir/manual/``.
+
+        Without this, manual mouse actions never produce a fresh frame
+        in the watch dir, so the UI's long-poll sits on the stale
+        last-run screenshot and the operator can't see the cursor
+        actually moved. Capture is serialized; the webcam is opened
+        and closed per call so a real run can still claim the device.
+        """
+        if settings is None:
+            return
+        if runner.is_busy():
+            # Capture would race with the run's own webcam handle.
+            return
+        async with _manual_capture_lock:
+            from datetime import datetime
+            import cv2
+            from terminaleyes.capture.webcam import WebcamCapture
+            resolution = None
+            if (settings.capture.resolution_width
+                    and settings.capture.resolution_height):
+                resolution = (
+                    settings.capture.resolution_width,
+                    settings.capture.resolution_height,
+                )
+            cap = WebcamCapture(
+                device_index=settings.capture.device_index,
+                resolution=resolution,
+            )
+            try:
+                await cap.open()
+                # Let the cursor settle visually before grabbing.
+                await asyncio.sleep(0.25)
+                frame = await cap.capture_frame()
+            except Exception as e:
+                logger.warning("manual snapshot failed: %s", e)
+                try:
+                    await cap.close()
+                except Exception:
+                    pass
+                return
+            try:
+                await cap.close()
+            except Exception:
+                pass
+            out_dir = store.watch_dir / "manual"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return
+            seq = int(datetime.now().timestamp() * 1000) % 10_000
+            ts = datetime.now().strftime("%H%M%S")
+            path = out_dir / f"{seq:04d}_{ts}_{label}.png"
+            try:
+                ok = cv2.imwrite(str(path), frame.image)
+                if not ok:
+                    logger.warning("imwrite returned False for %s", path)
+            except Exception as e:
+                logger.warning("imwrite failed for %s: %s", path, e)
+
+    def _commander_cfg():
+        if settings is None:
+            class _Default:
+                pi_base_url = "http://10.0.0.2:8080"
+                transport = "bt"
+                screen_width = 1920
+                screen_height = 1080
+            return _Default()
+        return settings.commander
+
+    async def _with_mouse(action):
+        if runner.is_busy():
+            raise HTTPException(409, "a run is currently in progress")
+        from terminaleyes.mouse.http_backend import HttpMouseOutput
+        cfg = _commander_cfg()
+        mouse = HttpMouseOutput(
+            base_url=cfg.pi_base_url,
+            timeout=10.0,
+            transport=cfg.transport,
+        )
+        try:
+            await mouse.connect()
+        except Exception as e:
+            raise HTTPException(502, f"mouse connect failed: {e}")
+        try:
+            return await action(mouse)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"mouse action failed: {e}")
+        finally:
+            try:
+                await mouse.disconnect()
+            except Exception:
+                pass
+
+    def _schedule_snapshot(label: str) -> None:
+        asyncio.create_task(_snapshot_after_manual_action(label))
+
+    @app.post("/api/mouse/click_at")
+    async def mouse_click_at(req: MouseClickAtRequest) -> JSONResponse:
+        """Closed-loop visual-servo click at a webcam-image pixel.
+
+        Routes through ``VisualServoHomer.home_to_pixel`` so the cursor
+        is actually homed to the supplied pixel using the same CV that
+        the controller uses. Open-loop ``MouseOutput.click_at`` was
+        wrong on macOS because BT HID relative moves are subject to
+        non-linear pointer acceleration.
+        """
+        if runner.is_busy():
+            raise HTTPException(409, "a run is currently in progress")
+        # Late import: pulls heavy CV deps only when actually used.
+        from terminaleyes.agents.login import _SessionAdapter
+        from terminaleyes.commander.visual_servo_homer import (
+            VisualServoHomer,
+        )
+
+        ctx = keyboard = mouse = capture = None
+        try:
+            ctx, keyboard, mouse, capture = await context_factory()
+        except Exception as e:
+            if capture is not None:
+                try: await capture.close()
+                except Exception: pass
+            if keyboard is not None:
+                try: await keyboard.disconnect()
+                except Exception: pass
+            if mouse is not None:
+                try: await mouse.disconnect()
+                except Exception: pass
+            raise HTTPException(502, f"context_factory failed: {e}")
+
+        try:
+            adapter = _SessionAdapter(ctx)
+            homer = VisualServoHomer(session=adapter)
+            outcome = await homer.home_to_pixel(
+                req.x_pct, req.y_pct, button=req.button,
+            )
+            # Drop a post-click frame at the watch-dir top level so
+            # FrameStore (one-level-deep scan) picks it up and the UI
+            # long-poll refreshes. The homer's own proof frames live
+            # under <ctx.output_dir>/homer/<ts>/ which FrameStore
+            # doesn't recurse into.
+            try:
+                from datetime import datetime
+                import cv2
+                await asyncio.sleep(0.35)
+                frame = await capture.capture_frame()
+                out_dir = store.watch_dir / "manual"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                seq = int(datetime.now().timestamp() * 1000) % 10_000
+                ts = datetime.now().strftime("%H%M%S")
+                path = out_dir / f"{seq:04d}_{ts}_click_at.png"
+                cv2.imwrite(str(path), frame.image)
+            except Exception as e:
+                logger.warning("post-click snapshot failed: %s", e)
+            return JSONResponse({
+                "ok": bool(outcome.clicked),
+                "reason": outcome.reason,
+                "steps": outcome.steps,
+                "x_pct": req.x_pct, "y_pct": req.y_pct,
+                "button": req.button,
+            })
+        except Exception as e:
+            logger.exception("home_to_pixel failed")
+            raise HTTPException(502, f"home_to_pixel failed: {e}")
+        finally:
+            if capture is not None:
+                try: await capture.close()
+                except Exception: pass
+            if keyboard is not None:
+                try: await keyboard.disconnect()
+                except Exception: pass
+            if mouse is not None:
+                try: await mouse.disconnect()
+                except Exception: pass
+
+    @app.post("/api/mouse/click")
+    async def mouse_click(req: MouseClickRequest) -> JSONResponse:
+        async def go(mouse):
+            await mouse.click(req.button)
+            return JSONResponse({"ok": True, "button": req.button})
+
+        try:
+            return await _with_mouse(go)
+        finally:
+            _schedule_snapshot(f"manual_click_{req.button}")
+
+    @app.post("/api/mouse/move")
+    async def mouse_move(req: MouseMoveRequest) -> JSONResponse:
+        async def go(mouse):
+            await mouse.move(req.dx, req.dy)
+            return JSONResponse({"ok": True, "dx": req.dx, "dy": req.dy})
+
+        try:
+            return await _with_mouse(go)
+        finally:
+            _schedule_snapshot("manual_move")
+
+    # ── manual keyboard control ──────────────────────────────────
+    async def _with_keyboard(action):
+        if runner.is_busy():
+            raise HTTPException(409, "a run is currently in progress")
+        from terminaleyes.keyboard.http_backend import HttpKeyboardOutput
+        cfg = _commander_cfg()
+        kb = HttpKeyboardOutput(
+            base_url=cfg.pi_base_url,
+            timeout=10.0,
+            transport=cfg.transport,
+        )
+        try:
+            await kb.connect()
+        except Exception as e:
+            raise HTTPException(502, f"keyboard connect failed: {e}")
+        try:
+            return await action(kb)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"keyboard action failed: {e}")
+        finally:
+            try:
+                await kb.disconnect()
+            except Exception:
+                pass
+
+    @app.post("/api/keyboard/text")
+    async def keyboard_text(req: KeyboardTextRequest) -> JSONResponse:
+        async def go(kb):
+            await kb.send_text(req.text, warmup=req.warmup)
+            return JSONResponse({"ok": True, "length": len(req.text)})
+        return await _with_keyboard(go)
+
+    @app.post("/api/keyboard/key")
+    async def keyboard_key(req: KeyboardKeyRequest) -> JSONResponse:
+        async def go(kb):
+            if req.modifiers:
+                await kb.send_key_combo(req.modifiers, req.key)
+            else:
+                await kb.send_keystroke(req.key)
+            return JSONResponse({
+                "ok": True, "key": req.key, "modifiers": req.modifiers,
+            })
+        return await _with_keyboard(go)
+
+    # ── paste-file: type a local file's contents on the host ────
+    @app.post("/api/paste-file")
+    async def paste_file(req: PasteFileRequest) -> JSONResponse:
+        """Type a local file's contents into a focused terminal on the
+        host, then verify the round-trip via OCR.
+
+        Sequence:
+          1. Maximize the focused window (optional).
+          2. ``cat > {path}`` + Enter — start cat reading from stdin.
+          3. Type content line-by-line, with Enter between lines and
+             Tab handled separately (HID has no \\n / \\t scancode).
+          4. Ctrl+D — close stdin, cat closes the file.
+          5. ``cat {path}`` + Enter — print it back so we can see it.
+          6. Capture a webcam frame, OCR the terminal, normalise
+             both texts and compute a similarity ratio.
+        """
+        if runner.is_busy():
+            raise HTTPException(409, "a run is currently in progress")
+        if settings is None:
+            raise HTTPException(500, "settings not wired into app")
+
+        from terminaleyes.capture.webcam import WebcamCapture
+        from terminaleyes.keyboard.http_backend import HttpKeyboardOutput
+
+        cfg = _commander_cfg()
+        kb = HttpKeyboardOutput(
+            base_url=cfg.pi_base_url,
+            timeout=20.0,
+            transport=cfg.transport,
+        )
+        capture = None
+        if req.verify:
+            resolution = None
+            if (settings.capture.resolution_width
+                    and settings.capture.resolution_height):
+                resolution = (
+                    settings.capture.resolution_width,
+                    settings.capture.resolution_height,
+                )
+            capture = WebcamCapture(
+                device_index=settings.capture.device_index,
+                resolution=resolution,
+            )
+
+        async def _cleanup():
+            if capture is not None:
+                try:
+                    await capture.close()
+                except Exception:
+                    pass
+            try:
+                await kb.disconnect()
+            except Exception:
+                pass
+
+        try:
+            await kb.connect()
+            if capture is not None:
+                await capture.open()
+        except Exception as e:
+            await _cleanup()
+            raise HTTPException(502, f"paste-file connect failed: {e}")
+
+        try:
+            # 1) Maximize the focused window.
+            if req.maximize:
+                if req.platform == "macos":
+                    # Cmd+Ctrl+F — native macOS full-screen toggle.
+                    await kb.send_key_combo(["ctrl", "meta"], "f")
+                else:
+                    # GNOME: Super+Up maximises.
+                    await kb.send_key_combo(["meta"], "Up")
+                await asyncio.sleep(1.0)
+
+            # 2) Start cat reading stdin → file.
+            await kb.send_text(f"cat > {req.path}")
+            await asyncio.sleep(0.05)
+            await kb.send_keystroke("Enter")
+            await asyncio.sleep(0.35)
+
+            # 3) Type content. Split by \n (Enter) and within each
+            # line split by \t (Tab) since neither has a printable
+            # HID mapping. Empty lines just send Enter.
+            lines = req.content.split("\n")
+            # If content ends with "\n", split produces a trailing
+            # empty string; that becomes a final Enter, which matches
+            # operator intent.
+            for line in lines:
+                if "\t" in line:
+                    parts = line.split("\t")
+                    for j, part in enumerate(parts):
+                        if part:
+                            await kb.send_text(part)
+                        if j < len(parts) - 1:
+                            await kb.send_keystroke("Tab")
+                            await asyncio.sleep(0.02)
+                elif line:
+                    await kb.send_text(line)
+                await kb.send_keystroke("Enter")
+                await asyncio.sleep(0.04)
+
+            # 4) Ctrl+D closes cat's stdin.
+            await kb.send_key_combo(["ctrl"], "d")
+            await asyncio.sleep(0.35)
+
+            result: dict = {
+                "ok": True,
+                "wrote_path": req.path,
+                "sent_chars": len(req.content),
+                "sent_lines": len(lines),
+            }
+
+            # 5) Verify via cat + OCR.
+            if req.verify and capture is not None:
+                await kb.send_text(f"cat {req.path}")
+                await kb.send_keystroke("Enter")
+                # Give the terminal a moment to render.
+                await asyncio.sleep(1.6)
+
+                from datetime import datetime
+                import cv2
+                frame = await capture.capture_frame()
+
+                out_dir = store.watch_dir / "manual"
+                try:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
+                seq = int(datetime.now().timestamp() * 1000) % 10_000
+                ts = datetime.now().strftime("%H%M%S")
+                vpath = out_dir / f"{seq:04d}_{ts}_paste_verify.png"
+                try:
+                    cv2.imwrite(str(vpath), frame.image)
+                except Exception as e:
+                    logger.warning("verify frame imwrite failed: %s", e)
+
+                ocr_text = ""
+                try:
+                    import pytesseract
+                    ocr_text = pytesseract.image_to_string(frame.image)
+                except Exception as e:
+                    logger.warning("OCR failed: %s", e)
+
+                # Normalise: rstrip each line, drop blanks, collapse
+                # leading/trailing whitespace. OCR rarely preserves
+                # exact whitespace.
+                def _norm(s: str) -> str:
+                    out = "\n".join(
+                        ln.rstrip() for ln in s.replace("\r", "").split("\n")
+                        if ln.strip()
+                    )
+                    return out.strip()
+
+                import difflib
+                sent_norm = _norm(req.content)
+                ocr_norm = _norm(ocr_text)
+                ratio = difflib.SequenceMatcher(
+                    None, sent_norm, ocr_norm,
+                ).ratio() if sent_norm else 0.0
+
+                # Compact diff: first ~10 changed regions.
+                diff_chunks = list(difflib.ndiff(
+                    sent_norm.splitlines()[:80],
+                    ocr_norm.splitlines()[:80],
+                ))[:200]
+
+                result["verify"] = {
+                    "similarity": round(ratio, 3),
+                    "match": ratio >= 0.85,
+                    "sent_norm_chars": len(sent_norm),
+                    "ocr_norm_chars": len(ocr_norm),
+                    "ocr_sample": ocr_text[:1000],
+                    "diff_sample": "\n".join(diff_chunks),
+                    "frame": str(vpath.name),
+                }
+
+            return JSONResponse(result)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("paste-file failed")
+            raise HTTPException(502, f"paste-file failed: {e}")
+        finally:
+            await _cleanup()
+
+    @app.post("/api/snapshot")
+    async def manual_snapshot() -> JSONResponse:
+        """Capture a fresh webcam frame on demand (no mouse action)."""
+        await _snapshot_after_manual_action("manual_snapshot")
+        return JSONResponse({"ok": True})
+
     @app.get("/api/state")
     def state() -> JSONResponse:
         latest = store.latest()
         active = runner.active()
+        cfg = _commander_cfg()
         return JSONResponse({
             "busy": runner.is_busy(),
             "latest_id": latest.id if latest else None,
             "frame_count": store.count(),
             "active_run": active.public() if active else None,
+            "screen_width": cfg.screen_width,
+            "screen_height": cfg.screen_height,
         })
 
     return app

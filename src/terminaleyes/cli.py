@@ -1430,7 +1430,9 @@ async def _run_commandcenter(settings, args) -> None:
     context_factory = make_default_context_factory(
         settings, base_dir=watch_dir, bus=bus,
     )
-    app = create_app(context_factory, frame_store=store, bus=bus)
+    app = create_app(
+        context_factory, frame_store=store, bus=bus, settings=settings,
+    )
 
     # Pre-flight: refuse to start if another process is already
     # listening on the requested port. macOS will sometimes let

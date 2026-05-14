@@ -28,6 +28,16 @@ const $execModalRun = document.getElementById("exec-modal-run");
 const $logView = document.getElementById("log-view");
 const $btnClearLogs = document.getElementById("btn-clear-logs");
 
+const $clickMarker = document.getElementById("click-marker");
+const $frameBusy = document.getElementById("frame-busy");
+const $frameBusyLabel = $frameBusy
+  ? $frameBusy.querySelector(".frame-busy-label")
+  : null;
+const $optClickToMove = document.getElementById("opt-click-to-move");
+const $btnMouseLeft = document.getElementById("btn-mouse-left");
+const $btnMouseMiddle = document.getElementById("btn-mouse-middle");
+const $btnMouseRight = document.getElementById("btn-mouse-right");
+
 // ── state ──────────────────────────────────────────────────────
 const state = {
   liveMode: true,
@@ -459,6 +469,475 @@ $logView.addEventListener("scroll", () => {
 
 $btnClearLogs.addEventListener("click", () => {
   $logView.innerHTML = "";
+});
+
+// ── manual mouse control ───────────────────────────────────────
+// The screenshot is laid out with object-fit:contain inside its
+// wrapper, so the rendered image fills only part of the element box
+// in one axis. To map a click to a screen percentage we need the
+// rendered image rect, not the box rect.
+function imageRect() {
+  const w = $frame.naturalWidth;
+  const h = $frame.naturalHeight;
+  const box = $frame.getBoundingClientRect();
+  if (!w || !h || !box.width || !box.height) return null;
+  const scale = Math.min(box.width / w, box.height / h);
+  const renderedW = w * scale;
+  const renderedH = h * scale;
+  const offsetX = (box.width - renderedW) / 2;
+  const offsetY = (box.height - renderedH) / 2;
+  return {
+    left: box.left + offsetX,
+    top: box.top + offsetY,
+    width: renderedW,
+    height: renderedH,
+  };
+}
+
+function showClickMarker(clientX, clientY) {
+  const wrap = $frame.parentElement.getBoundingClientRect();
+  $clickMarker.style.left = (clientX - wrap.left) + "px";
+  $clickMarker.style.top = (clientY - wrap.top) + "px";
+  $clickMarker.classList.remove("hidden");
+  // Restart animation
+  $clickMarker.style.animation = "none";
+  // Force reflow to restart CSS animation.
+  void $clickMarker.offsetWidth;
+  $clickMarker.style.animation = "";
+  setTimeout(() => $clickMarker.classList.add("hidden"), 700);
+}
+
+// One in-flight manual-mouse call at a time; the homer holds the
+// webcam, and the UI shouldn't queue conflicting requests.
+let _mouseBusy = false;
+
+function setMouseBusy(busy, label) {
+  _mouseBusy = !!busy;
+  if ($frameBusy) {
+    $frameBusy.classList.toggle("hidden", !busy);
+    if ($frameBusyLabel && label) $frameBusyLabel.textContent = label;
+  }
+  for (const b of [$btnMouseLeft, $btnMouseMiddle, $btnMouseRight]) {
+    if (b) b.disabled = !!busy;
+  }
+}
+
+async function postMouse(path, body, busyLabel) {
+  if (_mouseBusy) {
+    appendSystemLog("INFO", "mouse busy — skipping click");
+    return null;
+  }
+  setMouseBusy(true, busyLabel || "working…");
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      let t = "";
+      try { t = await r.text(); } catch (_) {}
+      appendSystemLog("ERROR", `${path} → ${r.status} ${t}`);
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    appendSystemLog("ERROR", `${path} failed: ${e}`);
+    return null;
+  } finally {
+    setMouseBusy(false);
+  }
+}
+
+$frame.addEventListener("click", async (e) => {
+  if (!$optClickToMove || !$optClickToMove.checked) return;
+  if ($frame.classList.contains("empty")) return;
+  const rect = imageRect();
+  if (!rect) return;
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  if (x < 0 || y < 0 || x > rect.width || y > rect.height) return;
+  const x_pct = Math.max(0, Math.min(1, x / rect.width));
+  const y_pct = Math.max(0, Math.min(1, y / rect.height));
+  if (_mouseBusy) return;
+  showClickMarker(e.clientX, e.clientY);
+  appendSystemLog(
+    "INFO",
+    `mouse click_at (${x_pct.toFixed(3)}, ${y_pct.toFixed(3)})`,
+  );
+  await postMouse(
+    "/api/mouse/click_at",
+    { x_pct, y_pct, button: "left" },
+    "homing cursor…",
+  );
+  // Always auto-focus the passthrough so typing flows to the host
+  // regardless of whether the homer ultimately reported success.
+  // (Without this, a single "cursor_not_found" outcome leaves the
+  // operator stuck wondering why their keypresses do nothing.)
+  if ($passInput) {
+    $passInput.value = "";
+    $passInput.focus();
+  }
+});
+
+// Block the default context menu when right-clicking on the
+// screenshot — operators usually want to fire a remote right-click
+// instead of opening the browser menu. We expose right-click via
+// the Right button; suppress the menu so it's not a distraction.
+$frame.addEventListener("contextmenu", (e) => {
+  if ($optClickToMove && $optClickToMove.checked) e.preventDefault();
+});
+
+async function fireButton(button) {
+  appendSystemLog("INFO", `mouse click button=${button}`);
+  await postMouse(
+    "/api/mouse/click", { button }, `clicking ${button}…`,
+  );
+}
+
+if ($btnMouseLeft)
+  $btnMouseLeft.addEventListener("click", () => fireButton("left"));
+if ($btnMouseMiddle)
+  $btnMouseMiddle.addEventListener("click", () => fireButton("middle"));
+if ($btnMouseRight)
+  $btnMouseRight.addEventListener("click", () => fireButton("right"));
+
+// ── keyboard passthrough ───────────────────────────────────────
+// Each keystroke in the passthrough field is forwarded to the host.
+// Requests are serialized so typing fast doesn't reorder them: HTTP
+// + Pi+BT HID don't guarantee in-order delivery across concurrent
+// requests, but a single in-flight FIFO does.
+const $passInput = document.getElementById("passthrough-input");
+const $btnPassEnter = document.getElementById("btn-passthrough-enter");
+const $btnPassTab = document.getElementById("btn-passthrough-tab");
+const $btnPassEsc = document.getElementById("btn-passthrough-esc");
+const $btnPassClear = document.getElementById("btn-passthrough-clear");
+
+const _kbQueue = [];
+let _kbDraining = false;
+
+function _kbEnqueue(job) {
+  _kbQueue.push(job);
+  _kbDrain();
+}
+
+async function _kbDrain() {
+  if (_kbDraining) return;
+  _kbDraining = true;
+  if ($passInput) $passInput.classList.add("busy");
+  try {
+    while (_kbQueue.length > 0) {
+      const job = _kbQueue.shift();
+      try {
+        const r = await fetch(job.path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(job.body),
+        });
+        if (!r.ok) {
+          let t = "";
+          try { t = await r.text(); } catch (_) {}
+          appendSystemLog("ERROR", `${job.path} → ${r.status} ${t}`);
+          _kbQueue.length = 0;       // give up on this typing burst
+          break;
+        }
+      } catch (e) {
+        appendSystemLog("ERROR", `${job.path} failed: ${e}`);
+        _kbQueue.length = 0;
+        break;
+      }
+    }
+  } finally {
+    _kbDraining = false;
+    if ($passInput) $passInput.classList.remove("busy");
+  }
+}
+
+// Map browser key names to Pi keystroke names. Pi's HID-codes map is
+// case-sensitive PascalCase ("Enter", not "enter") for special keys —
+// see raspi/hid_codes.py KEY_CODES.
+const _PASS_SPECIAL = {
+  "Enter": "Enter",
+  "Backspace": "Backspace",
+  "Tab": "Tab",
+  "Escape": "Escape",
+  "ArrowUp": "Up",
+  "ArrowDown": "Down",
+  "ArrowLeft": "Left",
+  "ArrowRight": "Right",
+  "Home": "Home",
+  "End": "End",
+  "PageUp": "PageUp",
+  "PageDown": "PageDown",
+  "Delete": "Delete",
+};
+
+function _passthroughHandleKey(e) {
+  if (!$passInput) return;
+  // Let the browser handle navigation modifier-only events.
+  if (e.key === "Shift" || e.key === "Control" || e.key === "Alt"
+      || e.key === "Meta") {
+    return;
+  }
+  e.preventDefault();
+
+  const hasCtrl = e.ctrlKey;
+  const hasMeta = e.metaKey;
+  const hasAlt = e.altKey;
+  const hasShift = e.shiftKey;
+  const mods = [];
+  if (hasCtrl) mods.push("ctrl");
+  if (hasMeta) mods.push("cmd");
+  if (hasAlt) mods.push("alt");
+  if (hasShift) mods.push("shift");
+
+  const special = _PASS_SPECIAL[e.key];
+  if (special) {
+    _kbEnqueue({
+      path: "/api/keyboard/key",
+      body: { key: special, modifiers: mods },
+    });
+    // Mirror the action locally for visual feedback.
+    if (special === "Backspace") {
+      $passInput.value = $passInput.value.slice(0, -1);
+    } else if (special === "Enter") {
+      $passInput.value = "";
+    } else if (special === "Tab") {
+      $passInput.value += "\t";
+    } else if (special === "Escape") {
+      $passInput.value = "";
+    }
+    return;
+  }
+
+  // Single printable character.
+  if (e.key.length === 1) {
+    // If modifier present (other than shift), send as combo.
+    const nonShiftMods = mods.filter(m => m !== "shift");
+    if (nonShiftMods.length > 0) {
+      _kbEnqueue({
+        path: "/api/keyboard/key",
+        body: { key: e.key.toLowerCase(), modifiers: mods },
+      });
+      return;
+    }
+    _kbEnqueue({
+      path: "/api/keyboard/text",
+      body: { text: e.key },
+    });
+    $passInput.value += e.key;
+  }
+}
+
+// Global key capture: when the user hasn't focused another text input
+// (chat, vault, exec body), forward keystrokes to the host. Makes the
+// "click on icon → start typing" flow work without the operator
+// remembering to click the passthrough field.
+const _GLOBAL_PASSTHRU_SKIP_IDS = new Set([
+  "chat-input", "opt-vault", "exec-script-body",
+]);
+function _shouldGlobalCapture() {
+  const a = document.activeElement;
+  if (!a) return true;
+  if (a === $passInput) return false;     // field handles it itself
+  if (a.id && _GLOBAL_PASSTHRU_SKIP_IDS.has(a.id)) return false;
+  const tag = (a.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") {
+    return false;
+  }
+  if (a.isContentEditable) return false;
+  return true;
+}
+document.addEventListener("keydown", (e) => {
+  if (!_shouldGlobalCapture()) return;
+  _passthroughHandleKey(e);
+}, true);
+
+if ($passInput) {
+  $passInput.addEventListener("keydown", _passthroughHandleKey);
+  // Block paste/cut/contextmenu autofill — only keystrokes go through.
+  $passInput.addEventListener("paste", (e) => {
+    e.preventDefault();
+    const text = (e.clipboardData || window.clipboardData).getData("text");
+    if (!text) return;
+    _kbEnqueue({
+      path: "/api/keyboard/text",
+      body: { text },
+    });
+    $passInput.value += text;
+  });
+}
+
+if ($btnPassEnter)
+  $btnPassEnter.addEventListener("click", () => {
+    _kbEnqueue({
+      path: "/api/keyboard/key", body: { key: "Enter", modifiers: [] },
+    });
+    if ($passInput) $passInput.value = "";
+  });
+if ($btnPassTab)
+  $btnPassTab.addEventListener("click", () => {
+    _kbEnqueue({
+      path: "/api/keyboard/key", body: { key: "Tab", modifiers: [] },
+    });
+    if ($passInput) $passInput.value += "\t";
+  });
+if ($btnPassEsc)
+  $btnPassEsc.addEventListener("click", () => {
+    _kbEnqueue({
+      path: "/api/keyboard/key", body: { key: "Escape", modifiers: [] },
+    });
+  });
+if ($btnPassClear)
+  $btnPassClear.addEventListener("click", () => {
+    if ($passInput) $passInput.value = "";
+  });
+
+// ── paste-file: pick a local file, type it on the host ────────
+const $btnPasteFile = document.getElementById("btn-paste-file");
+const $pasteFilePicker = document.getElementById("paste-file-picker");
+const $pasteModal = document.getElementById("paste-modal");
+const $pasteModalClose = document.getElementById("paste-modal-close");
+const $pasteModalCancel = document.getElementById("paste-modal-cancel");
+const $pasteModalSend = document.getElementById("paste-modal-send");
+const $pasteMetaName = document.getElementById("paste-meta-name");
+const $pasteMetaStats = document.getElementById("paste-meta-stats");
+const $pastePath = document.getElementById("paste-path");
+const $pasteContent = document.getElementById("paste-content");
+const $pasteOptMaximize = document.getElementById("paste-opt-maximize");
+const $pasteOptVerify = document.getElementById("paste-opt-verify");
+const $pasteOptPlatform = document.getElementById("paste-opt-platform");
+
+const PASTE_MAX_BYTES = 50_000;
+
+function _pasteOpenModal() {
+  $pasteModal.classList.remove("hidden");
+  $pasteModal.setAttribute("aria-hidden", "false");
+  setTimeout(() => $pasteContent && $pasteContent.focus(), 30);
+}
+
+function _pasteCloseModal() {
+  $pasteModal.classList.add("hidden");
+  $pasteModal.setAttribute("aria-hidden", "true");
+}
+
+function _pasteShowStats(name, content) {
+  const lines = content.split("\n").length;
+  const bytes = new Blob([content]).size;
+  $pasteMetaName.textContent = name;
+  $pasteMetaStats.textContent =
+    `${bytes} bytes · ${lines} lines · ~${Math.round(bytes / 35)}s to type at 35 cps`;
+}
+
+if ($btnPasteFile)
+  $btnPasteFile.addEventListener("click", () => {
+    if ($pasteFilePicker) $pasteFilePicker.click();
+  });
+
+if ($pasteFilePicker)
+  $pasteFilePicker.addEventListener("change", async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (file.size > PASTE_MAX_BYTES) {
+      appendSystemLog(
+        "ERROR",
+        `${file.name}: ${file.size} bytes exceeds ${PASTE_MAX_BYTES} cap`,
+      );
+      $pasteFilePicker.value = "";
+      return;
+    }
+    let text = "";
+    try {
+      text = await file.text();
+    } catch (err) {
+      appendSystemLog("ERROR", `read failed: ${err}`);
+      return;
+    }
+    $pasteContent.value = text;
+    // Default host filename = local basename, under /tmp.
+    const safe = (file.name || "cc_paste.txt")
+      .replace(/[^A-Za-z0-9._-]/g, "_")
+      .slice(0, 80);
+    $pastePath.value = `/tmp/${safe}`;
+    _pasteShowStats(file.name, text);
+    _pasteOpenModal();
+    // Reset so picking the same file again still fires change.
+    $pasteFilePicker.value = "";
+  });
+
+// Re-compute stats live as the operator edits the buffer.
+if ($pasteContent)
+  $pasteContent.addEventListener("input", () => {
+    const name = $pasteMetaName.textContent || "buffer";
+    _pasteShowStats(name, $pasteContent.value);
+  });
+
+if ($pasteModalClose) $pasteModalClose.addEventListener("click", _pasteCloseModal);
+if ($pasteModalCancel) $pasteModalCancel.addEventListener("click", _pasteCloseModal);
+
+async function _pasteSubmit() {
+  const content = $pasteContent.value;
+  if (!content) {
+    appendSystemLog("ERROR", "paste-file: empty content");
+    return;
+  }
+  if (new Blob([content]).size > PASTE_MAX_BYTES) {
+    appendSystemLog("ERROR", "paste-file: content over 50 KB cap");
+    return;
+  }
+  const body = {
+    content,
+    path: ($pastePath.value || "/tmp/cc_paste.txt").trim(),
+    platform: $pasteOptPlatform.value,
+    maximize: !!$pasteOptMaximize.checked,
+    verify: !!$pasteOptVerify.checked,
+  };
+  _pasteCloseModal();
+  setMouseBusy(true, "pasting file…");
+  appendSystemLog(
+    "INFO",
+    `paste-file → ${body.path} (${content.length} chars, verify=${body.verify})`,
+  );
+  try {
+    const r = await fetch("/api/paste-file", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      let t = "";
+      try { t = await r.text(); } catch (_) {}
+      appendSystemLog("ERROR", `paste-file → ${r.status} ${t}`);
+      return;
+    }
+    const data = await r.json();
+    if (data.verify) {
+      const v = data.verify;
+      const tag = v.match ? "✓ MATCH" : "✗ MISMATCH";
+      appendSystemLog(
+        v.match ? "INFO" : "ERROR",
+        `${tag} similarity=${v.similarity} sent=${v.sent_norm_chars}c ocr=${v.ocr_norm_chars}c`,
+      );
+      if (!v.match && v.ocr_sample) {
+        appendSystemLog("INFO", `OCR sample: ${v.ocr_sample.slice(0, 240).replace(/\n/g, " | ")}`);
+      }
+    } else {
+      appendSystemLog("INFO", `paste-file ok: wrote ${data.wrote_path} (${data.sent_chars} chars)`);
+    }
+  } catch (e) {
+    appendSystemLog("ERROR", `paste-file failed: ${e}`);
+  } finally {
+    setMouseBusy(false);
+  }
+}
+
+if ($pasteModalSend) $pasteModalSend.addEventListener("click", _pasteSubmit);
+
+// ESC closes paste modal when open.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && $pasteModal && !$pasteModal.classList.contains("hidden")) {
+    _pasteCloseModal();
+  }
 });
 
 function connectGlobalLogs() {

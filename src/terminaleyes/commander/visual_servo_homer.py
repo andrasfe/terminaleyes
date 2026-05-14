@@ -294,7 +294,38 @@ class VisualServoHomer:
             f"to compensate for hotspot offset"
         )
 
-        # 4) Visual servo loop — pure CV per step, no model calls.
+        return await self._servo_loop(
+            target_aim=target_aim, target_img=target_img,
+            cursor_img=cursor_img, button=button, run_dir=run_dir,
+            history=history, target_desc=target_desc,
+            verify_navigation=True, last_proof=last_proof,
+            confirm_frames=CONFIRM_FRAMES,
+            click_tol_pct=CLICK_TOL_PCT,
+        )
+
+    async def _servo_loop(
+        self, *,
+        target_aim: tuple[float, float],
+        target_img: tuple[float, float],
+        cursor_img: tuple[float, float],
+        button: str,
+        run_dir: Path,
+        history: list[StepRecord],
+        target_desc: str,
+        verify_navigation: bool,
+        last_proof: str | None,
+        confirm_frames: int = CONFIRM_FRAMES,
+        click_tol_pct: float = CLICK_TOL_PCT,
+    ) -> ClickOutcome:
+        """Run the visual-servo loop until cursor lands on target_aim.
+
+        Extracted from ``_run_inner`` so the same loop can also serve
+        manual click-to-pixel requests where the target is supplied
+        directly rather than located via OCR/VLM. ``verify_navigation``
+        gates the LLM URL-bar oracle: ``False`` skips both the navigation
+        verify and the click-retry diamond pattern (click once and
+        capture proof — fine for manual operator-driven clicks).
+        """
         confirm_count = 0
         for step in range(1, MAX_STEPS + 1):
             t_step = time.monotonic()
@@ -303,15 +334,42 @@ class VisualServoHomer:
             dy_pct = target_aim[1] - cursor_img[1]
             residual = math.hypot(dx_pct, dy_pct)
 
-            if residual <= CLICK_TOL_PCT:
+            if residual <= click_tol_pct:
                 confirm_count += 1
                 print(
                     f"  [{step:02d}] cursor=({cursor_img[0]:.2%},"
                     f"{cursor_img[1]:.2%}) aim=({target_aim[0]:.2%},"
                     f"{target_aim[1]:.2%}) residual={residual:.2%} ≤ "
-                    f"{CLICK_TOL_PCT:.0%} — confirm {confirm_count}/{CONFIRM_FRAMES}"
+                    f"{click_tol_pct:.1%} — confirm {confirm_count}/{confirm_frames}"
                 )
-                if confirm_count >= CONFIRM_FRAMES:
+                if confirm_count >= confirm_frames:
+                    if not verify_navigation:
+                        # Manual mode: geometric confirm is enough.
+                        # Click once, capture proof, return success.
+                        await self._session._executor._mouse.click(button)
+                        try:
+                            await asyncio.sleep(0.4)
+                            proof = await self._capture_proof(
+                                run_dir, step * 100,
+                            )
+                        except Exception:
+                            proof = None
+                        history.append(StepRecord(
+                            cursor_img=cursor_img, target_img=target_img,
+                            residual_pct=residual, hid_dx=0, hid_dy=0,
+                            ratio_x=self._pct_per_hid_x,
+                            ratio_y=self._pct_per_hid_y,
+                            note="click_sent;manual_geometric_only",
+                        ))
+                        print(
+                            f"  ✓ Geometric confirm — clicked {button} "
+                            f"at ({target_aim[0]:.2%},{target_aim[1]:.2%})"
+                        )
+                        return ClickOutcome(
+                            clicked=True, steps=step,
+                            reason="geometric_confirm",
+                            proof_path=proof, history=history,
+                        )
                     # Click + verify. If verification fails, nudge
                     # through a small diamond pattern and retry — the
                     # cursor centroid is close but the click hotspot
@@ -502,6 +560,100 @@ class VisualServoHomer:
         return ClickOutcome(
             clicked=False, steps=MAX_STEPS, reason="max_steps",
             proof_path=last_proof, history=history,
+        )
+
+    # ────────────────────── manual click-to-pixel ──────────────────────
+
+    async def home_to_pixel(
+        self,
+        x_pct: float,
+        y_pct: float,
+        button: str = "left",
+        *,
+        hotspot_offset: bool = True,
+    ) -> ClickOutcome:
+        """Home the cursor to a pre-located pixel on the webcam frame.
+
+        Skips the OCR/VLM target-location step (operator already told
+        us where to click) and skips the post-click LLM navigation
+        oracle (manual mode doesn't have a target description to
+        verify against). Everything else — slam, cursor detect, visual
+        servo, geometric click gate — is the same as ``run()``.
+        """
+        session_out = getattr(self._session, "output_dir", None)
+        ts = datetime.now().strftime("%H%M%S_manual")
+        if session_out is not None:
+            run_dir = session_out / "homer" / ts
+        else:
+            run_dir = PROOF_DIR / ts
+        run_dir.mkdir(parents=True, exist_ok=True)
+        history: list[StepRecord] = []
+
+        print(
+            f"  Manual click homing → ({x_pct:.2%}, {y_pct:.2%}) "
+            f"button={button}"
+        )
+        print(f"  Step log: {run_dir}/")
+
+        await self._slam_to_corner()
+        await self._send_hid(40, 40)
+        await asyncio.sleep(0.30)
+
+        f0 = await self._capture_color()
+        cursor_hit = find_cursor_hsv(f0)
+        cursor_img: tuple[float, float] | None = None
+        if cursor_hit is not None:
+            verified = await self._verify_hsv_by_motion(
+                (cursor_hit.x_pct, cursor_hit.y_pct), run_dir,
+            )
+            if verified is not None:
+                cursor_img = verified
+                self._hsv_enabled = True
+                print(
+                    f"  Cursor (HSV verified): ({cursor_img[0]:.2%}, "
+                    f"{cursor_img[1]:.2%})"
+                )
+            else:
+                print(
+                    "  HSV candidate failed motion verify — falling back."
+                )
+
+        if cursor_img is None:
+            print("  Using oscillation-variance to find cursor.")
+            osc_hit = await self._find_cursor_via_oscillation(run_dir)
+            if osc_hit is None:
+                print("  Could not detect cursor by oscillation.")
+                return ClickOutcome(
+                    clicked=False, steps=0, reason="cursor_not_found",
+                    proof_path=None, history=history,
+                )
+            cursor_img = osc_hit
+            print(
+                f"  Cursor (oscillation): ({cursor_img[0]:.2%}, "
+                f"{cursor_img[1]:.2%})"
+            )
+
+        target_img = (float(x_pct), float(y_pct))
+        if hotspot_offset:
+            target_aim = (
+                target_img[0] + HOTSPOT_OFFSET_X_PCT,
+                target_img[1] + HOTSPOT_OFFSET_Y_PCT,
+            )
+        else:
+            target_aim = target_img
+
+        # Manual clicks demand higher accuracy than the controller's
+        # "click on this OCR'd word" flow: an operator picks an exact
+        # pixel and expects the cursor to land *there*, not 20px off.
+        # Cursor-detection precision (~5–8 px on a 1080p webcam) is
+        # the real floor; we set the gate just above that.
+        return await self._servo_loop(
+            target_aim=target_aim, target_img=target_img,
+            cursor_img=cursor_img, button=button, run_dir=run_dir,
+            history=history, target_desc="<manual>",
+            verify_navigation=False, last_proof=None,
+            confirm_frames=1,
+            click_tol_pct=0.006,
         )
 
     # ────────────────────── target localization ──────────────────────

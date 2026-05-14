@@ -65,8 +65,182 @@ main#app {
   max-height: 100%;
   object-fit: contain;
   display: block;
+  cursor: crosshair;
 }
 #frame.empty { display: none; }
+#frame.click-disabled { cursor: default; }
+
+.click-marker {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  margin: -9px 0 0 -9px;
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  pointer-events: none;
+  box-shadow: 0 0 0 2px rgba(0,0,0,0.5);
+  animation: clickPing 0.6s ease-out forwards;
+}
+.click-marker.hidden { display: none; }
+
+.frame-busy {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 5;
+  pointer-events: auto;
+  color: var(--fg);
+  font-size: 12px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.frame-busy.hidden { display: none; }
+.frame-busy .spinner {
+  width: 42px;
+  height: 42px;
+  border: 3px solid rgba(255,255,255,0.18);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: frameSpin 0.9s linear infinite;
+}
+.frame-busy-label {
+  color: var(--muted);
+  text-shadow: 0 1px 2px rgba(0,0,0,0.6);
+}
+@keyframes frameSpin {
+  to { transform: rotate(360deg); }
+}
+@keyframes clickPing {
+  0%   { opacity: 1; transform: scale(0.6); }
+  100% { opacity: 0; transform: scale(1.6); }
+}
+
+.frame-mouse-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 6px;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.frame-mouse-controls .mouse-btn {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  min-height: 32px;
+}
+.frame-mouse-controls .mouse-btn:active { background: #2a2f37; }
+.frame-mouse-controls .mouse-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.frame-mouse-controls .mouse-toggle {
+  font-size: 12px;
+  color: var(--muted);
+  margin-right: auto;
+}
+
+.frame-keyboard-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 6px;
+  border-top: 1px solid var(--border);
+}
+.frame-keyboard-controls .passthrough {
+  flex: 1;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-family: var(--mono);
+  font-size: 13px;
+  min-height: 32px;
+}
+.frame-keyboard-controls .passthrough:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.frame-keyboard-controls .passthrough.busy {
+  opacity: 0.6;
+}
+.frame-keyboard-controls .kb-btn {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  min-height: 32px;
+  font-family: var(--mono);
+}
+.frame-keyboard-controls .kb-btn:active { background: #2a2f37; }
+.frame-keyboard-controls .kb-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+#paste-modal .modal-card {
+  width: min(560px, 96vw);
+}
+#paste-modal .paste-meta {
+  margin-bottom: 8px;
+}
+#paste-modal label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 8px 0 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+#paste-modal #paste-path {
+  width: 100%;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+#paste-modal #paste-content {
+  width: 100%;
+  resize: vertical;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+#paste-modal .paste-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 10px 0 4px;
+  align-items: center;
+}
+#paste-modal .paste-options .opt {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 13px;
+  color: var(--fg);
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
 .empty {
   color: var(--muted);
   font-size: 13px;
