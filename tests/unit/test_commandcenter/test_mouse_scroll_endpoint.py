@@ -175,7 +175,10 @@ def _build_client(store, bus):
 def test_scroll_positive_amount(
     store, bus, mouse_log, mock_mouse_cls, mock_capture_cls,
 ):
-    """Fast path: no position → just send the wheel tick."""
+    """Fast path: amount=3 fans out to 3 × scroll(+1) on the Pi.
+    macOS HID stacks treat sequential single-tick reports as a
+    gesture and apply real scroll acceleration; one big
+    scroll(N) report it caps to a tiny visual scroll instead."""
     with patched_runtime(mock_mouse_cls, mock_capture_cls):
         client = _build_client(store, bus)
         r = client.post(
@@ -185,9 +188,15 @@ def test_scroll_positive_amount(
     body = r.json()
     assert body["ok"] is True
     assert body["amount"] == 3
+    assert body["ticks_sent"] == 3
     assert body["homed"] is False
     scroll_calls = [c for c in mouse_log if c[0] == "scroll"]
-    assert scroll_calls == [("scroll", {"amount": 3})]
+    # Three sequential single-tick reports, not one scroll(3).
+    assert scroll_calls == [
+        ("scroll", {"amount": 1}),
+        ("scroll", {"amount": 1}),
+        ("scroll", {"amount": 1}),
+    ]
 
 
 def test_scroll_with_cached_position_skips_home(
@@ -206,8 +215,12 @@ def test_scroll_with_cached_position_skips_home(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["homed"] is False
+    assert body["ticks_sent"] == 2
     scroll_calls = [c for c in mouse_log if c[0] == "scroll"]
-    assert scroll_calls == [("scroll", {"amount": 2})]
+    assert scroll_calls == [
+        ("scroll", {"amount": 1}),
+        ("scroll", {"amount": 1}),
+    ]
 
 
 def test_scroll_negative_amount(
@@ -220,8 +233,10 @@ def test_scroll_negative_amount(
         )
     assert r.status_code == 200
     assert r.json()["amount"] == -5
+    assert r.json()["ticks_sent"] == 5
     scroll_calls = [c for c in mouse_log if c[0] == "scroll"]
-    assert scroll_calls == [("scroll", {"amount": -5})]
+    # Five single-tick reports, negative direction.
+    assert scroll_calls == [("scroll", {"amount": -1})] * 5
 
 
 def test_scroll_position_optional(

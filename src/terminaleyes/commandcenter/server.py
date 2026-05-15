@@ -619,12 +619,24 @@ def create_app(
         )
 
         if not needs_home:
-            # Fast path: just send the wheel tick, no webcam, no homer.
-            # Reuses the lightweight _with_mouse helper.
+            # Fast path: just send the wheel ticks, no webcam, no
+            # homer. Fan amount out into |amount| single-tick reports
+            # with a short sleep between them — matches the working
+            # ScrollAgent pattern (agents/scroll.py) and produces the
+            # macOS-acceleration "this is a gesture" effect.
+            # Sending one big scroll(N) report was being interpreted
+            # by macOS as a single notch with magnitude N, which it
+            # caps to a tiny visual scroll.
+            sign = 1 if req.amount > 0 else -1
+            ticks = abs(req.amount)
+
             async def go(mouse):
-                await mouse.scroll(req.amount)
+                for _ in range(ticks):
+                    await mouse.scroll(sign)
+                    await asyncio.sleep(0.05)
                 return JSONResponse({
                     "ok": True, "amount": req.amount,
+                    "ticks_sent": ticks,
                     "x_pct": req.x_pct, "y_pct": req.y_pct,
                     "homed": False,
                 })
@@ -693,10 +705,16 @@ def create_app(
                 # Whether the home succeeded or not, fire the scroll
                 # — the operator clearly wants something to scroll
                 # and a partial home is usually still in the right
-                # general region.
-                await mouse.scroll(req.amount)
+                # general region. Fan out as single-tick reports
+                # (see fast path for rationale).
+                sign = 1 if req.amount > 0 else -1
+                ticks = abs(req.amount)
+                for _ in range(ticks):
+                    await mouse.scroll(sign)
+                    await asyncio.sleep(0.05)
                 return JSONResponse({
                     "ok": True, "amount": req.amount,
+                    "ticks_sent": ticks,
                     "x_pct": req.x_pct, "y_pct": req.y_pct,
                     "homed": True,
                     "home_ok": homed_ok,
