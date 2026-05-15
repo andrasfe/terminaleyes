@@ -249,7 +249,7 @@ def test_happy_path_first_sha_matches(
 
     # Behaviour check on HID side: no chunks-print, no overwrite-dd.
     kb_texts = [c[1]["text"] for c in kb_log if c[0] == "text"]
-    assert any(c.startswith("cat > /tmp/x.txt") for c in kb_texts)
+    assert any(c.startswith("base64 -d > /tmp/x.txt") for c in kb_texts)
     assert any(pp.SHA_OPEN in c for c in kb_texts)  # SHA print
     assert not any(pp.CHUNKS_OPEN in c for c in kb_texts)
     assert not any("seek=" in c for c in kb_texts)
@@ -736,6 +736,49 @@ def test_body_readback_page_budget_caps_at_60(
     assert spaces == 60
 
 
+def test_unicode_content_survives_via_base64_carrier(
+    store, bus, mock_kb, mock_capture, kb_log,
+):
+    """Regression: README.md uses box-drawing chars (─├│└→), em-dashes
+    (—), and other glyphs that have no HID scancode. The original
+    cat-based body transmission rejected them at the Pi (400 Bad
+    Request from char_to_hid). The base64 carrier MUST survive any
+    bytes — that's the whole point of the carrier swap."""
+    # A line containing every offender we found in the real README.
+    content = (
+        "Tree view: ├── src/  │   └── lib  ─── done\n"
+        "Em dash — and an arrow →  cross × symbol\n"
+    )
+    cb = content.encode("utf-8")
+    responses = [_sha_block(cb)]
+    with patched_runtime(mock_kb, mock_capture, responses):
+        client = _build_client(store, bus)
+        r = client.post("/api/paste-file", json={
+            "content": content,
+            "maximize": False,
+            "verify": True,
+        })
+    assert r.status_code == 200, r.text
+    assert r.json()["verify"]["match"] is True
+    # No raw Unicode byte should have been typed — only base64
+    # lines (charset [A-Za-z0-9+/=]) and the leading `base64 -d`
+    # command.
+    import re
+    b64_charset_re = re.compile(r"^[A-Za-z0-9+/=]+$")
+    body_texts = [
+        c[1]["text"] for c in kb_log
+        if c[0] == "text"
+        and not c[1]["text"].startswith("base64 -d > ")
+        and pp.SHA_OPEN not in c[1]["text"]
+    ]
+    # At least one line was base64-encoded body content.
+    body_b64 = [t for t in body_texts if t and b64_charset_re.match(t)]
+    assert body_b64
+    # And NO body line carried any of the original non-ASCII bytes.
+    for ch in "├─│└→—×":
+        assert not any(ch in t for t in body_texts)
+
+
 def test_readme_md_roundtrip_zero_diff(
     store, bus, mock_kb, mock_capture, kb_log, tmp_path,
 ):
@@ -899,7 +942,7 @@ def test_architecture_md_end_to_end_with_perfect_ocr(
     # Command sequence sanity: cat redirect → SHA print → clear →
     # more → spaces → q.
     kb_texts = [c[1]["text"] for c in kb_log if c[0] == "text"]
-    assert any(t.startswith("cat > /tmp/cc_paste.txt") for t in kb_texts)
+    assert any(t.startswith("base64 -d > /tmp/cc_paste.txt") for t in kb_texts)
     assert any(pp.SHA_OPEN in t for t in kb_texts)
     assert "clear" in kb_texts
     assert any(t.startswith("more /tmp/cc_paste.txt") for t in kb_texts)

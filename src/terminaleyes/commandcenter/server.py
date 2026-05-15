@@ -643,13 +643,18 @@ def create_app(
 
         Sequence:
           1. Maximize the focused window (optional).
-          2. ``cat > {path}`` + Enter — start cat reading from stdin.
-          3. Type content line-by-line, with Enter between lines and
-             Tab handled separately (HID has no \\n / \\t scancode).
-          4. Ctrl+D — close stdin, cat closes the file.
-          5. ``cat {path}`` + Enter — print it back so we can see it.
-          6. Capture a webcam frame, OCR the terminal, normalise
-             both texts and compute a similarity ratio.
+          2. ``base64 -d > {path}`` + Enter — start a decoder reading
+             stdin.
+          3. Type the base64-encoded content in 76-col lines. Base64
+             is restricted to ``[A-Za-z0-9+/=]``, all of which have
+             HID scancodes — so any byte content (including Unicode
+             box-drawing or other chars that have no key mapping)
+             survives the wire.
+          4. Ctrl+D — close stdin, base64 decodes the buffer and
+             writes the original bytes to the file.
+          5. ``shasum -a 256 {path}`` + Enter — print framed SHA.
+          6. Capture webcam, OCR the framed hash, compare. On
+             mismatch, drive the chunked-MD5 repair loop.
         """
         if runner.is_busy():
             raise HTTPException(409, "a run is currently in progress")
@@ -709,34 +714,40 @@ def create_app(
                     await kb.send_key_combo(["meta"], "Up")
                 await asyncio.sleep(1.0)
 
-            # 2) Start cat reading stdin → file.
-            await kb.send_text(f"cat > {req.path}")
+            # 2-3) Send the body as base64 piped through ``base64 -d``
+            # on the host. Typing raw content character-by-character
+            # would fail on any byte without an HID scancode (Unicode
+            # box-drawing, em-dash, etc.) — and would also break on
+            # operator-side shell-special chars the moment the host
+            # echoes them. Base64's charset is ``[A-Za-z0-9+/=]``,
+            # entirely covered by the HID map, so any byte goes
+            # through cleanly. The host decodes back to original
+            # bytes — SHA over the original is unchanged.
+            import base64 as _b64
+            content_b64 = _b64.b64encode(req.content.encode("utf-8")).decode("ascii")
+            # Standard MIME-style line wrap at 76 columns so each
+            # line is well under the Pi's text-buffer ceiling and so
+            # the terminal echo doesn't smear across the whole
+            # screen. ``base64 -d`` ignores newlines transparently.
+            B64_WRAP = 76
+            b64_lines = [
+                content_b64[i : i + B64_WRAP]
+                for i in range(0, len(content_b64), B64_WRAP)
+            ] or [""]
+
+            await kb.send_text(f"base64 -d > {req.path}")
             await asyncio.sleep(0.05)
             await kb.send_keystroke("Enter")
             await asyncio.sleep(0.35)
 
-            # 3) Type content. Split by \n (Enter) and within each
-            # line split by \t (Tab) since neither has a printable
-            # HID mapping. Empty lines just send Enter.
-            lines = req.content.split("\n")
-            # If content ends with "\n", split produces a trailing
-            # empty string; that becomes a final Enter, which matches
-            # operator intent.
-            for line in lines:
-                if "\t" in line:
-                    parts = line.split("\t")
-                    for j, part in enumerate(parts):
-                        if part:
-                            await kb.send_text(part)
-                        if j < len(parts) - 1:
-                            await kb.send_keystroke("Tab")
-                            await asyncio.sleep(0.02)
-                elif line:
+            for line in b64_lines:
+                if line:
                     await kb.send_text(line)
                 await kb.send_keystroke("Enter")
-                await asyncio.sleep(0.04)
+                await asyncio.sleep(0.03)
 
-            # 4) Ctrl+D closes cat's stdin.
+            # 4) Ctrl+D closes base64's stdin → it decodes the buffer
+            # and writes the original bytes to ``req.path``.
             await kb.send_key_combo(["ctrl"], "d")
             await asyncio.sleep(0.35)
 
@@ -744,7 +755,9 @@ def create_app(
                 "ok": True,
                 "wrote_path": req.path,
                 "sent_chars": len(req.content),
-                "sent_lines": len(lines),
+                "sent_lines": req.content.count("\n") + (
+                    0 if req.content.endswith("\n") else 1
+                ),
             }
 
             # 5) Verify + auto-repair via SHA-256 + chunked MD5 diff.
