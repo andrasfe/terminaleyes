@@ -95,7 +95,7 @@ def main() -> int:
         try:
             out = generate(
                 loader.model, loader.processor, formatted,
-                image=[img], max_tokens=24, temperature=0.1,
+                image=[img], max_tokens=120, temperature=0.1,
             )
             raw = getattr(out, "text", out) if not isinstance(out, str) else out
         except Exception as e:
