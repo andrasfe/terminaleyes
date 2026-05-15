@@ -26,10 +26,11 @@ Reuses scene-map + ShowUI grounding from ``ClosedLoopHomer`` for the
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -151,6 +152,44 @@ class StepRecord:
     ratio_x: float | None = None
     ratio_y: float | None = None
     note: str = ""
+
+
+def _persist_step(run_dir: Path, record: "StepRecord") -> None:
+    """Append one step record as a JSONL row to
+    ``<run_dir>/history.jsonl``. Best-effort; errors are swallowed
+    so a logging failure can't break a live homer run.
+
+    Each row is ``{ts, hid_dx, hid_dy, cursor_img: [x, y] | null,
+    measured_dx_pct, measured_dy_pct, ratio_x, ratio_y, ...}`` — the
+    fields a forward-model trainer needs to learn the OS-side
+    pointer-acceleration curve from observed cursor deltas.
+    """
+    try:
+        row = asdict(record)
+        # ``asdict`` turns tuples into lists, which is fine for JSON.
+        row["ts"] = time.time()
+        with (run_dir / "history.jsonl").open(
+            "a", encoding="utf-8",
+        ) as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        # Step recording must never break a live run.
+        pass
+
+
+def _record_step(
+    run_dir: Path,
+    history: list["StepRecord"],
+    record: "StepRecord",
+) -> None:
+    """Append ``record`` to in-memory ``history`` *and* persist it.
+
+    Used at every ``history.append(StepRecord(...))`` site so a
+    single API change covers both the existing in-memory contract
+    and the new on-disk JSONL training log.
+    """
+    history.append(record)
+    _persist_step(run_dir, record)
 
 
 @dataclass
@@ -360,7 +399,7 @@ class VisualServoHomer:
                             )
                         except Exception:
                             proof = None
-                        history.append(StepRecord(
+                        _record_step(run_dir, history, StepRecord(
                             cursor_img=cursor_img, target_img=target_img,
                             residual_pct=residual, hid_dx=0, hid_dy=0,
                             ratio_x=self._pct_per_hid_x,
@@ -419,7 +458,7 @@ class VisualServoHomer:
                             except Exception:
                                 pass
                             break
-                    history.append(StepRecord(
+                    _record_step(run_dir, history, StepRecord(
                         cursor_img=cursor_img, target_img=target_img,
                         residual_pct=residual, hid_dx=0, hid_dy=0,
                         ratio_x=self._pct_per_hid_x,
@@ -544,7 +583,7 @@ class VisualServoHomer:
                 f"{elapsed:.2f}s"
             )
 
-            history.append(StepRecord(
+            _record_step(run_dir, history, StepRecord(
                 cursor_img=cursor_img, target_img=target_img,
                 residual_pct=residual, hid_dx=hid_dx, hid_dy=hid_dy,
                 measured_dx_pct=measured_dx_pct,
