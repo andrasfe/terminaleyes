@@ -132,6 +132,21 @@ _PLANNER_FEW_SHOT = (
     '  {"name": "launch", "kwargs": {"app": "firefox", "platform": "linux"}},\n'
     '  {"name": "keys",   "kwargs": {"modifiers": ["alt"], "key": "F4"}}\n'
     "]}\n\n"
+    "Intent: close the browser\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch", "kwargs": {"app": "firefox", "platform": "linux"}},\n'
+    '  {"name": "keys",   "kwargs": {"modifiers": ["alt"], "key": "F4"}}\n'
+    "]}\n\n"
+    "Intent: close the browser window\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch", "kwargs": {"app": "firefox", "platform": "linux"}},\n'
+    '  {"name": "keys",   "kwargs": {"modifiers": ["alt"], "key": "F4"}}\n'
+    "]}\n\n"
+    "Intent: quit firefox\n"
+    'Reply: {"plan": [\n'
+    '  {"name": "launch", "kwargs": {"app": "firefox", "platform": "linux"}},\n'
+    '  {"name": "keys",   "kwargs": {"modifiers": ["ctrl"], "key": "q"}}\n'
+    "]}\n\n"
     "Intent: save the file\n"
     'Reply: {"plan": [\n'
     '  {"name": "keys", "kwargs": {"modifiers": ["ctrl"], "key": "s"}}\n'
@@ -883,6 +898,43 @@ def _plan_one(
             "scroll", ScrollAgent,
             {"direction": direction, "amount": amount},
         )]
+
+    # "close (the) <app> [window]" / "quit <app>" → [launch X, keys
+    # Alt+F4]. The LLM planner had been missing the launch step for
+    # generic phrasings like "close the browser" (no specific app
+    # name), so a bare keys Alt+F4 closed whatever happened to be
+    # foregrounded — usually nothing useful. The rule-planner gives
+    # deterministic behaviour for the common app names; unknown
+    # apps fall through to the LLM as before.
+    close_match = re.match(
+        r"^(?:close|quit)\s+(?:the\s+)?"
+        r"(terminal|firefox|chrome|chromium|browser|calculator|"
+        r"writer|libreoffice|files|nautilus|finder)"
+        r"(?:\s+window)?$",
+        sl, re.IGNORECASE,
+    )
+    if close_match:
+        word = close_match.group(1).lower()
+        # Map generic synonyms to the launcher's canonical app key.
+        # LaunchAgent.APP_ALIASES already handles the rest.
+        app = {
+            "browser": "firefox",
+            "libreoffice": "libreoffice writer",
+            "nautilus": "files",
+            "finder": "files",
+        }.get(word, word)
+        return [
+            PlanStep(
+                "launch", LaunchAgent,
+                {"app": app, "platform": platform},
+                best_effort=True,
+            ),
+            PlanStep(
+                "keys", KeyComboAgent,
+                {"modifiers": ["alt"], "key": "F4",
+                 "platform": platform},
+            ),
+        ]
 
     return []
 
