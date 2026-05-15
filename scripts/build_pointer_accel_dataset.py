@@ -27,10 +27,11 @@ weird near borders).
 Filtering:
   * Drop steps where ``hid_dx == 0 && hid_dy == 0`` (those are post-
     click "confirm" records, not pointer-accel samples).
-  * Drop steps without a measured delta (the open-loop-fallback
-    branch — we can't supervise on those).
-  * Drop steps with note containing "openloop_fallback" since the
-    HSV measurement failed for them.
+  * Drop steps without a measured delta. The homer logs a measured
+    delta even when HSV detection fails (note=openloop_fallback)
+    via frame-diff fallback — those rows are NOISIER but still
+    carry the right shape of the curve, so we keep them and let
+    the training MSE handle the noise.
 
 Splits 80/10/10 by trajectory.
 """
@@ -59,8 +60,6 @@ def _row_from_step(traj_id: str, idx: int, step: dict) -> dict | None:
     mdx = step.get("measured_dx_pct")
     mdy = step.get("measured_dy_pct")
     if mdx is None or mdy is None:
-        return None
-    if "openloop_fallback" in (step.get("note") or ""):
         return None
     cursor = step.get("cursor_img")
     cx = cy = None
