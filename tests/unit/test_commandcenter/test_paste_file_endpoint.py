@@ -736,6 +736,116 @@ def test_body_readback_page_budget_caps_at_60(
     assert spaces == 60
 
 
+def test_readme_md_roundtrip_zero_diff(
+    store, bus, mock_kb, mock_capture, kb_log, tmp_path,
+):
+    """End-to-end round-trip: paste README.md into ~/Downloads on the
+    "host", read it back via the `more` pipeline, reconstruct, write
+    to a file, and run a real diff(1) — assert zero differences.
+
+    Two independent identity proofs are required to declare the
+    feature 'working':
+
+    1. **SHA-256 match** — the file on the host is byte-identical to
+       what we sent. Deterministic, cryptographic.
+    2. **Body readback zero-diff** — the content we OCR'd back from
+       the host's `more` output, after stripping the pager prompt
+       and blank-line normalisation, reconstructs cleanly into a
+       file that diffs zero against the original.
+
+    Live hardware will have OCR noise so (2) will degrade in
+    practice — but the *protocol* and the *normaliser* are validated
+    here to produce zero diff in the limit of clean OCR. That's the
+    contract: when OCR is good, the readback is exact."""
+    from pathlib import Path
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[3]
+    readme = repo_root / "README.md"
+    if not readme.exists():
+        pytest.skip("README.md not in repo root")
+    content = readme.read_text()
+    cb = content.encode()
+
+    # Simulate what a maximised terminal showing `more file` would
+    # render: paginated chunks of the file's lines, optionally with
+    # a `--More--(NN%)` prompt on the bottom row of each non-final
+    # page. The endpoint's normaliser must strip those.
+    all_lines = content.split("\n")
+    page_size = 30
+    pages = []
+    for i in range(0, len(all_lines), page_size):
+        chunk_lines = all_lines[i : i + page_size]
+        page_text = "\n".join(chunk_lines)
+        # Append a realistic pager prompt on all non-final pages.
+        if i + page_size < len(all_lines):
+            pct = int(100 * (i + page_size) / len(all_lines))
+            page_text += f"\n--More--({pct}%)"
+        pages.append(page_text)
+
+    pages_budget = max(2, (content.count("\n") + 1) // 30 + 2)
+    pages_budget = min(pages_budget, 60)
+    # Pad any "post-EOF" pages the endpoint captures with empty OCR.
+    responses = [_sha_block(cb)] + pages + [""] * pages_budget
+
+    with patched_runtime(mock_kb, mock_capture, responses):
+        client = _build_client(store, bus)
+        r = client.post("/api/paste-file", json={
+            # ~/Downloads/README.md — the host-shell expansion of ~
+            # is fine; for the mock it's just an opaque path string.
+            "content": content,
+            "path": "~/Downloads/README.md",
+            "maximize": False,
+            "verify": True,
+            "body_readback": True,
+        })
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    # (1) Cryptographic identity proof.
+    assert data["verify"]["match"] is True, (
+        f"SHA did not match: {data['verify']}"
+    )
+
+    # (2) Run an actual diff(1) between the original README.md and
+    # the OCR-reconstructed body. With perfect OCR + the new
+    # --More-- stripping, this must be empty.
+    rb = data["body_readback"]
+    recovered = rb["recovered_text"]
+    recovered_path = tmp_path / "recovered_README.md"
+    recovered_path.write_text(recovered)
+
+    # Normalise the *original* the same way the endpoint normalised
+    # the OCR'd recovery — empty lines dropped, lines rstripped,
+    # pager prompt filtered. Without doing both sides the same way
+    # we'd be comparing raw against normalised and reporting noise.
+    def _norm_for_diff(s: str) -> str:
+        import re
+        more_re = re.compile(
+            r"^\s*-{1,3}\s*More\s*-{1,3}\s*\(\s*\d+\s*%\s*\)\s*$",
+            re.IGNORECASE,
+        )
+        return "\n".join(
+            ln.rstrip()
+            for ln in s.replace("\r", "").split("\n")
+            if ln.strip() and not more_re.match(ln.rstrip())
+        ).strip()
+
+    normalised_original = tmp_path / "original_README_norm.md"
+    normalised_original.write_text(_norm_for_diff(content))
+
+    proc = subprocess.run(
+        ["diff", "-u", str(normalised_original), str(recovered_path)],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, (
+        f"diff is non-empty:\n{proc.stdout[:2000]}"
+    )
+    # rb.similarity should be 1.0 in this clean-OCR scenario.
+    assert rb["similarity"] == 1.0, rb
+
+
 def test_architecture_md_end_to_end_with_perfect_ocr(
     store, bus, mock_kb, mock_capture, kb_log,
 ):

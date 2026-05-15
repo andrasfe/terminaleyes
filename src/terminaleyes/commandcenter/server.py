@@ -1081,12 +1081,27 @@ def create_app(
                 # Normalise & compare. OCR is lossy on body text
                 # (unlike the SHA line's restricted charset), so the
                 # similarity is an approximate sanity check, not a
-                # cryptographic verdict.
+                # cryptographic verdict. We:
+                #   - drop empty lines (OCR routinely fabricates them)
+                #   - rstrip each line (trailing whitespace is meaningless)
+                #   - strip the pager's own ``--More--(NN%)`` prompt
+                #     line so the readback isn't penalised for it
+                import re as _re
+                _MORE_PROMPT = _re.compile(
+                    r"^\s*-{1,3}\s*More\s*-{1,3}\s*\(\s*\d+\s*%\s*\)\s*$",
+                    _re.IGNORECASE,
+                )
+
                 def _norm_body(s: str) -> str:
-                    return "\n".join(
-                        ln.rstrip() for ln in s.replace("\r", "").split("\n")
-                        if ln.strip()
-                    ).strip()
+                    out_lines = []
+                    for ln in s.replace("\r", "").split("\n"):
+                        ln = ln.rstrip()
+                        if not ln.strip():
+                            continue
+                        if _MORE_PROMPT.match(ln):
+                            continue
+                        out_lines.append(ln)
+                    return "\n".join(out_lines).strip()
 
                 accumulated = "\n".join(pages_ocr)
                 expected_norm = _norm_body(req.content)
@@ -1106,6 +1121,11 @@ def create_app(
                     "ocr_chars": len(ocr_norm),
                     # Bounded sample for UI.
                     "ocr_sample": accumulated[:2000],
+                    # Full reconstructed-after-normalize text so an
+                    # operator (or test) can run a real diff against
+                    # the source — useful when SHA matches and they
+                    # still want to *see* the byte-level recovery.
+                    "recovered_text": ocr_norm,
                 }
 
             return JSONResponse(result)
