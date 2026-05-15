@@ -629,16 +629,24 @@ def create_app(
                     "homed": False,
                 })
 
+            tag = "manual_scroll"
+            if pos_specified:
+                tag = (
+                    f"manual_scroll_{int(req.x_pct * 100):02d}_"
+                    f"{int(req.y_pct * 100):02d}"
+                )
             try:
-                return await _with_mouse(go)
+                resp = await _with_mouse(go)
             finally:
-                tag = "manual_scroll"
-                if pos_specified:
-                    tag = (
-                        f"manual_scroll_{int(req.x_pct * 100):02d}_"
-                        f"{int(req.y_pct * 100):02d}"
-                    )
-                _schedule_snapshot(tag)
+                # Synchronous post-action snapshot so the response
+                # returns *after* a fresh frame is on disk. Without
+                # this, the cc UI showed stale screenshots until
+                # FrameStore polled (~250 ms later) — visually it
+                # looked like "scroll did nothing." Cost is one
+                # webcam open + grab (~500 ms) per scroll, which is
+                # already coalesced from many wheel events.
+                await _snapshot_after_manual_action(tag)
+            return resp
 
         # Slow path: home cursor to (x_pct, y_pct) THEN scroll.
         # Same fixture as click_at — context_factory builds a full
