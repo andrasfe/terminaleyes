@@ -691,6 +691,22 @@ async function flushScroll() {
   }
 }
 
+// Normalise a wheel event's deltaY to pixels regardless of
+// deltaMode. A real mouse with a notched wheel typically reports
+// `deltaMode = 1` (DOM_DELTA_LINE) with deltaY = ±3 — those 3 are
+// lines, not pixels, and treating them as 3 px never crosses the
+// 30-px flush threshold so the user observes "scroll does nothing"
+// even though the handler fires. Trackpads usually report
+// deltaMode = 0 (pixels) with much larger deltaY values.
+function _wheelDeltaPx(e) {
+  switch (e.deltaMode) {
+    case 1: return e.deltaY * 38;     // line ≈ ~38 px (Firefox default)
+    case 2: return e.deltaY * 800;    // page ≈ viewport-ish; unusual
+    case 0:
+    default: return e.deltaY;
+  }
+}
+
 $frame.addEventListener("wheel", (e) => {
   // Scrolling over the screenshot is unambiguous intent (you're
   // trying to scroll the content shown there), so unlike click_at
@@ -709,7 +725,7 @@ $frame.addEventListener("wheel", (e) => {
       _wheelLastPos.y = Math.max(0, Math.min(1, y / rect.height));
     }
   }
-  _wheelPxAccum += e.deltaY;
+  _wheelPxAccum += _wheelDeltaPx(e);
   if (_wheelFlushTimer !== null) {
     clearTimeout(_wheelFlushTimer);
   }

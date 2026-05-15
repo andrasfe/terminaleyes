@@ -491,6 +491,108 @@ def test_wheel_fires_regardless_of_click_to_move(tmp_path):
                 browser.close()
 
 
+def test_wheel_deltamode_line_normalised(tmp_path):
+    """Real mouse-wheel events arrive with ``deltaMode=1``
+    (DOM_DELTA_LINE) and small ``deltaY`` values like ±3 (lines,
+    not pixels). The handler must scale those up so a normal
+    wheel-notch produces a /api/mouse/scroll POST instead of
+    silently piling under the 30-px threshold."""
+    mouse_log: list[tuple[str, dict]] = []
+    port = _pick_free_port()
+    with _serve_cc(tmp_path, mouse_log, port) as base_url:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                ctx = browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                )
+                page = ctx.new_page()
+                seen = []
+                page.route(
+                    "**/api/mouse/scroll",
+                    lambda route: (seen.append(
+                        route.request.post_data_json or {}
+                    ), route.continue_()),
+                )
+
+                page.goto(base_url, wait_until="domcontentloaded")
+                page.wait_for_function(
+                    "typeof window.__teTest === 'object'",
+                    timeout=5_000,
+                )
+                _TINY_PNG = (
+                    "data:image/png;base64,"
+                    "iVBORw0KGgoAAAANSUhEUgAAAKAAAABaCAIAAACwpMoFAAAA60lEQVR4"
+                    "nO3RAQkAIADAMDWNIeyfyxQinC3B4XPvM+havwN4y+A4g+MMjjM4zuA4g+MMjjM4zuA4g+MM"
+                    "jjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MM"
+                    "jjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MM"
+                    "jjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MM"
+                    "jjM4zuA4g+MMjjN4tF2eMgFA/IQ9PAAAAABJRU5ErkJggg=="
+                )
+                page.evaluate(
+                    f"""(src) => new Promise((resolve) => {{
+                        const f = document.getElementById('frame');
+                        f.classList.remove('empty');
+                        f.style.width  = '800px';
+                        f.style.height = '450px';
+                        f.style.display = 'block';
+                        f.onload = () => resolve(true);
+                        f.src = src;
+                        if (f.complete && f.naturalWidth > 0) resolve(true);
+                    }})""",
+                    _TINY_PNG,
+                )
+                page.wait_for_function(
+                    "() => document.getElementById('frame').naturalWidth > 0",
+                    timeout=4_000,
+                )
+                # One mouse-wheel-notch in DOM_DELTA_LINE mode:
+                # deltaMode=1, deltaY=3. Without normalisation this
+                # would add 3 px to the accumulator and never flush.
+                _DISPATCH_RECT_JS = """() => {
+                    const f = document.getElementById('frame');
+                    const w = f.naturalWidth, h = f.naturalHeight;
+                    const box = f.getBoundingClientRect();
+                    const scale = Math.min(box.width / w, box.height / h);
+                    return {
+                        left: box.left + (box.width - w * scale) / 2,
+                        top:  box.top  + (box.height - h * scale) / 2,
+                        width: w * scale, height: h * scale,
+                    };
+                }"""
+                page.evaluate(
+                    f"""() => {{
+                        const rect = ({_DISPATCH_RECT_JS})();
+                        document.getElementById('frame').dispatchEvent(
+                            new WheelEvent('wheel', {{
+                                bubbles: true, cancelable: true,
+                                deltaMode: 1,    // DOM_DELTA_LINE
+                                deltaY: 3,       // one notch
+                                clientX: rect.left + rect.width / 2,
+                                clientY: rect.top + rect.height / 2,
+                            }})
+                        );
+                    }}"""
+                )
+                page.wait_for_function(
+                    "() => window.__teTest "
+                    "  && !window.__teTest.peekScrollState().flushing "
+                    "  && window.__teTest.peekScrollState().px < 30",
+                    timeout=4_000,
+                )
+                page.wait_for_timeout(200)
+                assert seen, (
+                    "deltaMode=1, deltaY=3 must fire at least one "
+                    "/api/mouse/scroll POST after normalisation; "
+                    "raw 3 px would never cross the 30 px gate."
+                )
+                # 3 lines × 38 px/line = 114 px → 3 ticks
+                # (114/30 floored = 3, remainder 24 stays in accum).
+                assert seen[0]["amount"] >= 3, seen[0]
+            finally:
+                browser.close()
+
+
 def test_wheel_shows_busy_indicator(tmp_path):
     """Per the cc UX contract the hourglass must show for every
     manual mouse action — including scroll. We verify ``#frame-busy``
