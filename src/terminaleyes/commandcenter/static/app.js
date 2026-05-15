@@ -602,6 +602,117 @@ if ($btnMouseMiddle)
 if ($btnMouseRight)
   $btnMouseRight.addEventListener("click", () => fireButton("right"));
 
+// ── mouse wheel → remote scroll ────────────────────────────────
+// When the operator scrolls while hovering over the screenshot, we
+// forward wheel ticks to the target via /api/mouse/scroll. Browsers
+// emit many wheel events per gesture (often dozens of small
+// deltaY samples), so we accumulate the pixel delta and flush via
+// a single coalesced POST per ~120 ms. Without coalescing, a single
+// trackpad gesture would spam the Pi with 30+ HTTP requests.
+//
+// Position (x_pct, y_pct) is included for telemetry / snapshot
+// labelling — the actual scroll happens at the target's current
+// cursor location. Hovering-over-region routing would need a fast
+// open-loop home, which is on the to-do list, not in this MVP.
+let _wheelPxAccum = 0;
+let _wheelLastPos = { x: null, y: null };
+let _wheelFlushTimer = null;
+let _wheelFlushing = false;
+// Browsers report deltaY in pixels (DOM_DELTA_PIXEL); a typical
+// mouse-wheel notch is ~100 px. We map ~100 px to one Pi wheel tick
+// and clamp the per-POST amount so the Pi never receives a single
+// scroll larger than ±10 ticks.
+const WHEEL_PX_PER_TICK = 100;
+const WHEEL_MAX_TICKS_PER_POST = 10;
+const WHEEL_FLUSH_DELAY_MS = 100;
+
+async function flushScroll() {
+  if (_wheelFlushing) return;
+  _wheelFlushing = true;
+  try {
+    while (Math.abs(_wheelPxAccum) >= WHEEL_PX_PER_TICK) {
+      const sign = Math.sign(_wheelPxAccum);
+      const ticks = Math.min(
+        WHEEL_MAX_TICKS_PER_POST,
+        Math.floor(Math.abs(_wheelPxAccum) / WHEEL_PX_PER_TICK),
+      );
+      const amount = sign * ticks;
+      // Drain the pixels we're about to send so simultaneous wheel
+      // events accumulate only the REMAINDER, not the whole gesture.
+      _wheelPxAccum -= amount * WHEEL_PX_PER_TICK;
+      const body = {
+        amount,
+        x_pct: _wheelLastPos.x,
+        y_pct: _wheelLastPos.y,
+      };
+      appendSystemLog(
+        "INFO",
+        `mouse scroll amount=${amount} ` +
+        `at (${_wheelLastPos.x?.toFixed(3)}, ${_wheelLastPos.y?.toFixed(3)})`,
+      );
+      try {
+        const r = await fetch("/api/mouse/scroll", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          let t = "";
+          try { t = await r.text(); } catch (_) {}
+          appendSystemLog("ERROR", `/api/mouse/scroll → ${r.status} ${t}`);
+          // Drop the rest of the accumulated buffer on a server
+          // error — otherwise we'd retry the same failing call.
+          _wheelPxAccum = 0;
+          break;
+        }
+      } catch (e) {
+        appendSystemLog("ERROR", `/api/mouse/scroll failed: ${e}`);
+        _wheelPxAccum = 0;
+        break;
+      }
+    }
+  } finally {
+    _wheelFlushing = false;
+  }
+}
+
+$frame.addEventListener("wheel", (e) => {
+  // Gate on the same toggle that controls click-at — if remote
+  // mouse control is disabled, wheel events behave as native
+  // page-scroll.
+  if (!$optClickToMove || !$optClickToMove.checked) return;
+  if ($frame.classList.contains("empty")) return;
+  // Don't let the browser also scroll the cc UI's pane.
+  e.preventDefault();
+  const rect = imageRect();
+  if (rect) {
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    if (x >= 0 && y >= 0 && x <= rect.width && y <= rect.height) {
+      _wheelLastPos.x = Math.max(0, Math.min(1, x / rect.width));
+      _wheelLastPos.y = Math.max(0, Math.min(1, y / rect.height));
+    }
+  }
+  _wheelPxAccum += e.deltaY;
+  if (_wheelFlushTimer !== null) {
+    clearTimeout(_wheelFlushTimer);
+  }
+  _wheelFlushTimer = setTimeout(() => {
+    _wheelFlushTimer = null;
+    flushScroll();
+  }, WHEEL_FLUSH_DELAY_MS);
+}, { passive: false });
+
+// Expose for the test harness — playwright can call window.__teTest
+// to bypass UI gating during automated tests.
+window.__teTest = window.__teTest || {};
+window.__teTest.flushScroll = flushScroll;
+window.__teTest.peekScrollState = () => ({
+  px: _wheelPxAccum,
+  pos: { ..._wheelLastPos },
+  flushing: _wheelFlushing,
+});
+
 // ── keyboard passthrough ───────────────────────────────────────
 // Each keystroke in the passthrough field is forwarded to the host.
 // Requests are serialized so typing fast doesn't reorder them: HTTP

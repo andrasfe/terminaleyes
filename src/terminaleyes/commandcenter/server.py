@@ -68,6 +68,23 @@ class MouseMoveRequest(BaseModel):
     dy: int = Field(ge=-127, le=127)
 
 
+class MouseScrollRequest(BaseModel):
+    """Wheel-tick scroll. ``amount`` is signed in mouse-wheel units —
+    positive for "scroll down/away from user", negative for "up".
+    Matches the Pi-side ``mouse.scroll(amount)`` convention.
+
+    ``x_pct`` / ``y_pct`` are optional and only carried for telemetry/
+    snapshot labelling today; the scroll is applied at the target's
+    current cursor position. Moving the target cursor to the operator's
+    hover position before scrolling is a future enhancement, gated on
+    a faster open-loop home path (the current homer is too slow for
+    per-wheel-event latency).
+    """
+    amount: int = Field(ge=-30, le=30)
+    x_pct: float | None = Field(default=None, ge=0.0, le=1.0)
+    y_pct: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
 class KeyboardTextRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4096)
     warmup: bool = False
@@ -546,6 +563,31 @@ def create_app(
             return await _with_mouse(go)
         finally:
             _schedule_snapshot("manual_move")
+
+    @app.post("/api/mouse/scroll")
+    async def mouse_scroll(req: MouseScrollRequest) -> JSONResponse:
+        """Forward a wheel-tick to the target. Fired by the cc UI's
+        wheel listener on the screenshot pane; ``x_pct`` / ``y_pct``
+        carry where the operator was hovering when the wheel fired
+        (used for snapshot labelling only — the scroll itself goes
+        to the target's current cursor position)."""
+        async def go(mouse):
+            await mouse.scroll(req.amount)
+            return JSONResponse({
+                "ok": True, "amount": req.amount,
+                "x_pct": req.x_pct, "y_pct": req.y_pct,
+            })
+
+        try:
+            return await _with_mouse(go)
+        finally:
+            tag = "manual_scroll"
+            if req.x_pct is not None and req.y_pct is not None:
+                tag = (
+                    f"manual_scroll_{int(req.x_pct * 100):02d}_"
+                    f"{int(req.y_pct * 100):02d}"
+                )
+            _schedule_snapshot(tag)
 
     # ── manual keyboard control ──────────────────────────────────
     async def _with_keyboard(action):
