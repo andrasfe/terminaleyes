@@ -175,20 +175,39 @@ def _build_client(store, bus):
 def test_scroll_positive_amount(
     store, bus, mouse_log, mock_mouse_cls, mock_capture_cls,
 ):
+    """Fast path: no position → just send the wheel tick."""
     with patched_runtime(mock_mouse_cls, mock_capture_cls):
         client = _build_client(store, bus)
         r = client.post(
-            "/api/mouse/scroll",
-            json={"amount": 3, "x_pct": 0.5, "y_pct": 0.5},
+            "/api/mouse/scroll", json={"amount": 3},
         )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
     assert body["amount"] == 3
-    assert body["x_pct"] == 0.5
-    assert body["y_pct"] == 0.5
+    assert body["homed"] is False
     scroll_calls = [c for c in mouse_log if c[0] == "scroll"]
     assert scroll_calls == [("scroll", {"amount": 3})]
+
+
+def test_scroll_with_cached_position_skips_home(
+    store, bus, mouse_log, mock_mouse_cls, mock_capture_cls,
+):
+    """When the operator hovers within tolerance of the cached
+    last-home position, the slow homer path is skipped."""
+    with patched_runtime(mock_mouse_cls, mock_capture_cls):
+        client = _build_client(store, bus)
+        # Prime the cache so the position lookup is a hit.
+        client.app.state.last_scroll_home_xy = (0.5, 0.5)
+        r = client.post(
+            "/api/mouse/scroll",
+            json={"amount": 2, "x_pct": 0.51, "y_pct": 0.49},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["homed"] is False
+    scroll_calls = [c for c in mouse_log if c[0] == "scroll"]
+    assert scroll_calls == [("scroll", {"amount": 2})]
 
 
 def test_scroll_negative_amount(
@@ -208,7 +227,8 @@ def test_scroll_negative_amount(
 def test_scroll_position_optional(
     store, bus, mouse_log, mock_mouse_cls, mock_capture_cls,
 ):
-    """The endpoint must accept a scroll with no position fields."""
+    """The endpoint must accept a scroll with no position fields.
+    No position → no homing → fast path, no x_pct/y_pct echoed."""
     with patched_runtime(mock_mouse_cls, mock_capture_cls):
         client = _build_client(store, bus)
         r = client.post("/api/mouse/scroll", json={"amount": 1})
@@ -216,6 +236,7 @@ def test_scroll_position_optional(
     body = r.json()
     assert body["x_pct"] is None
     assert body["y_pct"] is None
+    assert body["homed"] is False
 
 
 @pytest.mark.parametrize("bad", [

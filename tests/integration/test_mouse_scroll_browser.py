@@ -127,6 +127,13 @@ def _serve_cc(tmp_path: Path, mouse_log: list, port: int):
         app = create_app(
             _factory, frame_store=store, bus=bus, settings=_Settings(),
         )
+        # Pre-prime the scroll-home cache so the position-aware
+        # wheel POSTs in these tests hit the fast path (just send
+        # mouse.scroll without invoking the visual-servo homer,
+        # which would require real webcam + opencv). The slow
+        # home-then-scroll path is exercised separately in the
+        # unit tests via mocked factories.
+        app.state.last_scroll_home_xy = (0.5, 0.5)
 
         config = uvicorn.Config(
             app, host="127.0.0.1", port=port,

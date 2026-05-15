@@ -629,6 +629,18 @@ const WHEEL_FLUSH_DELAY_MS = 80;
 
 async function flushScroll() {
   if (_wheelFlushing) return;
+  // Another mouse action is in flight (click, click_at, paste-file).
+  // Don't barge — re-arm the debounce timer so we try again once
+  // the in-flight action releases the busy state.
+  if (_mouseBusy) {
+    if (_wheelFlushTimer === null) {
+      _wheelFlushTimer = setTimeout(() => {
+        _wheelFlushTimer = null;
+        flushScroll();
+      }, WHEEL_FLUSH_DELAY_MS);
+    }
+    return;
+  }
   _wheelFlushing = true;
   // Show the same busy hourglass other manual mouse actions use —
   // user feedback on every action, per the cc UX contract.

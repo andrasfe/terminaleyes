@@ -316,6 +316,7 @@ class VisualServoHomer:
         last_proof: str | None,
         confirm_frames: int = CONFIRM_FRAMES,
         click_tol_pct: float = CLICK_TOL_PCT,
+        click: bool = True,
     ) -> ClickOutcome:
         """Run the visual-servo loop until cursor lands on target_aim.
 
@@ -345,8 +346,13 @@ class VisualServoHomer:
                 if confirm_count >= confirm_frames:
                     if not verify_navigation:
                         # Manual mode: geometric confirm is enough.
-                        # Click once, capture proof, return success.
-                        await self._session._executor._mouse.click(button)
+                        # Click once (unless caller opted out — used
+                        # by /api/mouse/scroll, which homes the
+                        # cursor to the hover position WITHOUT
+                        # clicking, then scrolls at that pixel),
+                        # capture proof, return success.
+                        if click:
+                            await self._session._executor._mouse.click(button)
                         try:
                             await asyncio.sleep(0.4)
                             proof = await self._capture_proof(
@@ -571,6 +577,7 @@ class VisualServoHomer:
         button: str = "left",
         *,
         hotspot_offset: bool = True,
+        click: bool = True,
     ) -> ClickOutcome:
         """Home the cursor to a pre-located pixel on the webcam frame.
 
@@ -654,6 +661,7 @@ class VisualServoHomer:
             verify_navigation=False, last_proof=None,
             confirm_frames=1,
             click_tol_pct=0.006,
+            click=click,
         )
 
     # ────────────────────── target localization ──────────────────────

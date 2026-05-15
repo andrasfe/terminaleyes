@@ -162,6 +162,21 @@ def create_app(
     # background follow-up snapshot don't fight over the device.
     _manual_capture_lock = asyncio.Lock()
 
+    # Single mutex around every manual mouse action (click_at,
+    # click, move, scroll, plus post-action snapshot work). Two
+    # concurrent HID reports over BT cause genuinely undefined
+    # behaviour — at best the second wins and the first is lost,
+    # at worst the Pi rejects both. Cheap to acquire; the cc UI
+    # already enforces a single-in-flight discipline at the JS
+    # level, this is the belt-and-braces guarantee on the server.
+    _manual_mouse_lock = asyncio.Lock()
+
+    # Cache of the last (x_pct, y_pct) the cursor was visually
+    # homed to. /api/mouse/scroll skips a fresh home when the
+    # operator hovers within tolerance of the cached position, so
+    # a continuous scroll gesture re-uses the homing cost.
+    app.state.last_scroll_home_xy = None
+
     @app.on_event("startup")
     async def _on_startup() -> None:
         bus.bind_loop(asyncio.get_event_loop())
@@ -445,21 +460,22 @@ def create_app(
             timeout=10.0,
             transport=cfg.transport,
         )
-        try:
-            await mouse.connect()
-        except Exception as e:
-            raise HTTPException(502, f"mouse connect failed: {e}")
-        try:
-            return await action(mouse)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(502, f"mouse action failed: {e}")
-        finally:
+        async with _manual_mouse_lock:
             try:
-                await mouse.disconnect()
-            except Exception:
-                pass
+                await mouse.connect()
+            except Exception as e:
+                raise HTTPException(502, f"mouse connect failed: {e}")
+            try:
+                return await action(mouse)
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(502, f"mouse action failed: {e}")
+            finally:
+                try:
+                    await mouse.disconnect()
+                except Exception:
+                    pass
 
     def _schedule_snapshot(label: str) -> None:
         asyncio.create_task(_snapshot_after_manual_action(label))
@@ -482,65 +498,70 @@ def create_app(
             VisualServoHomer,
         )
 
-        ctx = keyboard = mouse = capture = None
-        try:
-            ctx, keyboard, mouse, capture = await context_factory()
-        except Exception as e:
-            if capture is not None:
-                try: await capture.close()
-                except Exception: pass
-            if keyboard is not None:
-                try: await keyboard.disconnect()
-                except Exception: pass
-            if mouse is not None:
-                try: await mouse.disconnect()
-                except Exception: pass
-            raise HTTPException(502, f"context_factory failed: {e}")
-
-        try:
-            adapter = _SessionAdapter(ctx)
-            homer = VisualServoHomer(session=adapter)
-            outcome = await homer.home_to_pixel(
-                req.x_pct, req.y_pct, button=req.button,
-            )
-            # Drop a post-click frame at the watch-dir top level so
-            # FrameStore (one-level-deep scan) picks it up and the UI
-            # long-poll refreshes. The homer's own proof frames live
-            # under <ctx.output_dir>/homer/<ts>/ which FrameStore
-            # doesn't recurse into.
+        async with _manual_mouse_lock:
+            ctx = keyboard = mouse = capture = None
             try:
-                from datetime import datetime
-                import cv2
-                await asyncio.sleep(0.35)
-                frame = await capture.capture_frame()
-                out_dir = store.watch_dir / "manual"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                seq = int(datetime.now().timestamp() * 1000) % 10_000
-                ts = datetime.now().strftime("%H%M%S")
-                path = out_dir / f"{seq:04d}_{ts}_click_at.png"
-                cv2.imwrite(str(path), frame.image)
+                ctx, keyboard, mouse, capture = await context_factory()
             except Exception as e:
-                logger.warning("post-click snapshot failed: %s", e)
-            return JSONResponse({
-                "ok": bool(outcome.clicked),
-                "reason": outcome.reason,
-                "steps": outcome.steps,
-                "x_pct": req.x_pct, "y_pct": req.y_pct,
-                "button": req.button,
-            })
-        except Exception as e:
-            logger.exception("home_to_pixel failed")
-            raise HTTPException(502, f"home_to_pixel failed: {e}")
-        finally:
-            if capture is not None:
-                try: await capture.close()
-                except Exception: pass
-            if keyboard is not None:
-                try: await keyboard.disconnect()
-                except Exception: pass
-            if mouse is not None:
-                try: await mouse.disconnect()
-                except Exception: pass
+                if capture is not None:
+                    try: await capture.close()
+                    except Exception: pass
+                if keyboard is not None:
+                    try: await keyboard.disconnect()
+                    except Exception: pass
+                if mouse is not None:
+                    try: await mouse.disconnect()
+                    except Exception: pass
+                raise HTTPException(502, f"context_factory failed: {e}")
+
+            try:
+                adapter = _SessionAdapter(ctx)
+                homer = VisualServoHomer(session=adapter)
+                outcome = await homer.home_to_pixel(
+                    req.x_pct, req.y_pct, button=req.button,
+                )
+                # click_at successfully landed the cursor at this
+                # pixel — update the scroll-home cache so the next
+                # /api/mouse/scroll at the same spot skips a fresh
+                # home.
+                if bool(outcome.clicked):
+                    app.state.last_scroll_home_xy = (req.x_pct, req.y_pct)
+                # Drop a post-click frame at the watch-dir top level
+                # so FrameStore (one-level-deep scan) picks it up and
+                # the UI long-poll refreshes.
+                try:
+                    from datetime import datetime
+                    import cv2
+                    await asyncio.sleep(0.35)
+                    frame = await capture.capture_frame()
+                    out_dir = store.watch_dir / "manual"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    seq = int(datetime.now().timestamp() * 1000) % 10_000
+                    ts = datetime.now().strftime("%H%M%S")
+                    path = out_dir / f"{seq:04d}_{ts}_click_at.png"
+                    cv2.imwrite(str(path), frame.image)
+                except Exception as e:
+                    logger.warning("post-click snapshot failed: %s", e)
+                return JSONResponse({
+                    "ok": bool(outcome.clicked),
+                    "reason": outcome.reason,
+                    "steps": outcome.steps,
+                    "x_pct": req.x_pct, "y_pct": req.y_pct,
+                    "button": req.button,
+                })
+            except Exception as e:
+                logger.exception("home_to_pixel failed")
+                raise HTTPException(502, f"home_to_pixel failed: {e}")
+            finally:
+                if capture is not None:
+                    try: await capture.close()
+                    except Exception: pass
+                if keyboard is not None:
+                    try: await keyboard.disconnect()
+                    except Exception: pass
+                if mouse is not None:
+                    try: await mouse.disconnect()
+                    except Exception: pass
 
     @app.post("/api/mouse/click")
     async def mouse_click(req: MouseClickRequest) -> JSONResponse:
@@ -564,30 +585,143 @@ def create_app(
         finally:
             _schedule_snapshot("manual_move")
 
+    # Tolerance (in normalised coords, both axes) for treating two
+    # hover positions as "the same target" so we don't re-home on
+    # every wheel event in a continuous gesture. 5 % ≈ 96 px on a
+    # 1920-wide screen — well within a scrollable pane.
+    SCROLL_HOME_TOL = 0.05
+
     @app.post("/api/mouse/scroll")
     async def mouse_scroll(req: MouseScrollRequest) -> JSONResponse:
-        """Forward a wheel-tick to the target. Fired by the cc UI's
-        wheel listener on the screenshot pane; ``x_pct`` / ``y_pct``
-        carry where the operator was hovering when the wheel fired
-        (used for snapshot labelling only — the scroll itself goes
-        to the target's current cursor position)."""
-        async def go(mouse):
-            await mouse.scroll(req.amount)
-            return JSONResponse({
-                "ok": True, "amount": req.amount,
-                "x_pct": req.x_pct, "y_pct": req.y_pct,
-            })
+        """Forward a wheel-tick to the target.
 
-        try:
-            return await _with_mouse(go)
-        finally:
-            tag = "manual_scroll"
-            if req.x_pct is not None and req.y_pct is not None:
-                tag = (
-                    f"manual_scroll_{int(req.x_pct * 100):02d}_"
-                    f"{int(req.y_pct * 100):02d}"
+        When ``x_pct`` / ``y_pct`` are provided AND differ from the
+        last successful home position by more than
+        ``SCROLL_HOME_TOL`` in either axis, the cursor is first
+        visually homed (no click) to the hover position so the
+        scroll lands on the content the operator pointed at — not
+        on whatever scrollable region the cursor was last left in.
+
+        Subsequent scrolls within tolerance reuse the cached home
+        and skip straight to ``mouse.scroll(amount)`` so a
+        continuous gesture pays the homing cost exactly once.
+        """
+        if runner.is_busy():
+            raise HTTPException(409, "a run is currently in progress")
+        pos_specified = (
+            req.x_pct is not None and req.y_pct is not None
+        )
+        last = getattr(app.state, "last_scroll_home_xy", None)
+        needs_home = pos_specified and (
+            last is None
+            or abs(last[0] - req.x_pct) > SCROLL_HOME_TOL
+            or abs(last[1] - req.y_pct) > SCROLL_HOME_TOL
+        )
+
+        if not needs_home:
+            # Fast path: just send the wheel tick, no webcam, no homer.
+            # Reuses the lightweight _with_mouse helper.
+            async def go(mouse):
+                await mouse.scroll(req.amount)
+                return JSONResponse({
+                    "ok": True, "amount": req.amount,
+                    "x_pct": req.x_pct, "y_pct": req.y_pct,
+                    "homed": False,
+                })
+
+            try:
+                return await _with_mouse(go)
+            finally:
+                tag = "manual_scroll"
+                if pos_specified:
+                    tag = (
+                        f"manual_scroll_{int(req.x_pct * 100):02d}_"
+                        f"{int(req.y_pct * 100):02d}"
+                    )
+                _schedule_snapshot(tag)
+
+        # Slow path: home cursor to (x_pct, y_pct) THEN scroll.
+        # Same fixture as click_at — context_factory builds a full
+        # ctx, VisualServoHomer.home_to_pixel(click=False) lands
+        # the cursor without firing a button, then mouse.scroll(...).
+        from terminaleyes.agents.login import _SessionAdapter
+        from terminaleyes.commander.visual_servo_homer import (
+            VisualServoHomer,
+        )
+
+        async with _manual_mouse_lock:
+            ctx = keyboard = mouse = capture = None
+            try:
+                ctx, keyboard, mouse, capture = await context_factory()
+            except Exception as e:
+                if capture is not None:
+                    try: await capture.close()
+                    except Exception: pass
+                if keyboard is not None:
+                    try: await keyboard.disconnect()
+                    except Exception: pass
+                if mouse is not None:
+                    try: await mouse.disconnect()
+                    except Exception: pass
+                raise HTTPException(502, f"context_factory failed: {e}")
+            try:
+                adapter = _SessionAdapter(ctx)
+                homer = VisualServoHomer(session=adapter)
+                outcome = await homer.home_to_pixel(
+                    req.x_pct, req.y_pct, click=False,
                 )
-            _schedule_snapshot(tag)
+                homed_ok = bool(getattr(outcome, "clicked", False)) or (
+                    # home_to_pixel's ClickOutcome semantically tracks
+                    # "did we successfully land on the pixel" via
+                    # the clicked flag even when click=False — the
+                    # homer only sets it after the geometric confirm
+                    # passes. Treat it as the home-success signal.
+                    False
+                )
+                if homed_ok:
+                    app.state.last_scroll_home_xy = (
+                        req.x_pct, req.y_pct,
+                    )
+                # Whether the home succeeded or not, fire the scroll
+                # — the operator clearly wants something to scroll
+                # and a partial home is usually still in the right
+                # general region.
+                await mouse.scroll(req.amount)
+                return JSONResponse({
+                    "ok": True, "amount": req.amount,
+                    "x_pct": req.x_pct, "y_pct": req.y_pct,
+                    "homed": True,
+                    "home_ok": homed_ok,
+                    "home_reason": getattr(outcome, "reason", ""),
+                })
+            except Exception as e:
+                logger.exception("home-then-scroll failed")
+                raise HTTPException(502, f"scroll failed: {e}")
+            finally:
+                # Best-effort post-action snapshot via the same lock
+                # so it's serialised against the next mouse action.
+                try:
+                    from datetime import datetime
+                    import cv2
+                    await asyncio.sleep(0.3)
+                    frame = await capture.capture_frame()
+                    out_dir = store.watch_dir / "manual"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    seq = int(datetime.now().timestamp() * 1000) % 10_000
+                    ts = datetime.now().strftime("%H%M%S")
+                    path = out_dir / f"{seq:04d}_{ts}_scroll.png"
+                    cv2.imwrite(str(path), frame.image)
+                except Exception as e:
+                    logger.warning("post-scroll snapshot failed: %s", e)
+                if capture is not None:
+                    try: await capture.close()
+                    except Exception: pass
+                if keyboard is not None:
+                    try: await keyboard.disconnect()
+                    except Exception: pass
+                if mouse is not None:
+                    try: await mouse.disconnect()
+                    except Exception: pass
 
     # ── manual keyboard control ──────────────────────────────────
     async def _with_keyboard(action):
