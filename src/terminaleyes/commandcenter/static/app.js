@@ -806,6 +806,7 @@ const $pastePath = document.getElementById("paste-path");
 const $pasteContent = document.getElementById("paste-content");
 const $pasteOptMaximize = document.getElementById("paste-opt-maximize");
 const $pasteOptVerify = document.getElementById("paste-opt-verify");
+const $pasteOptBodyReadback = document.getElementById("paste-opt-body-readback");
 const $pasteOptPlatform = document.getElementById("paste-opt-platform");
 
 const PASTE_MAX_BYTES = 50_000;
@@ -891,6 +892,7 @@ async function _pasteSubmit() {
     platform: $pasteOptPlatform.value,
     maximize: !!$pasteOptMaximize.checked,
     verify: !!$pasteOptVerify.checked,
+    body_readback: !!($pasteOptBodyReadback && $pasteOptBodyReadback.checked),
   };
   _pasteCloseModal();
   setMouseBusy(true, "pasting file…");
@@ -942,6 +944,18 @@ async function _pasteSubmit() {
       appendSystemLog(
         "INFO",
         `paste-file ok: wrote ${data.wrote_path} (${data.sent_chars} chars)`,
+      );
+    }
+    // Body readback (the `more`-based visual confirmation) is
+    // separate from the SHA verdict — surface it on its own line.
+    if (data.body_readback) {
+      const rb = data.body_readback;
+      const ok = rb.similarity >= 0.85;
+      appendSystemLog(
+        ok ? "INFO" : "ERROR",
+        `${ok ? "✓" : "≈"} body readback: ` +
+          `similarity=${rb.similarity} over ${rb.pages} page(s) ` +
+          `(expected=${rb.expected_chars}c, ocr=${rb.ocr_chars}c)`,
       );
     }
   } catch (e) {

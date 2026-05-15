@@ -88,6 +88,12 @@ class PasteFileRequest(BaseModel):
     platform: str = Field(default="macos", pattern="^(macos|linux)$")
     maximize: bool = True
     verify: bool = True
+    # Optional pager-driven body readback. SHA-256 (under ``verify``)
+    # is the *cryptographic* identity check; this is for visual /
+    # body-level confirmation — drive ``more PATH`` and OCR each
+    # page so the operator can see the file scroll past via webcam.
+    # Disabled by default because each page costs ~1 s of dwell.
+    body_readback: bool = False
 
 
 def _content_type_for(path: str) -> str:
@@ -889,6 +895,105 @@ def create_app(
                     "n_chunks": nchunks,
                     "chunk_size": pp.CHUNK_SIZE,
                     "frame": (final_frame.name if final_frame else None),
+                }
+
+            # 6) Optional pager-driven body readback. Independent of
+            # (and additive to) the SHA verdict — for the operator
+            # who wants to *see* the file scroll past on the webcam
+            # rather than trust a hash. Bounded page count derived
+            # from local line count.
+            if req.body_readback and capture is not None:
+                import difflib
+                # Conservative: 30 visible lines per page after the
+                # maximised terminal accounts for chrome + the
+                # ``--More--`` prompt. Plus two extra pages for end-
+                # of-file slop. Capped to keep runtime bounded.
+                local_lines = req.content.count("\n") + 1
+                pages_budget = max(2, (local_lines // 30) + 2)
+                pages_budget = min(pages_budget, 60)
+                _emit(
+                    f"body readback: more {req.path} "
+                    f"(~{pages_budget} pages)",
+                )
+
+                # Start fresh: clear the screen so the first page
+                # OCR isn't polluted by SHA/CHUNKS framing tokens
+                # left over from the verify section.
+                await kb.send_text("clear")
+                await kb.send_keystroke("Enter")
+                await asyncio.sleep(0.35)
+                await kb.send_text(f"more {req.path}")
+                await kb.send_keystroke("Enter")
+                await asyncio.sleep(0.9)
+
+                pages_ocr: list[str] = []
+                from datetime import datetime
+                import cv2
+                for p_idx in range(pages_budget):
+                    try:
+                        frame = await capture.capture_frame()
+                    except Exception as e:
+                        logger.warning("readback capture failed: %s", e)
+                        break
+                    out_dir = store.watch_dir / "manual"
+                    try:
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        pass
+                    seq = int(datetime.now().timestamp() * 1000) % 10_000
+                    ts = datetime.now().strftime("%H%M%S")
+                    fpath = out_dir / f"{seq:04d}_{ts}_more_p{p_idx}.png"
+                    try:
+                        cv2.imwrite(str(fpath), frame.image)
+                    except Exception as e:
+                        logger.warning("imwrite failed: %s", e)
+                    page_text = ""
+                    try:
+                        import pytesseract
+                        page_text = pytesseract.image_to_string(frame.image)
+                    except Exception as e:
+                        logger.warning("readback OCR failed: %s", e)
+                    pages_ocr.append(page_text)
+                    # Advance to next page — Space, NOT Enter (Enter
+                    # scrolls one line on more; Space goes a whole
+                    # page).
+                    await kb.send_text(" ")
+                    await asyncio.sleep(0.55)
+
+                # Defensive q in case the page budget was a hair too
+                # generous and ``more`` is still alive at the
+                # prompt. No-op if it's already exited.
+                await kb.send_text("q")
+                await asyncio.sleep(0.2)
+
+                # Normalise & compare. OCR is lossy on body text
+                # (unlike the SHA line's restricted charset), so the
+                # similarity is an approximate sanity check, not a
+                # cryptographic verdict.
+                def _norm_body(s: str) -> str:
+                    return "\n".join(
+                        ln.rstrip() for ln in s.replace("\r", "").split("\n")
+                        if ln.strip()
+                    ).strip()
+
+                accumulated = "\n".join(pages_ocr)
+                expected_norm = _norm_body(req.content)
+                ocr_norm = _norm_body(accumulated)
+                ratio = difflib.SequenceMatcher(
+                    None, expected_norm, ocr_norm,
+                ).ratio() if expected_norm else 0.0
+                _emit(
+                    f"body readback: similarity={ratio:.3f} "
+                    f"(expected={len(expected_norm)}c, "
+                    f"ocr={len(ocr_norm)}c, pages={len(pages_ocr)})",
+                )
+                result["body_readback"] = {
+                    "pages": len(pages_ocr),
+                    "similarity": round(ratio, 3),
+                    "expected_chars": len(expected_norm),
+                    "ocr_chars": len(ocr_norm),
+                    # Bounded sample for UI.
+                    "ocr_sample": accumulated[:2000],
                 }
 
             return JSONResponse(result)

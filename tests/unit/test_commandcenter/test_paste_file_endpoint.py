@@ -501,6 +501,198 @@ def test_409_when_runner_busy(store, bus, mock_kb, mock_capture):
             client.app.state.runner._active = None
 
 
+def test_body_readback_more_pagination_matches_sent(
+    store, bus, mock_kb, mock_capture, kb_log,
+):
+    """body_readback=True drives `more PATH`, captures each page via
+    OCR, and reports a similarity score against the sent content.
+    With perfect OCR (we feed back the original content split into
+    pages), similarity should be ~1.0."""
+    # Multi-page synthetic content with deterministic line shape.
+    lines = [f"line {i:03d} hello world" for i in range(60)]
+    content = "\n".join(lines) + "\n"
+    cb = content.encode()
+
+    # OCR responses: first the SHA happy-path frame, then one OCR
+    # response per `more` page. Split content into 30-line pages.
+    page_size = 30
+    pages = [
+        "\n".join(lines[i : i + page_size])
+        for i in range(0, len(lines), page_size)
+    ]
+    # pages_budget for 60 lines = (60//30)+2 = 4. We supply 2 real
+    # pages then 2 empty pages (post-EOF the screen is just the
+    # shell prompt — OCR returns near-nothing).
+    responses = [_sha_block(cb)] + pages + ["$ ", "$ "]
+
+    with patched_runtime(mock_kb, mock_capture, responses):
+        client = _build_client(store, bus)
+        r = client.post("/api/paste-file", json={
+            "content": content,
+            "maximize": False,
+            "verify": True,
+            "body_readback": True,
+        })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["verify"]["match"] is True
+    rb = data["body_readback"]
+    # 4 pages budgeted for 60 lines (60//30 + 2).
+    assert rb["pages"] == 4
+    # OCR was perfect for the first 2 pages → similarity should be high.
+    assert rb["similarity"] >= 0.95, rb
+
+    # HID side: the readback section MUST type `clear`, `more PATH`,
+    # then exactly `pages_budget` Spaces, then a defensive `q`.
+    kb_texts = [c[1]["text"] for c in kb_log if c[0] == "text"]
+    assert "clear" in kb_texts
+    assert any(c.startswith("more /tmp/cc_paste.txt") for c in kb_texts)
+    spaces = sum(1 for t in kb_texts if t == " ")
+    assert spaces == 4
+    assert "q" in kb_texts
+
+
+def test_body_readback_off_skips_more(
+    store, bus, mock_kb, mock_capture, kb_log,
+):
+    """body_readback=False → no `more`, no Space, no `q`."""
+    content = "hello\n"
+    cb = content.encode()
+    with patched_runtime(mock_kb, mock_capture, [_sha_block(cb)]):
+        client = _build_client(store, bus)
+        r = client.post("/api/paste-file", json={
+            "content": content,
+            "maximize": False,
+            "verify": True,
+            "body_readback": False,
+        })
+    assert r.status_code == 200
+    assert "body_readback" not in r.json()
+    kb_texts = [c[1]["text"] for c in kb_log if c[0] == "text"]
+    assert not any(t.startswith("more ") for t in kb_texts)
+    assert " " not in kb_texts
+
+
+def test_body_readback_lossy_ocr_reports_lower_similarity(
+    store, bus, mock_kb, mock_capture, kb_log,
+):
+    """When OCR mangles the page content (substitutions, drops),
+    similarity should still be reported — just lower. This is the
+    user-visible signal that the visual readback isn't perfect even
+    when SHA reports a clean match."""
+    lines = [f"line {i:02d} foo bar baz" for i in range(30)]
+    content = "\n".join(lines) + "\n"
+    cb = content.encode()
+
+    # Page budget for 30 lines = (30//30) + 2 = 3.
+    # Provide one badly OCR'd page (random text), then empty pages.
+    mangled = "compI3tely diff3r3nt text the OCR" * 5
+    responses = [_sha_block(cb), mangled, "", ""]
+    with patched_runtime(mock_kb, mock_capture, responses):
+        client = _build_client(store, bus)
+        r = client.post("/api/paste-file", json={
+            "content": content,
+            "maximize": False,
+            "verify": True,
+            "body_readback": True,
+        })
+    assert r.status_code == 200
+    data = r.json()
+    # SHA verdict is independent and still True.
+    assert data["verify"]["match"] is True
+    rb = data["body_readback"]
+    assert rb["similarity"] < 0.5, rb  # OCR completely mangled
+
+
+def test_body_readback_page_budget_caps_at_60(
+    store, bus, mock_kb, mock_capture, kb_log,
+):
+    """Very large content shouldn't burn unbounded HID time on
+    pagination. The page budget caps at 60 pages regardless."""
+    # 2000 lines of 24 chars (48 KB, under the 50 KB request cap).
+    # Naive budget = (2000//30)+2 = 68 → capped at 60.
+    content = ("x" * 23 + "\n") * 2000
+    cb = content.encode()
+    # Feed one valid SHA response and many empty OCR pages.
+    responses = [_sha_block(cb)] + [""] * 120
+    with patched_runtime(mock_kb, mock_capture, responses):
+        client = _build_client(store, bus)
+        r = client.post("/api/paste-file", json={
+            "content": content,
+            "maximize": False,
+            "verify": True,
+            "body_readback": True,
+        })
+    assert r.status_code == 200
+    rb = r.json()["body_readback"]
+    assert rb["pages"] == 60   # hard cap
+    spaces = sum(
+        1 for c in kb_log if c[0] == "text" and c[1]["text"] == " "
+    )
+    assert spaces == 60
+
+
+def test_architecture_md_end_to_end_with_perfect_ocr(
+    store, bus, mock_kb, mock_capture, kb_log,
+):
+    """Drive the full pipeline with the real ARCHITECTURE.md from the
+    repo: paste, SHA verify, `more` body readback paginated across
+    multiple pages. With perfectly faithful OCR (we replay the actual
+    file content split into pages) similarity should be very high.
+
+    Establishes a baseline for the body-readback similarity score that
+    a real run on hardware should approach (subject to webcam OCR
+    noise)."""
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[3]
+    md = repo_root / "ARCHITECTURE.md"
+    if not md.exists():
+        pytest.skip("ARCHITECTURE.md not in repo root — test skipped")
+    content = md.read_text()
+    cb = content.encode()
+
+    # Split into 30-line pages (matches the endpoint's page-size
+    # heuristic) so the "OCR" sees what a real `more` would render.
+    all_lines = content.split("\n")
+    page_size = 30
+    pages = [
+        "\n".join(all_lines[i : i + page_size])
+        for i in range(0, len(all_lines), page_size)
+    ]
+    pages_budget = max(2, (content.count("\n") + 1) // 30 + 2)
+    pages_budget = min(pages_budget, 60)
+    # Pad with empty OCR responses for any extra pages the endpoint
+    # captures past EOF.
+    responses = [_sha_block(cb)] + pages + [""] * pages_budget
+
+    with patched_runtime(mock_kb, mock_capture, responses):
+        client = _build_client(store, bus)
+        r = client.post("/api/paste-file", json={
+            "content": content,
+            "maximize": False,
+            "verify": True,
+            "body_readback": True,
+        })
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # SHA path: deterministic.
+    assert data["verify"]["match"] is True
+    # Body readback: should converge to near-1 with perfect OCR.
+    rb = data["body_readback"]
+    assert rb["pages"] == pages_budget
+    assert rb["similarity"] >= 0.95, rb
+    # Command sequence sanity: cat redirect → SHA print → clear →
+    # more → spaces → q.
+    kb_texts = [c[1]["text"] for c in kb_log if c[0] == "text"]
+    assert any(t.startswith("cat > /tmp/cc_paste.txt") for t in kb_texts)
+    assert any(pp.SHA_OPEN in t for t in kb_texts)
+    assert "clear" in kb_texts
+    assert any(t.startswith("more /tmp/cc_paste.txt") for t in kb_texts)
+    spaces = sum(1 for t in kb_texts if t == " ")
+    assert spaces == pages_budget
+
+
 def test_disabled_verify_skips_all_readback(
     store, bus, mock_kb, mock_capture, kb_log,
 ):
