@@ -665,9 +665,14 @@ def create_app(
         from terminaleyes.keyboard.http_backend import HttpKeyboardOutput
 
         cfg = _commander_cfg()
+        # Generous per-request timeout: each /bt/text call types
+        # the whole payload character-by-character via BT HID. A
+        # 76-col base64 line takes a few seconds with the warmup
+        # pre-flight; larger payloads (chunk overwrites) need more
+        # headroom than the default 10 s.
         kb = HttpKeyboardOutput(
             base_url=cfg.pi_base_url,
-            timeout=20.0,
+            timeout=120.0,
             transport=cfg.transport,
         )
         capture = None
@@ -989,16 +994,46 @@ def create_app(
                         f"{len(bad)}/{nchunks} chunks "
                         f"({len(diff.unknown_indices)} unknown)",
                     )
+
+                    async def _overwrite_chunk(idx: int, payload: bytes):
+                        """Stage payload via line-wrapped base64 →
+                        write into place via ``dd seek=``. Splitting
+                        the b64 across many small ``send_text`` calls
+                        keeps each /bt/text request bounded; sending
+                        the whole 2.7 KB inline (as the original
+                        single-string command did) overran the HTTP
+                        timeout on real BT HID."""
+                        import base64 as _b64
+                        tmp = "/tmp/_cc_overwrite.bin"
+                        b64 = _b64.b64encode(payload).decode("ascii")
+                        WRAP = 76
+                        lines = [
+                            b64[i : i + WRAP]
+                            for i in range(0, len(b64), WRAP)
+                        ] or [""]
+                        await kb.send_text(f"base64 -d > {tmp}")
+                        await kb.send_keystroke("Enter")
+                        await asyncio.sleep(0.1)
+                        for ln in lines:
+                            if ln:
+                                await kb.send_text(ln)
+                            await kb.send_keystroke("Enter")
+                            await asyncio.sleep(0.03)
+                        await kb.send_key_combo(["ctrl"], "d")
+                        await asyncio.sleep(0.15)
+                        await kb.send_text(
+                            f"dd if={tmp} of={req.path} "
+                            f"bs={pp.CHUNK_SIZE} seek={idx} "
+                            f"conv=notrunc 2>/dev/null && rm -f {tmp}"
+                        )
+                        await kb.send_keystroke("Enter")
+
                     for idx in bad:
                         start = idx * pp.CHUNK_SIZE
                         payload = content_bytes[start : start + pp.CHUNK_SIZE]
                         if not payload:
                             continue
-                        cmd = pp.cmd_overwrite_chunk(
-                            req.path, idx, payload,
-                        )
-                        await kb.send_text(cmd)
-                        await kb.send_keystroke("Enter")
+                        await _overwrite_chunk(idx, payload)
                         chunk_retry_count[idx] = (
                             chunk_retry_count.get(idx, 0) + 1
                         )
