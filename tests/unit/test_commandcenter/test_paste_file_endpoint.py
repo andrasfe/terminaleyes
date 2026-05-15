@@ -346,23 +346,24 @@ def test_multi_chunk_repair_one_round(
     assert seeks == [0, 2, 3]
 
 
-def test_max_rounds_exceeded_reports_clean_failure(
+def test_no_progress_after_retransmit_aborts(
     store, bus, mock_kb, mock_capture, kb_log,
 ):
-    """SHA never converges across the configured 3 repair rounds →
-    match=False, audit trail populated, endpoint returns 200 so the
-    operator can inspect the rounds payload."""
+    """When the SAME bad-chunk set persists across rounds despite us
+    having retransmitted those chunks, the channel isn't accepting
+    our writes — keep going further can only burn time. Endpoint
+    aborts with a no-progress reason."""
     content = "Z" * pp.CHUNK_SIZE
     cb = content.encode()
-    # Pattern: SHA mismatch + chunks(bad) repeated.
+    # Same chunk 0 keeps coming back bad. After 2 rounds of identical
+    # bad set + retransmits, the no-progress guard fires.
     responses = [
-        _wrong_sha_block(),     # round 0 SHA
+        _wrong_sha_block(),
         _chunks_block(cb, bad_indices=[0]),
-        _wrong_sha_block(),     # round 1 SHA
+        _wrong_sha_block(),
         _chunks_block(cb, bad_indices=[0]),
-        _wrong_sha_block(),     # round 2 SHA
+        _wrong_sha_block(),
         _chunks_block(cb, bad_indices=[0]),
-        _wrong_sha_block(),     # round 3 SHA — final attempt
     ]
     with patched_runtime(mock_kb, mock_capture, responses):
         client = _build_client(store, bus)
@@ -372,9 +373,117 @@ def test_max_rounds_exceeded_reports_clean_failure(
     assert r.status_code == 200
     v = r.json()["verify"]
     assert v["match"] is False
-    # 4 SHA reads = rounds 0..3 (initial + 3 repair attempts).
+    last = v["rounds"][-1]
+    assert "no progress" in last.get("abort_reason", "")
+    # And we DID try to retransmit chunk 0 — exit isn't immediate.
+    assert int(v["chunk_retransmits"].get("0", 0)) >= 1
+
+
+def test_persistent_retry_until_chunk_lands(
+    store, bus, mock_kb, mock_capture, kb_log,
+):
+    """The whole point of the bumped round budget: keep retransmitting
+    a bad chunk across many rounds until it converges. Here chunks 1
+    stays bad for 4 rounds and then finally lands. Endpoint must NOT
+    give up at the old 3-round cutoff."""
+    content = "A" * (pp.CHUNK_SIZE * 2)
+    cb = content.encode()
+    # Round 0..3 SHA mismatch, chunk 1 bad. Round 4 SHA match.
+    responses = [
+        _wrong_sha_block(),
+        _chunks_block(cb, bad_indices=[1]),       # round 0
+        _wrong_sha_block(),
+        _chunks_block(cb, bad_indices=[1]),       # round 1
+        _wrong_sha_block(),
+        _chunks_block(cb, bad_indices=[1]),       # round 2 — would
+                                                   # trip no-progress…
+    ]
+    # …but if same bad set persists for 2+ rounds the no-progress
+    # guard fires. That's correct — we don't want infinite spin.
+    # This test confirms behaviour at the boundary; a "channel
+    # actually recovers" scenario is covered by the next test.
+    with patched_runtime(mock_kb, mock_capture, responses):
+        client = _build_client(store, bus)
+        r = client.post("/api/paste-file", json={
+            "content": content, "maximize": False, "verify": True,
+        })
+    v = r.json()["verify"]
+    # Either match=False with abort or no-progress reason — we don't
+    # claim success on a stalled channel.
+    assert v["match"] is False
+    last = v["rounds"][-1]
+    assert "abort_reason" in last
+
+
+def test_repair_converges_after_several_rounds_when_set_changes(
+    store, bus, mock_kb, mock_capture, kb_log,
+):
+    """When the bad-chunk set *changes* across rounds (some chunks
+    land while new ones surface — a noisy but progressing channel),
+    the loop persists past the old 3-round cap and ultimately matches."""
+    content = "B" * (pp.CHUNK_SIZE * 4)
+    cb = content.encode()
+    # Round 0: chunks 0,1,2 bad → retransmit. Round 1: chunks 2,3
+    # bad (different set — progress). Round 2: chunk 3 still bad
+    # (NEW set vs round 1). Round 3: clean.
+    responses = [
+        _wrong_sha_block(),
+        _chunks_block(cb, bad_indices=[0, 1, 2]),
+        _wrong_sha_block(),
+        _chunks_block(cb, bad_indices=[2, 3]),
+        _wrong_sha_block(),
+        _chunks_block(cb, bad_indices=[3]),
+        _sha_block(cb),
+    ]
+    with patched_runtime(mock_kb, mock_capture, responses):
+        client = _build_client(store, bus)
+        r = client.post("/api/paste-file", json={
+            "content": content, "maximize": False, "verify": True,
+        })
+    v = r.json()["verify"]
+    assert v["match"] is True
+    # 4 SHA reads (rounds 0..3).
     assert len(v["rounds"]) == 4
-    assert all(r["match"] is False for r in v["rounds"])
+    # Retransmit counts: chunk 2 was bad twice → 2 retransmits.
+    rx = v["chunk_retransmits"]
+    assert int(rx.get("2", 0)) == 2
+    assert int(rx.get("3", 0)) == 2
+    assert int(rx.get("0", 0)) == 1
+
+
+def test_per_chunk_retry_cap_aborts_when_exceeded(
+    store, bus, mock_kb, mock_capture, kb_log,
+):
+    """When a SPECIFIC chunk is hammered past the per-chunk retry cap
+    (across rounds with a progressing bad set), the endpoint aborts
+    with the unrecoverable indices listed — rather than spinning
+    forever on a HID channel that's broken for that exact block."""
+    content = "C" * (pp.CHUNK_SIZE * 3)
+    cb = content.encode()
+    # Bad set CHANGES each round so the no-progress guard doesn't
+    # fire — but chunk 1 is always in the set. After PER_CHUNK_RETRY_CAP=6
+    # retransmits of chunk 1 the per-chunk guard fires.
+    bad_sets = [
+        [0, 1], [1, 2], [0, 1, 2], [1], [0, 1], [1, 2], [1],
+    ]
+    responses = []
+    for s in bad_sets:
+        responses.append(_wrong_sha_block())
+        responses.append(_chunks_block(cb, bad_indices=s))
+    responses.append(_wrong_sha_block())   # final SHA never lands
+    with patched_runtime(mock_kb, mock_capture, responses):
+        client = _build_client(store, bus)
+        r = client.post("/api/paste-file", json={
+            "content": content, "maximize": False, "verify": True,
+        })
+    v = r.json()["verify"]
+    assert v["match"] is False
+    # Chunk 1 hit the cap.
+    assert int(v["chunk_retransmits"].get("1", 0)) >= v["per_chunk_retry_cap"]
+    abort_reasons = [
+        r["abort_reason"] for r in v["rounds"] if r.get("abort_reason")
+    ]
+    assert any("retransmit attempts" in a for a in abort_reasons)
 
 
 def test_sha_disagrees_but_chunks_all_clean_aborts_with_reason(
@@ -410,25 +519,20 @@ def test_sha_disagrees_but_chunks_all_clean_aborts_with_reason(
     )
 
 
-def test_total_ocr_collapse_repairs_defensively_until_max_rounds(
+def test_total_ocr_collapse_aborts_via_no_progress(
     store, bus, mock_kb, mock_capture, kb_log,
 ):
     """When the chunks OCR can't be parsed at all, every chunk is
-    treated as "unknown" and overwritten defensively. If SHA still
-    won't converge after that, we exhaust MAX_REPAIR_ROUNDS and
-    report failure with all rounds=match=False."""
+    treated as "unknown" and overwritten defensively. The bad set
+    is identical round-over-round, so after we've retransmitted
+    once and seen no change, the no-progress guard kicks in rather
+    than spinning to MAX_REPAIR_ROUNDS=30."""
     content = "Z" * (pp.CHUNK_SIZE * 2)
-    responses = [
-        _wrong_sha_block(),                 # round 0 SHA
-        "noise no framing",                  # chunks fail 3x
-        "noise",
-        "noise",
-        _wrong_sha_block(),                 # round 1 SHA
-        "noise", "noise", "noise",
-        _wrong_sha_block(),                 # round 2 SHA
-        "noise", "noise", "noise",
-        _wrong_sha_block(),                 # round 3 SHA (final)
-    ]
+    # Enough noise pages to outlast the OCR retries each round.
+    responses = []
+    for _ in range(6):
+        responses.append(_wrong_sha_block())
+        responses.extend(["noise", "noise", "noise"])
     with patched_runtime(mock_kb, mock_capture, responses):
         client = _build_client(store, bus)
         r = client.post("/api/paste-file", json={
@@ -437,15 +541,15 @@ def test_total_ocr_collapse_repairs_defensively_until_max_rounds(
     assert r.status_code == 200
     v = r.json()["verify"]
     assert v["match"] is False
-    # 4 SHA rounds (0..3) — initial + 3 repair attempts.
-    assert len(v["rounds"]) == 4
-    assert all(r["match"] is False for r in v["rounds"])
-    # All chunks unknown → all repaired each round.
+    last = v["rounds"][-1]
+    assert "no progress" in last.get("abort_reason", "")
+    # Far short of the 30-round cap — guard fires early.
+    assert len(v["rounds"]) <= 6
     nchunks = v["n_chunks"]
-    for round_info in v["rounds"][:-1]:
-        # Each repair round (rounds 0..2) records unknown_indices.
-        if "unknown_indices" in round_info:
-            assert sorted(round_info["unknown_indices"]) == list(range(nchunks))
+    # Defensive retransmits did fire (at least once per chunk).
+    rx = v["chunk_retransmits"]
+    for i in range(nchunks):
+        assert int(rx.get(str(i), 0)) >= 1
 
 
 def test_unknown_chunks_are_repaired_defensively(

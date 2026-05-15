@@ -717,7 +717,20 @@ def create_app(
                 local_sha = pp.file_sha256(content_bytes)
                 local_chunks = pp.chunk_hashes(content_bytes)
                 nchunks = pp.n_chunks(len(content_bytes))
-                MAX_REPAIR_ROUNDS = 3
+                # Persistence policy: keep retransmitting until SHA
+                # converges. Bounded only by two safety guards:
+                #   * per-chunk attempt cap — if one specific block
+                #     refuses to land after this many retransmits in
+                #     a row, the channel is broken for it and we
+                #     give up rather than spinning forever.
+                #   * no-progress detection — if the bad-chunk set
+                #     is identical to the previous round AFTER we
+                #     already overwrote those chunks, our writes
+                #     aren't taking effect and we'd spin pointlessly.
+                # The global round cap is generous so a busy channel
+                # has room to converge.
+                MAX_REPAIR_ROUNDS = 30
+                PER_CHUNK_RETRY_CAP = 6
 
                 async def _ocr_now(label: str) -> tuple[str, "Path"]:
                     """Capture, save under manual/, OCR, return (text, path)."""
@@ -812,6 +825,12 @@ def create_app(
                     f"{pp.CHUNK_SIZE}B, local SHA={local_sha[:12]}…",
                 )
 
+                # Per-chunk retransmit counter: index → times we've
+                # rewritten this chunk. We escalate to "unrecoverable"
+                # if any single chunk exceeds the cap.
+                chunk_retry_count: dict[int, int] = {}
+                last_bad_set: frozenset[int] | None = None
+
                 for repair_round in range(MAX_REPAIR_ROUNDS + 1):
                     _emit(f"round {repair_round}: reading host SHA…")
                     host_sha, sha_frame = await _read_host_sha()
@@ -869,6 +888,47 @@ def create_app(
                         )
                         break
 
+                    # No-progress guard: if the bad set is identical
+                    # to the prior round and we already rewrote those
+                    # chunks, our writes aren't taking effect. Spinning
+                    # further can only burn time.
+                    current_bad = frozenset(bad)
+                    if (last_bad_set is not None
+                            and current_bad == last_bad_set
+                            and repair_round >= 2):
+                        round_info["abort_reason"] = (
+                            f"no progress — same {len(bad)} chunks "
+                            f"bad after retransmit"
+                        )
+                        _emit(
+                            f"round {repair_round}: aborting — same "
+                            f"{len(bad)} chunks bad as last round; "
+                            f"channel not accepting writes",
+                            level="ERROR",
+                        )
+                        break
+                    last_bad_set = current_bad
+
+                    # Per-chunk retry cap.
+                    blocked = [
+                        i for i in bad
+                        if chunk_retry_count.get(i, 0) >= PER_CHUNK_RETRY_CAP
+                    ]
+                    if blocked:
+                        round_info["abort_reason"] = (
+                            f"chunks {blocked[:10]} exceeded "
+                            f"{PER_CHUNK_RETRY_CAP} retransmit attempts"
+                        )
+                        round_info["unrecoverable_chunks"] = blocked
+                        _emit(
+                            f"round {repair_round}: aborting — "
+                            f"{len(blocked)} chunk(s) refusing to land "
+                            f"after {PER_CHUNK_RETRY_CAP} retransmits "
+                            f"({blocked[:10]}…)",
+                            level="ERROR",
+                        )
+                        break
+
                     _emit(
                         f"round {repair_round}: repairing "
                         f"{len(bad)}/{nchunks} chunks "
@@ -884,16 +944,26 @@ def create_app(
                         )
                         await kb.send_text(cmd)
                         await kb.send_keystroke("Enter")
+                        chunk_retry_count[idx] = (
+                            chunk_retry_count.get(idx, 0) + 1
+                        )
                         # Small settle — the dd is bounded by chunk
                         # size, and the host shouldn't queue these.
                         await asyncio.sleep(0.25)
 
+                # Sparse map — only chunks we actually retransmitted.
+                retry_map = {
+                    str(k): v for k, v in chunk_retry_count.items() if v > 0
+                }
                 result["verify"] = {
                     "match": matched,
                     "local_sha": local_sha,
                     "rounds": rounds_log,
                     "n_chunks": nchunks,
                     "chunk_size": pp.CHUNK_SIZE,
+                    "max_repair_rounds": MAX_REPAIR_ROUNDS,
+                    "per_chunk_retry_cap": PER_CHUNK_RETRY_CAP,
+                    "chunk_retransmits": retry_map,
                     "frame": (final_frame.name if final_frame else None),
                 }
 

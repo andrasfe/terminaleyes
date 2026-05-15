@@ -940,6 +940,21 @@ async function _pasteSubmit() {
           appendSystemLog("ERROR", `round ${r.round} abort: ${r.abort_reason}`);
         }
       }
+      // Per-chunk retransmit summary — useful when the channel is
+      // noisy and a chunk needed several attempts to land.
+      const rx = v.chunk_retransmits || {};
+      const rxKeys = Object.keys(rx);
+      if (rxKeys.length) {
+        const max = Math.max(...rxKeys.map(k => rx[k]));
+        const total = rxKeys.reduce((s, k) => s + rx[k], 0);
+        appendSystemLog(
+          "INFO",
+          `retransmits: ${total} total across ${rxKeys.length} chunk(s), ` +
+            `max ${max} for one chunk` +
+            (v.per_chunk_retry_cap
+              ? ` (cap ${v.per_chunk_retry_cap})` : ""),
+        );
+      }
     } else {
       appendSystemLog(
         "INFO",
