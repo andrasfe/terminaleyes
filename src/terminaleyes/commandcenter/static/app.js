@@ -618,17 +618,21 @@ let _wheelPxAccum = 0;
 let _wheelLastPos = { x: null, y: null };
 let _wheelFlushTimer = null;
 let _wheelFlushing = false;
-// Browsers report deltaY in pixels (DOM_DELTA_PIXEL); a typical
-// mouse-wheel notch is ~100 px. We map ~100 px to one Pi wheel tick
-// and clamp the per-POST amount so the Pi never receives a single
-// scroll larger than ±10 ticks.
-const WHEEL_PX_PER_TICK = 100;
+// Browsers report deltaY in pixels (DOM_DELTA_PIXEL); ~30 px is a
+// typical trackpad two-finger increment, ~100 px is one mouse-wheel
+// notch. Map ~30 px to one Pi wheel tick so trackpad gestures
+// actually cross the threshold, and clamp the per-POST amount so
+// the Pi never receives a single scroll larger than ±10 ticks.
+const WHEEL_PX_PER_TICK = 30;
 const WHEEL_MAX_TICKS_PER_POST = 10;
-const WHEEL_FLUSH_DELAY_MS = 100;
+const WHEEL_FLUSH_DELAY_MS = 80;
 
 async function flushScroll() {
   if (_wheelFlushing) return;
   _wheelFlushing = true;
+  // Show the same busy hourglass other manual mouse actions use —
+  // user feedback on every action, per the cc UX contract.
+  setMouseBusy(true, "scrolling…");
   try {
     while (Math.abs(_wheelPxAccum) >= WHEEL_PX_PER_TICK) {
       const sign = Math.sign(_wheelPxAccum);
@@ -660,8 +664,6 @@ async function flushScroll() {
           let t = "";
           try { t = await r.text(); } catch (_) {}
           appendSystemLog("ERROR", `/api/mouse/scroll → ${r.status} ${t}`);
-          // Drop the rest of the accumulated buffer on a server
-          // error — otherwise we'd retry the same failing call.
           _wheelPxAccum = 0;
           break;
         }
@@ -672,15 +674,17 @@ async function flushScroll() {
       }
     }
   } finally {
+    setMouseBusy(false);
     _wheelFlushing = false;
   }
 }
 
 $frame.addEventListener("wheel", (e) => {
-  // Gate on the same toggle that controls click-at — if remote
-  // mouse control is disabled, wheel events behave as native
-  // page-scroll.
-  if (!$optClickToMove || !$optClickToMove.checked) return;
+  // Scrolling over the screenshot is unambiguous intent (you're
+  // trying to scroll the content shown there), so unlike click_at
+  // we do NOT gate on the click-to-move toggle. Operators who want
+  // native page scroll can move the cursor off the screenshot
+  // pane.
   if ($frame.classList.contains("empty")) return;
   // Don't let the browser also scroll the cc UI's pane.
   e.preventDefault();

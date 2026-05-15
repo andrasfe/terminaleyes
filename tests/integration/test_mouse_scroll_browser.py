@@ -312,8 +312,12 @@ def test_wheel_over_screenshot_posts_scroll(tmp_path):
                 page.wait_for_timeout(200)
 
                 assert len(seen) >= 1, "expected at least one /api/mouse/scroll POST"
+                # 3 wheel events × deltaY=100 = 300 px. At 30 px per
+                # tick that's 10 ticks, which also happens to be the
+                # WHEEL_MAX_TICKS_PER_POST clamp — so we expect one
+                # POST with amount = 10.
                 first = seen[0]
-                assert first["amount"] == 3, first
+                assert first["amount"] == 10, first
                 # Position: should be near the middle of the element.
                 assert 0.45 <= first["x_pct"] <= 0.55, first
                 assert 0.45 <= first["y_pct"] <= 0.55, first
@@ -321,7 +325,7 @@ def test_wheel_over_screenshot_posts_scroll(tmp_path):
                 # And the request actually reached the mocked Pi.
                 scrolls = [c for c in mouse_log if c[0] == "scroll"]
                 assert scrolls, "no scroll() call reached the Pi mock"
-                assert sum(c[1]["amount"] for c in scrolls) == 3
+                assert sum(c[1]["amount"] for c in scrolls) == 10
 
                 # ── Negative direction works too. Dispatch at a
                 # point we know is inside the rendered image — pick
@@ -331,6 +335,10 @@ def test_wheel_over_screenshot_posts_scroll(tmp_path):
                 # _wheelLastPos via the test hook before the flush
                 # consumes the accumulated deltaY.
                 seen.clear()
+                # Use a deltaY that divides cleanly by
+                # WHEEL_PX_PER_TICK (30) so the wait below can
+                # require px === 0 with no leftover remainder.
+                # -180 = -6 ticks, remainder 0.
                 page.evaluate(
                     f"""() => {{
                         const rect = ({_DISPATCH_RECT_JS})();
@@ -339,7 +347,7 @@ def test_wheel_over_screenshot_posts_scroll(tmp_path):
                         document.getElementById('frame').dispatchEvent(
                             new WheelEvent('wheel', {{
                                 bubbles: true, cancelable: true,
-                                deltaY: -200,
+                                deltaY: -180,
                                 clientX: cx, clientY: cy,
                             }})
                         );
@@ -354,8 +362,9 @@ def test_wheel_over_screenshot_posts_scroll(tmp_path):
                 page.wait_for_timeout(200)
 
                 assert seen, "negative wheel didn't fire a POST"
+                # -180 px ÷ 30 px/tick = -6 ticks (negative direction).
                 neg = seen[0]
-                assert neg["amount"] == -2, neg
+                assert neg["amount"] == -6, neg
                 # Position should be ~0.10 (we dispatched 10 % in).
                 assert 0.05 <= neg["x_pct"] <= 0.20, neg
                 assert 0.05 <= neg["y_pct"] <= 0.20, neg
@@ -364,10 +373,10 @@ def test_wheel_over_screenshot_posts_scroll(tmp_path):
                 browser.close()
 
 
-def test_wheel_disabled_when_click_to_move_off(tmp_path):
-    """If the operator turned off the click-to-move toggle, wheel
-    events shouldn't fire any /api/mouse/scroll POSTs — the
-    browser scrolls the page normally instead."""
+def test_wheel_fires_regardless_of_click_to_move(tmp_path):
+    """Scroll-over-screenshot is unambiguous intent, so unlike
+    ``click_at`` we don't gate on the ``click-to-move`` toggle.
+    A wheel event fires the POST whether the toggle is on or off."""
     mouse_log: list[tuple[str, dict]] = []
     port = _pick_free_port()
     with _serve_cc(tmp_path, mouse_log, port) as base_url:
@@ -427,24 +436,148 @@ def test_wheel_disabled_when_click_to_move_off(tmp_path):
                     "() => document.getElementById('frame').naturalWidth > 0",
                     timeout=4_000,
                 )
+                # Compute rect from the rendered image, not the
+                # element box, so the dispatched point is inside the
+                # active hit-region after parent-flex squashing.
+                _DISPATCH_RECT_JS = """() => {
+                    const f = document.getElementById('frame');
+                    const w = f.naturalWidth, h = f.naturalHeight;
+                    const box = f.getBoundingClientRect();
+                    const scale = Math.min(box.width / w, box.height / h);
+                    return {
+                        left: box.left + (box.width - w * scale) / 2,
+                        top:  box.top  + (box.height - h * scale) / 2,
+                        width: w * scale, height: h * scale,
+                    };
+                }"""
                 page.evaluate(
-                    """() => {
+                    f"""() => {{
+                        const rect = ({_DISPATCH_RECT_JS})();
                         const f = document.getElementById('frame');
-                        const r = f.getBoundingClientRect();
-                        f.dispatchEvent(new WheelEvent('wheel', {
+                        f.dispatchEvent(new WheelEvent('wheel', {{
                             bubbles: true, cancelable: true,
-                            deltaY: 500,
-                            clientX: r.left + r.width / 2,
-                            clientY: r.top + r.height / 2,
-                        }));
-                    }"""
+                            deltaY: 90,
+                            clientX: rect.left + rect.width / 2,
+                            clientY: rect.top + rect.height / 2,
+                        }}));
+                    }}"""
                 )
-                page.wait_for_timeout(400)
+                page.wait_for_function(
+                    "() => window.__teTest && "
+                    "  !window.__teTest.peekScrollState().flushing && "
+                    "  window.__teTest.peekScrollState().px === 0",
+                    timeout=4_000,
+                )
+                page.wait_for_timeout(200)
 
-                assert not seen, (
-                    "wheel handler should have early-returned with "
-                    "the toggle off; saw POST(s): " + str(seen)
+                # New semantics: scroll fires even with the toggle
+                # off. The POST should have landed and the busy
+                # hourglass should NOT still be showing post-flush.
+                assert seen, (
+                    "wheel handler should have fired even with the "
+                    "click-to-move toggle off; no POST was seen."
                 )
-                assert not [c for c in mouse_log if c[0] == "scroll"]
+                assert seen[0]["amount"] >= 1
+                # Pi mock saw the scroll.
+                assert [c for c in mouse_log if c[0] == "scroll"]
+            finally:
+                browser.close()
+
+
+def test_wheel_shows_busy_indicator(tmp_path):
+    """Per the cc UX contract the hourglass must show for every
+    manual mouse action — including scroll. We verify ``#frame-busy``
+    becomes visible during a flush and hides after it completes."""
+    mouse_log: list[tuple[str, dict]] = []
+    port = _pick_free_port()
+    with _serve_cc(tmp_path, mouse_log, port) as base_url:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                ctx = browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                )
+                page = ctx.new_page()
+                # Slow the cc /api/mouse/scroll roundtrip so the
+                # hourglass is observably "on" during the in-flight
+                # POST. Without a delay the flush completes in
+                # milliseconds and we miss the visible-state window.
+                def _slow_route(route):
+                    import time as _t
+                    _t.sleep(0.4)
+                    route.continue_()
+                page.route("**/api/mouse/scroll", _slow_route)
+                page.goto(base_url, wait_until="domcontentloaded")
+                page.wait_for_function(
+                    "typeof window.__teTest === 'object'", timeout=5_000,
+                )
+                _TINY_PNG = (
+                    "data:image/png;base64,"
+                    "iVBORw0KGgoAAAANSUhEUgAAAKAAAABaCAIAAACwpMoFAAAA60lEQVR4"
+                    "nO3RAQkAIADAMDWNIeyfyxQinC3B4XPvM+havwN4y+A4g+MMjjM4zuA4g+MMjjM4zuA4g+MM"
+                    "jjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MM"
+                    "jjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MM"
+                    "jjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MMjjM4zuA4g+MM"
+                    "jjM4zuA4g+MMjjN4tF2eMgFA/IQ9PAAAAABJRU5ErkJggg=="
+                )
+                page.evaluate(
+                    f"""(src) => new Promise((resolve) => {{
+                        const f = document.getElementById('frame');
+                        f.classList.remove('empty');
+                        f.style.width  = '800px';
+                        f.style.height = '450px';
+                        f.style.display = 'block';
+                        f.onload = () => resolve(true);
+                        f.src = src;
+                        if (f.complete && f.naturalWidth > 0) resolve(true);
+                    }})""",
+                    _TINY_PNG,
+                )
+                page.wait_for_function(
+                    "() => document.getElementById('frame').naturalWidth > 0",
+                    timeout=4_000,
+                )
+                # Pre-flush: hourglass hidden.
+                hidden_before = page.evaluate(
+                    "() => document.getElementById('frame-busy')."
+                    "classList.contains('hidden')"
+                )
+                assert hidden_before is True
+                _DISPATCH_RECT_JS = """() => {
+                    const f = document.getElementById('frame');
+                    const w = f.naturalWidth, h = f.naturalHeight;
+                    const box = f.getBoundingClientRect();
+                    const scale = Math.min(box.width / w, box.height / h);
+                    return {
+                        left: box.left + (box.width - w * scale) / 2,
+                        top:  box.top  + (box.height - h * scale) / 2,
+                        width: w * scale, height: h * scale,
+                    };
+                }"""
+                page.evaluate(
+                    f"""() => {{
+                        const rect = ({_DISPATCH_RECT_JS})();
+                        document.getElementById('frame').dispatchEvent(
+                            new WheelEvent('wheel', {{
+                                bubbles: true, cancelable: true,
+                                deltaY: 120,
+                                clientX: rect.left + rect.width / 2,
+                                clientY: rect.top + rect.height / 2,
+                            }})
+                        );
+                    }}"""
+                )
+                # During the slow POST the hourglass should flip on.
+                page.wait_for_function(
+                    "() => !document.getElementById('frame-busy')."
+                    "classList.contains('hidden')",
+                    timeout=2_000,
+                )
+                # After the POST settles, it must hide again.
+                page.wait_for_function(
+                    "() => document.getElementById('frame-busy')."
+                    "classList.contains('hidden')",
+                    timeout=4_000,
+                )
             finally:
                 browser.close()
