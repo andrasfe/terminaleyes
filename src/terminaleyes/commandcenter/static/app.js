@@ -47,6 +47,18 @@ const state = {
   logsAtBottom: true,
   globalSrc: null,
   runChats: new Map(),   // run_id -> chat <li>
+  // True after the operator has performed at least one ``click_at``
+  // this session. Until then we warn on the first keystroke that
+  // typing-before-clicking is the most common reason "the host
+  // didn't see what I typed" — the host window is probably not
+  // focused. Persists in sessionStorage so a tab reload doesn't
+  // re-show the banner if the user has already acknowledged it.
+  hadClickAt: false,
+  warnedPassthrough: (() => {
+    try {
+      return sessionStorage.getItem("te-warned-passthrough") === "1";
+    } catch (_) { return false; }
+  })(),
 };
 
 // ── frame fetching ─────────────────────────────────────────────
@@ -570,6 +582,11 @@ $frame.addEventListener("click", async (e) => {
     { x_pct, y_pct, button: "left" },
     "homing cursor…",
   );
+  // A successful click_at means the operator has just transferred
+  // focus on the target — the next keystroke goes where they
+  // pointed. Note this so the "you typed without clicking first"
+  // warning doesn't fire on legitimate workflows.
+  state.hadClickAt = true;
   // Always auto-focus the passthrough so typing flows to the host
   // regardless of whether the homer ultimately reported success.
   // (Without this, a single "cursor_not_found" outcome leaves the
@@ -815,6 +832,29 @@ const _PASS_SPECIAL = {
   "Delete": "Delete",
 };
 
+// Warning banner about typing-without-clicking-first.
+const $passWarn = document.getElementById("passthrough-warn");
+const $passWarnDismiss = document.getElementById(
+  "passthrough-warn-dismiss",
+);
+
+function _maybeShowPassthroughWarn() {
+  if (state.hadClickAt) return;
+  if (state.warnedPassthrough) return;
+  if (!$passWarn) return;
+  $passWarn.classList.remove("hidden");
+}
+
+if ($passWarnDismiss) {
+  $passWarnDismiss.addEventListener("click", () => {
+    state.warnedPassthrough = true;
+    try {
+      sessionStorage.setItem("te-warned-passthrough", "1");
+    } catch (_) {}
+    if ($passWarn) $passWarn.classList.add("hidden");
+  });
+}
+
 function _passthroughHandleKey(e) {
   if (!$passInput) return;
   // Let the browser handle navigation modifier-only events.
@@ -822,6 +862,10 @@ function _passthroughHandleKey(e) {
       || e.key === "Meta") {
     return;
   }
+  // First "real" keystroke without a prior click_at this session?
+  // Surface the warning so the operator notices when host focus is
+  // wrong and they're typing into the void.
+  _maybeShowPassthroughWarn();
   e.preventDefault();
 
   const hasCtrl = e.ctrlKey;

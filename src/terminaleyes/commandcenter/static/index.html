@@ -41,11 +41,20 @@
       <div class="frame-keyboard-controls">
         <input id="passthrough-input" type="text"
                class="passthrough"
-               placeholder="type to send keystrokes to host…"
+               placeholder="Click target field on screenshot first, THEN type here"
                autocomplete="off"
                autocapitalize="off"
                autocorrect="off"
                spellcheck="false" />
+        <div id="passthrough-warn" class="passthrough-warn hidden"
+             role="alert">
+          ⚠ Type only AFTER clicking the target field on the screenshot.
+          Without a prior click the host window may not be focused, and
+          keystrokes land somewhere invisible (URL bar / background /
+          another window).
+          <button id="passthrough-warn-dismiss" type="button"
+                  aria-label="Dismiss">✕</button>
+        </div>
         <button id="btn-passthrough-enter" type="button" class="kb-btn"
                 title="Send Enter to host">↵</button>
         <button id="btn-passthrough-tab" type="button" class="kb-btn"
