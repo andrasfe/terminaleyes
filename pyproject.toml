@@ -22,6 +22,10 @@ dependencies = [
     "PyYAML>=6.0",
     "pygame>=2.5.0",
     "numpy>=1.26.0",
+    # LLM planners sometimes emit slightly malformed JSON (stray
+    # extra closing brace, trailing comma, single quotes). json-repair
+    # recovers those without us having to special-case each pattern.
+    "json-repair>=0.50",
 ]
 
 [project.optional-dependencies]

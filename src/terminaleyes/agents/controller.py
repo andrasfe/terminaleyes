@@ -2353,9 +2353,22 @@ class ControllerAgent(Agent):
             pass
         # Pull the first {...} substring.
         m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
+        candidate = m.group(0) if m else raw
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+        # Final attempt: hand off to json-repair. LLMs routinely emit
+        # one extra `}` before the closing `]` (the failure mode that
+        # killed "click on the anteater") or stray commas / missing
+        # quotes — json-repair handles all of those without us
+        # having to special-case each pattern.
+        try:
+            import json_repair
+        except ImportError:
             return None
         try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
+            obj = json_repair.repair_json(candidate, return_objects=True)
+        except Exception:
             return None
+        return obj if isinstance(obj, dict) else None

@@ -140,8 +140,10 @@ def test_scroll(intent, direction, amount):
     "type hello world",
     "run ls -la",
     "execute pwd",
-    "close the window",
-    "close the terminal window",
+    # NOTE: "close the window" / "close the terminal window" used to
+    # be in this list, but the controller now has a deterministic
+    # "close <app> [window]" rule (planning Alt+F4 with an optional
+    # launch precondition). They legitimately match a rule now.
     "save",
     "save the file",
     "copy",
