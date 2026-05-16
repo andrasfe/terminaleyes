@@ -1076,10 +1076,32 @@ function _passthroughHandleKey(e) {
   _maybeShowPassthroughWarn();
   e.preventDefault();
 
-  const hasCtrl = e.ctrlKey;
+  let hasCtrl = e.ctrlKey;
   const hasMeta = e.metaKey;
   const hasAlt = e.altKey;
   const hasShift = e.shiftKey;
+  // Mac-target shortcut convenience: Mac uses Cmd, not Ctrl, for
+  // copy/paste/cut/select-all/etc. An operator coming from Linux
+  // or Windows muscle-memory presses Ctrl-A and expects select-all,
+  // but their literal Ctrl-A reaches the Mac as Ctrl-A which means
+  // "beginning of line" (or nothing) on Mac. When the target is
+  // macOS (read from $optPlatform — defaults to "macos") and the
+  // keystroke is a *plain* Ctrl-letter/digit chord with no other
+  // modifier, swap the ctrl bit for super (Cmd). Ctrl-Shift-letter
+  // and Ctrl-arrow are left literal because Mac apps do bind those
+  // (Ctrl-arrow = Mission Control, Ctrl-Shift-Tab = previous tab,
+  // Ctrl-A in iTerm = bash beginning-of-line, etc.).
+  const targetIsMac = !$optPlatform || $optPlatform.value === "macos";
+  if (
+    hasCtrl && !hasMeta && !hasAlt
+    && e.key && e.key.length === 1
+    && /[a-zA-Z0-9]/.test(e.key)
+    && targetIsMac
+  ) {
+    hasCtrl = false;
+    // We'll push "super" below.
+    e._teMacRemap = true;
+  }
   const mods = [];
   if (hasCtrl) mods.push("ctrl");
   // Cmd on macOS / Super on Linux. The Pi modifier map at
@@ -1088,7 +1110,7 @@ function _passthroughHandleKey(e) {
   // the modifier and the host received an unmodified keystroke —
   // which is why Cmd-C / Ctrl-Tab / etc. appeared not to work even
   // though the rest of the pipeline was firing.
-  if (hasMeta) mods.push("super");
+  if (hasMeta || e._teMacRemap) mods.push("super");
   if (hasAlt) mods.push("alt");
   if (hasShift) mods.push("shift");
 
