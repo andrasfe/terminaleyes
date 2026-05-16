@@ -1157,6 +1157,14 @@ function _shouldGlobalCapture() {
 }
 document.addEventListener("keydown", (e) => {
   if (!_shouldGlobalCapture()) return;
+  // Require the mouse to be over the screenshot for global capture.
+  // Without this gate, ANY keystroke fired while no cc input was
+  // focused would go to the host — including ones the operator
+  // typed by accident (browser focus on body, alt-tab back, etc.).
+  // The "host kbd" visual cue already signals exactly this state,
+  // so the rule becomes: if you can see the cue, your keys go to
+  // the host. If not, they don't.
+  if (!state.mouseOverFrame) return;
   _passthroughHandleKey(e);
 }, true);
 
