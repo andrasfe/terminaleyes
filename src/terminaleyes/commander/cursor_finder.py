@@ -108,6 +108,100 @@ def find_cursor_hsv(image_bgr: np.ndarray) -> CursorHit | None:
     return best
 
 
+# Wider red gates for the position-aware variant. The global
+# ``find_cursor_hsv`` has to filter out skin tones and brown text
+# from the entire frame; ``find_cursor_hsv_near`` only looks inside
+# a small ROI around a known cursor position, so it can accept much
+# weaker reds (low saturation from webcam perspective, glare, etc.)
+# without false-positiving on environment.
+WIDE_RED_LO_A = np.array([0,    60,  60], dtype=np.uint8)
+WIDE_RED_HI_A = np.array([18,  255, 255], dtype=np.uint8)
+WIDE_RED_LO_B = np.array([160,  60,  60], dtype=np.uint8)
+WIDE_RED_HI_B = np.array([180, 255, 255], dtype=np.uint8)
+# Much smaller floor too — the ROI is bounded so a 30-px-wide cursor
+# is plenty.
+WIDE_MIN_AREA_PCT = 0.00004   # ~80 px on a 1920x1080 frame
+
+
+def find_cursor_hsv_near(
+    image_bgr: np.ndarray,
+    near_pct: tuple[float, float],
+    max_dist_pct: float = 0.04,
+) -> CursorHit | None:
+    """Variant of :func:`find_cursor_hsv` that prefers a blob whose
+    centroid is close to ``near_pct`` (an externally-known cursor
+    position, e.g. from oscillation-variance detection).
+
+    Solves the case where the globally highest-confidence red blob
+    in the frame is a static UI accent at the screen edge, not the
+    cursor. The cursor itself is somewhere we already know, so
+    "biggest blob within ``max_dist_pct`` of that point" is provably
+    the right one — and using its HSV centroid gives us a pixel-
+    accurate position to feed the closed-loop servo, far better than
+    the frame-diff fallback.
+
+    Uses wider HSV thresholds and a lower minimum-area floor than
+    the global finder because the position constraint already
+    excludes the false positives that the strict thresholds existed
+    to filter out. This way a desaturated webcam capture of the
+    redglass cursor still registers.
+    """
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        return None
+    h, w = image_bgr.shape[:2]
+    img_area = h * w
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+
+    red_a = cv2.inRange(hsv, WIDE_RED_LO_A, WIDE_RED_HI_A)
+    red_b = cv2.inRange(hsv, WIDE_RED_LO_B, WIDE_RED_HI_B)
+    red_mask = cv2.bitwise_or(red_a, red_b)
+    kernel3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel3)
+    kernel5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel5)
+
+    contours, _ = cv2.findContours(
+        red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None
+
+    best: CursorHit | None = None
+    best_dist = float("inf")
+    for c in contours:
+        area = cv2.contourArea(c)
+        area_pct = area / img_area
+        if area_pct < WIDE_MIN_AREA_PCT:
+            continue
+        if area_pct > MAX_AREA_PCT:
+            continue
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+        x_pct = cx / w
+        y_pct = cy / h
+        dx = x_pct - near_pct[0]
+        dy = y_pct - near_pct[1]
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist > max_dist_pct:
+            continue
+        # Among in-range blobs, prefer the closest (the cursor itself,
+        # not a nearby UI fleck).
+        if dist < best_dist:
+            best_dist = dist
+            size_score = min(1.0, area_pct / 0.005)
+            best = CursorHit(
+                x_pct=x_pct, y_pct=y_pct,
+                area_pct=area_pct,
+                # Confidence: combines size and proximity.
+                confidence=size_score
+                * max(0.0, 1.0 - dist / max_dist_pct),
+            )
+    return best
+
+
 def annotate_cursor(
     image_bgr: np.ndarray, hit: CursorHit,
     color: tuple[int, int, int] = (0, 255, 255),
