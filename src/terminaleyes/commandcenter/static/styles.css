@@ -29,16 +29,98 @@ button, select, textarea, input {
   color: inherit;
 }
 
+/* Two-column desktop layout.
+   Left column: screenshot pane on top + chat textbox underneath.
+   Right column: chat history + logs (each flex:1 within the column).
+   The two columns are separated by a draggable divider; the right
+   column's width is stored in --right-col-width (JS persists it to
+   localStorage). The whole app fills the browser viewport. */
 main#app {
-  display: grid;
-  grid-template-rows: minmax(38vh, 1fr) minmax(180px, 32vh) minmax(140px, 1fr);
-  min-height: 0;
+  display: flex;
+  flex-direction: row;
   gap: 6px;
   padding: 6px;
   height: 100vh;
   height: 100dvh;
-  max-width: 900px;
-  margin: 0 auto;
+  width: 100vw;
+  min-width: 0;
+}
+
+#col-left {
+  flex: 1 1 0;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+
+#col-right {
+  flex: 0 0 var(--right-col-width, 38vw);
+  min-width: 240px;
+  max-width: calc(100vw - 320px);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+
+#col-divider {
+  flex: 0 0 6px;
+  background: var(--border);
+  border-radius: 3px;
+  cursor: col-resize;
+  align-self: stretch;
+  transition: background 0.15s ease;
+  touch-action: none;
+}
+#col-divider:hover,
+#col-divider.dragging,
+#col-divider:focus-visible { background: var(--accent); outline: none; }
+body.col-resizing {
+  cursor: col-resize;
+  user-select: none;
+  -webkit-user-select: none;
+}
+body.col-resizing iframe,
+body.col-resizing img { pointer-events: none; }
+
+/* In the left column, the frame pane stretches; the chat form
+   sits at a fixed height beneath it. */
+#col-left > #frame-pane { flex: 1 1 0; min-height: 0; }
+#col-left > #chat-form { flex: 0 0 auto; }
+
+/* In the right column, history and logs split available space. */
+#col-right > #chat-pane { flex: 1 1 0; min-height: 0; }
+#col-right > #log-pane { flex: 1 1 0; min-height: 0; }
+
+.pane-header {
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Mobile / narrow viewports: stack everything vertically and let
+   the page scroll like it used to. Below 800 px desktop side-by-
+   side stops being readable. */
+@media (max-width: 800px) {
+  main#app {
+    flex-direction: column;
+    width: 100%;
+  }
+  #col-left, #col-right {
+    flex: 0 0 auto;
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+  }
+  #col-divider { display: none; }
+  #col-right > #chat-pane { flex: 0 0 30vh; }
+  #col-right > #log-pane { flex: 0 0 30vh; }
+  #col-left > #frame-pane { flex: 0 0 50vh; }
 }
 
 .pane {
@@ -353,7 +435,6 @@ main#app {
   flex-direction: column;
   gap: 6px;
   padding: 6px;
-  border-top: 1px solid var(--border);
   background: var(--bg-elev);
 }
 #chat-input {

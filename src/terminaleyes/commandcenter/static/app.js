@@ -1218,6 +1218,91 @@ async function loadChatHistory() {
   } catch (_) {}
 }
 
+// ── column divider drag (desktop layout) ───────────────────────
+// Right column width is stored in --right-col-width on <main>. We
+// persist it to localStorage so the user's split survives reloads.
+// Mobile (<800px) hides the divider and stacks columns vertically;
+// the resize handlers are no-ops there because the divider isn't
+// in the DOM hit-test.
+(function initColDivider() {
+  const root = document.getElementById("app");
+  const divider = document.getElementById("col-divider");
+  if (!root || !divider) return;
+  const STORAGE_KEY = "cc.rightColWidth";
+  const MIN_LEFT = 320;
+  const MIN_RIGHT = 240;
+
+  function applyWidth(px) {
+    const max = Math.max(MIN_RIGHT, window.innerWidth - MIN_LEFT - 24);
+    const clamped = Math.max(MIN_RIGHT, Math.min(max, px));
+    root.style.setProperty("--right-col-width", clamped + "px");
+    return clamped;
+  }
+  function clampAndPersist(px) {
+    const v = applyWidth(px);
+    try { localStorage.setItem(STORAGE_KEY, String(v)); } catch (_) {}
+  }
+  // Restore from storage (if any) on boot, before first paint settles.
+  try {
+    const saved = parseFloat(localStorage.getItem(STORAGE_KEY) || "");
+    if (Number.isFinite(saved) && saved > 0) applyWidth(saved);
+  } catch (_) {}
+  // Re-clamp on window resize so a previously-saved width can't
+  // leave the left column below MIN_LEFT.
+  window.addEventListener("resize", () => {
+    const cur = parseFloat(
+      getComputedStyle(root).getPropertyValue("--right-col-width") || "0"
+    );
+    if (Number.isFinite(cur) && cur > 0) applyWidth(cur);
+  });
+
+  let dragging = false;
+  function onPointerDown(e) {
+    dragging = true;
+    divider.classList.add("dragging");
+    document.body.classList.add("col-resizing");
+    divider.setPointerCapture?.(e.pointerId);
+    e.preventDefault();
+  }
+  function onPointerMove(e) {
+    if (!dragging) return;
+    // Right column width = distance from pointer to right edge of
+    // the viewport, minus the app's right padding (6px).
+    const width = window.innerWidth - e.clientX - 6;
+    applyWidth(width);
+  }
+  function onPointerUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    divider.classList.remove("dragging");
+    document.body.classList.remove("col-resizing");
+    try { divider.releasePointerCapture?.(e.pointerId); } catch (_) {}
+    const cur = parseFloat(
+      getComputedStyle(root).getPropertyValue("--right-col-width") || "0"
+    );
+    if (Number.isFinite(cur) && cur > 0) {
+      try { localStorage.setItem(STORAGE_KEY, String(cur)); } catch (_) {}
+    }
+  }
+  divider.addEventListener("pointerdown", onPointerDown);
+  divider.addEventListener("pointermove", onPointerMove);
+  divider.addEventListener("pointerup", onPointerUp);
+  divider.addEventListener("pointercancel", onPointerUp);
+  // Double-click resets to default split.
+  divider.addEventListener("dblclick", () => {
+    clampAndPersist(Math.round(window.innerWidth * 0.38));
+  });
+  // Keyboard nudging when the divider is focused.
+  divider.addEventListener("keydown", (e) => {
+    const cur = parseFloat(
+      getComputedStyle(root).getPropertyValue("--right-col-width") || "0"
+    ) || (window.innerWidth * 0.38);
+    const step = e.shiftKey ? 64 : 16;
+    if (e.key === "ArrowLeft") { clampAndPersist(cur + step); e.preventDefault(); }
+    else if (e.key === "ArrowRight") { clampAndPersist(cur - step); e.preventDefault(); }
+  });
+})();
+
 // ── boot ───────────────────────────────────────────────────────
 async function init() {
   await loadChatHistory();

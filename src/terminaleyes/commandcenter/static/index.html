@@ -11,6 +11,7 @@
 </head>
 <body>
   <main id="app">
+    <div id="col-left" class="col">
     <section id="frame-pane" class="pane">
       <div class="frame-wrap">
         <img id="frame" alt="latest frame" />
@@ -81,36 +82,44 @@
       </div>
     </section>
 
-    <section id="chat-pane" class="pane">
-      <ul id="chat-log" aria-live="polite"></ul>
-      <form id="chat-form">
-        <textarea
-          id="chat-input"
-          rows="2"
-          placeholder="Tell the controller what to do…  (e.g. open reddit.com)"
-          autocomplete="off"
-          autocapitalize="off"
-          spellcheck="false"
-        ></textarea>
-        <div class="chat-row">
-          <label class="opt"><input type="checkbox" id="opt-dry-run"/> dry-run</label>
-          <label class="opt"><input type="checkbox" id="opt-no-focus"/> no-focus</label>
-          <select id="opt-platform" title="Platform">
-            <option value="linux" selected>linux</option>
-            <option value="macos">macos</option>
-          </select>
-          <button id="btn-send" type="submit">Send</button>
-        </div>
-      </form>
-    </section>
-
-    <section id="log-pane" class="pane">
-      <div class="log-header">
-        <span>logs</span>
-        <button id="btn-clear-logs" type="button" title="Clear view">clear</button>
+    <form id="chat-form" class="pane">
+      <textarea
+        id="chat-input"
+        rows="2"
+        placeholder="Tell the controller what to do…  (e.g. open reddit.com)"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+      ></textarea>
+      <div class="chat-row">
+        <label class="opt"><input type="checkbox" id="opt-dry-run"/> dry-run</label>
+        <label class="opt"><input type="checkbox" id="opt-no-focus"/> no-focus</label>
+        <select id="opt-platform" title="Platform">
+          <option value="linux" selected>linux</option>
+          <option value="macos">macos</option>
+        </select>
+        <button id="btn-send" type="submit">Send</button>
       </div>
-      <pre id="log-view"></pre>
-    </section>
+    </form>
+    </div>
+
+    <div id="col-divider" role="separator" aria-orientation="vertical"
+         aria-label="Resize panels" tabindex="0"></div>
+
+    <div id="col-right" class="col">
+      <section id="chat-pane" class="pane">
+        <div class="pane-header">history</div>
+        <ul id="chat-log" aria-live="polite"></ul>
+      </section>
+
+      <section id="log-pane" class="pane">
+        <div class="log-header">
+          <span>logs</span>
+          <button id="btn-clear-logs" type="button" title="Clear view">clear</button>
+        </div>
+        <pre id="log-view"></pre>
+      </section>
+    </div>
   </main>
 
   <!-- Execute-Script modal: paste a shell script body and submit -->
