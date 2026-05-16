@@ -142,6 +142,28 @@ body.col-resizing img { pointer-events: none; }
   background: #000;
   overflow: hidden;
 }
+/* When the mouse is hovering the screenshot AND no UI input is
+   focused, keystrokes get forwarded to the host (Ctrl-C, arrow
+   keys, etc.). Subtle accent ring + corner tag makes that state
+   visible so the operator never wonders "did that key land?". */
+#frame-pane.host-kb .frame-wrap {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+#frame-pane.host-kb .frame-wrap::after {
+  content: "host kbd";
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  background: rgba(0,0,0,0.55);
+  padding: 2px 6px;
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 6;
+}
 #frame {
   max-width: 100%;
   max-height: 100%;

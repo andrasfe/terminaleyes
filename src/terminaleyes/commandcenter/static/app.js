@@ -55,6 +55,10 @@ const state = {
   // focused. Persists in sessionStorage so a tab reload doesn't
   // re-show the banner if the user has already acknowledged it.
   hadClickAt: false,
+  // True while the mouse pointer is over the screenshot. Used to
+  // light up the keyboard-passthrough indicator so the operator
+  // knows their keypresses will land on the host.
+  mouseOverFrame: false,
   warnedPassthrough: (() => {
     try {
       return sessionStorage.getItem("te-warned-passthrough") === "1";
@@ -746,6 +750,12 @@ const WHEEL_FLUSH_DELAY_MS = 80;
 
 async function flushScroll() {
   if (_wheelFlushing) return;
+  // If the accumulated delta hasn't crossed one Pi tick yet, this
+  // is just trackpad noise (every micro-pan emits wheel events with
+  // sub-pixel deltaY). Showing the "scrolling…" hourglass for those
+  // flickers makes the operator think a scroll is happening when
+  // nothing actually fires. Bail before touching the busy state.
+  if (Math.abs(_wheelPxAccum) < WHEEL_PX_PER_TICK) return;
   // Another mouse action is in flight (click, click_at, paste-file).
   // Don't barge — re-arm the debounce timer so we try again once
   // the in-flight action releases the busy state.
@@ -1017,9 +1027,20 @@ function _passthroughHandleKey(e) {
   const hasShift = e.shiftKey;
   const mods = [];
   if (hasCtrl) mods.push("ctrl");
-  if (hasMeta) mods.push("cmd");
+  // Cmd on macOS / Super on Linux. The Pi modifier map at
+  // raspi/hid_codes.py::MODIFIER_MAP only accepts "super" / "meta"
+  // / "win" (no "cmd"), so sending "cmd" here used to silently drop
+  // the modifier and the host received an unmodified keystroke —
+  // which is why Cmd-C / Ctrl-Tab / etc. appeared not to work even
+  // though the rest of the pipeline was firing.
+  if (hasMeta) mods.push("super");
   if (hasAlt) mods.push("alt");
   if (hasShift) mods.push("shift");
+
+  // Only mirror keystrokes into $passInput when it's the focused
+  // field — otherwise hovering the image and typing accumulates
+  // invisible text that surprises the operator later.
+  const isPassInputFocused = document.activeElement === $passInput;
 
   const special = _PASS_SPECIAL[e.key];
   if (special) {
@@ -1027,15 +1048,16 @@ function _passthroughHandleKey(e) {
       path: "/api/keyboard/key",
       body: { key: special, modifiers: mods },
     });
-    // Mirror the action locally for visual feedback.
-    if (special === "Backspace") {
-      $passInput.value = $passInput.value.slice(0, -1);
-    } else if (special === "Enter") {
-      $passInput.value = "";
-    } else if (special === "Tab") {
-      $passInput.value += "\t";
-    } else if (special === "Escape") {
-      $passInput.value = "";
+    if (isPassInputFocused) {
+      if (special === "Backspace") {
+        $passInput.value = $passInput.value.slice(0, -1);
+      } else if (special === "Enter") {
+        $passInput.value = "";
+      } else if (special === "Tab") {
+        $passInput.value += "\t";
+      } else if (special === "Escape") {
+        $passInput.value = "";
+      }
     }
     return;
   }
@@ -1055,7 +1077,7 @@ function _passthroughHandleKey(e) {
       path: "/api/keyboard/text",
       body: { text: e.key },
     });
-    $passInput.value += e.key;
+    if (isPassInputFocused) $passInput.value += e.key;
   }
 }
 
@@ -1082,6 +1104,33 @@ document.addEventListener("keydown", (e) => {
   if (!_shouldGlobalCapture()) return;
   _passthroughHandleKey(e);
 }, true);
+
+// Visual cue: when the mouse is hovering over the screenshot AND
+// no UI input is focused, any keystroke (including Ctrl-C, arrow
+// keys, F-keys, Cmd-V, etc.) is being forwarded to the host. Show
+// a thin accent border on the image so the operator can tell at a
+// glance that the next keypress will land on the target machine,
+// not in the browser.
+const $framePane = document.getElementById("frame-pane");
+function _refreshHostKbCue() {
+  if (!$framePane) return;
+  const on = state.mouseOverFrame && _shouldGlobalCapture();
+  $framePane.classList.toggle("host-kb", !!on);
+}
+if ($frame) {
+  $frame.addEventListener("mouseenter", () => {
+    state.mouseOverFrame = true;
+    _refreshHostKbCue();
+  });
+  $frame.addEventListener("mouseleave", () => {
+    state.mouseOverFrame = false;
+    _refreshHostKbCue();
+  });
+}
+// Focus changes (clicking into chat-input, away from it, etc.)
+// flip whether global capture is active — update the cue too.
+document.addEventListener("focusin", _refreshHostKbCue);
+document.addEventListener("focusout", _refreshHostKbCue);
 
 if ($passInput) {
   $passInput.addEventListener("keydown", _passthroughHandleKey);
