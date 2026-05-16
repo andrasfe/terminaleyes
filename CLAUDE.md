@@ -89,7 +89,7 @@ The Command Center web UI (`terminaleyes commandcenter`) watches this directory 
   - `static/` — mobile-first SPA (`index.html`, `app.js`, `styles.css`).
 - `src/terminaleyes/commander/` — Implementation modules backing the agents
   - `visual_servo_homer.py` — closed-loop CV homer; the click engine ClickAgent wraps. Persists every step to `<run>/homer/<id>/history.jsonl` for training.
-  - `pointer_accel.py` — open-loop pointer-acceleration MLP (NumPy inference + Newton inverse). Used by the homer as the first-iteration HID seed; falls back silently to closed-loop if the checkpoint isn't present. Currently Ubuntu-libinput-adaptive specific.
+  - `pointer_accel.py` — open-loop pointer-acceleration MLP. v3+ checkpoints are *direct inverse* models — `(measured_dx_pct, measured_dy_pct, cursor) → hid` — so inference is a single forward pass with no Newton iteration. v1/v2 checkpoints are forward models that the runtime Newton-inverts (kept for backwards compat — `config.json:"direction"` selects). Used by the homer as the first-iteration HID seed; falls back silently to closed-loop if no checkpoint is present. Ubuntu-libinput-adaptive specific.
   - `cursor_finder.py` — HSV finder (saturated red `redglass` cursor) + variance fallback
   - `ocr_finder.py` — tesseract wrapper with multi-pass preprocessing
   - `login.py` — backwards-compat shim; routes to `agents.login.LoginAgent`

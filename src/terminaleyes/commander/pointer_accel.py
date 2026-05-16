@@ -42,6 +42,9 @@ class PointerAccelConfig:
     input_features: list[str]
     output_features: list[str]
     platform: str = "ubuntu-libinput-adaptive"
+    # "forward" → (hid, cursor) → measured; runtime must Newton-invert.
+    # "inverse" → (measured, cursor) → hid; runtime is a single fwd pass.
+    direction: str = "forward"
 
 
 class PointerAccelModel:
@@ -60,6 +63,7 @@ class PointerAccelModel:
             input_features=list(cfg.get("input_features", [])),
             output_features=list(cfg.get("output_features", [])),
             platform=str(cfg.get("platform", "")),
+            direction=str(cfg.get("direction", "forward")),
         )
         npz = np.load(self.weights_dir / "weights.npz")
         self._w1 = npz["fc1.weight"].astype(np.float32)
@@ -116,15 +120,29 @@ class PointerAccelModel:
         max_iters: int = 6,
         tol_pct: float = 0.002,
     ) -> tuple[int, int]:
-        """Inverse: given a desired observed cursor delta, return the
-        HID (dx, dy) that should produce it under the trained
-        forward model. Newton-style iteration on a 2-d problem.
+        """Given a desired observed cursor delta, return the HID
+        (dx, dy) that should produce it under the trained model.
 
-        ``initial_ratio_x/y`` (pct-per-hid) seed the first guess —
-        the homer already learns these online, so passing them
-        gives the inverse a head start. When omitted, we fall back
-        to 1/40 (roughly the empirical floor we see on this rig).
+        If the checkpoint was trained in ``direction="inverse"`` (the
+        default in v3+), this is a single forward pass — no Newton
+        iteration, no Jacobian noise, much cleaner near zero. If the
+        checkpoint is a legacy forward model, we Newton-invert.
         """
+        if self.config.direction == "inverse":
+            x = np.array([
+                float(target_dx_pct),
+                float(target_dy_pct),
+                cursor_x_pct * 2.0 - 1.0,
+                cursor_y_pct * 2.0 - 1.0,
+            ], dtype=np.float32)
+            out = self._forward(x)
+            # Outputs are HID normalised by /127; un-normalise and
+            # clamp to the signed-byte range the BT report supports.
+            dx = max(-127.0, min(127.0, float(out[0]) * 127.0))
+            dy = max(-127.0, min(127.0, float(out[1]) * 127.0))
+            return int(round(dx)), int(round(dy))
+        # Legacy forward-model path — Newton's method on a 2-d
+        # problem with finite-difference Jacobian.
         # Seed: dx ≈ target_dx / ratio_x. Clamp to ±127 right away.
         rx = initial_ratio_x if initial_ratio_x and initial_ratio_x > 0 else 1.0 / 40.0
         ry = initial_ratio_y if initial_ratio_y and initial_ratio_y > 0 else 1.0 / 40.0

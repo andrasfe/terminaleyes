@@ -47,7 +47,25 @@ def _load_jsonl(path: Path) -> list[dict]:
         return [json.loads(ln) for ln in f if ln.strip()]
 
 
-def _featurise(rows: list[dict]):
+def _featurise(rows: list[dict], *, inverse: bool, augment: bool):
+    """Build (X, Y) for either the forward or inverse problem.
+
+    Forward: ``(hid, cursor) → measured`` — what we used to do; the
+    homer then inverts at runtime via Newton's method (finite-diff
+    Jacobian, 6 forward passes, noisy near zero).
+
+    Inverse (default in v3): ``(measured, cursor) → hid``. We have the
+    inverse samples for free — every row of the dataset is a real
+    ``(target HID, observed delta)`` pair, so flipping the I/O turns
+    the same data into an inverse-training corpus. Inference becomes
+    a single forward pass; no Newton iteration, no Jacobian noise.
+
+    Augment: the pointer-accel curve is symmetric under (dx → -dx)
+    and (dy → -dy) independently. Adding the three sign-flipped
+    copies roughly 4× the dataset for free, and forces the model to
+    learn that symmetry instead of memorising the specific positive-
+    quadrant trajectories the homer happens to produce.
+    """
     import numpy as np
     X = []
     Y = []
@@ -55,22 +73,26 @@ def _featurise(rows: list[dict]):
         cx = r.get("cursor_x_pct")
         cy = r.get("cursor_y_pct")
         if cx is None or cy is None:
-            # No prior cursor position — drop. With enough rows we
-            # don't need the row-level fallback; the corpus is
-            # dominated by rows that DO have a cursor position
-            # because the homer only sends HID deltas AFTER it has
-            # locked onto the cursor visually.
             continue
-        X.append([
-            r["hid_dx"] / 127.0,
-            r["hid_dy"] / 127.0,
-            (cx * 2.0) - 1.0,
-            (cy * 2.0) - 1.0,
-        ])
-        Y.append([
-            r["measured_dx_pct"],
-            r["measured_dy_pct"],
-        ])
+        hx = r["hid_dx"] / 127.0
+        hy = r["hid_dy"] / 127.0
+        mx = float(r["measured_dx_pct"])
+        my = float(r["measured_dy_pct"])
+        cx_c = (cx * 2.0) - 1.0
+        cy_c = (cy * 2.0) - 1.0
+        samples = [(hx, hy, mx, my, cx_c, cy_c)]
+        if augment:
+            samples.append((-hx, hy, -mx, my, -cx_c, cy_c))
+            samples.append((hx, -hy, mx, -my, cx_c, -cy_c))
+            samples.append((-hx, -hy, -mx, -my, -cx_c, -cy_c))
+        for hx_, hy_, mx_, my_, cx_, cy_ in samples:
+            if inverse:
+                # Inverse direction: tell me what HID to send.
+                X.append([mx_, my_, cx_, cy_])
+                Y.append([hx_, hy_])
+            else:
+                X.append([hx_, hy_, cx_, cy_])
+                Y.append([mx_, my_])
     return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
 
 
@@ -88,6 +110,21 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=400)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument(
+        "--inverse", action="store_true", default=True,
+        help="Train (measured, cursor)→hid directly (default).",
+    )
+    ap.add_argument(
+        "--forward", dest="inverse", action="store_false",
+        help="Train forward (hid, cursor)→measured; runtime inverts.",
+    )
+    ap.add_argument(
+        "--augment", action="store_true", default=True,
+        help="Sign-flip augmentation (x4 dataset; default on).",
+    )
+    ap.add_argument(
+        "--no-augment", dest="augment", action="store_false",
+    )
     args = ap.parse_args()
 
     try:
@@ -108,11 +145,21 @@ def main() -> int:
     )
     if not train_rows:
         print("no train rows", file=sys.stderr); return 1
-    Xtr, Ytr = _featurise(train_rows)
-    Xv, Yv = _featurise(val_rows) if val_rows else (None, None)
+    Xtr, Ytr = _featurise(
+        train_rows, inverse=args.inverse, augment=args.augment,
+    )
+    if val_rows:
+        # Don't augment val — we measure on real-world (non-flipped)
+        # rows only so the reported MSE reflects deployment.
+        Xv, Yv = _featurise(val_rows, inverse=args.inverse, augment=False)
+    else:
+        Xv, Yv = None, None
+    mode = "inverse (measured,cursor)→hid" if args.inverse \
+        else "forward (hid,cursor)→measured"
     print(
-        f"train shape: {Xtr.shape} → {Ytr.shape};"
-        f" val shape: {None if Xv is None else Xv.shape}"
+        f"mode: {mode}; augment={args.augment}; "
+        f"train shape: {Xtr.shape} → {Ytr.shape}; "
+        f"val shape: {None if Xv is None else Xv.shape}"
     )
 
     class _MLP(nn.Module):
@@ -172,13 +219,24 @@ def main() -> int:
         f"fc3.bias":   np.array(model.fc3.bias),
     }
     np.savez(str(args.output / "weights.npz"), **weights)
-    (args.output / "config.json").write_text(json.dumps({
-        "hidden": args.hidden,
-        "input_features": [
+    if args.inverse:
+        input_features = [
+            "measured_dx_pct", "measured_dy_pct",
+            "cursor_x_centred", "cursor_y_centred",
+        ]
+        output_features = ["hid_dx_norm", "hid_dy_norm"]
+    else:
+        input_features = [
             "hid_dx_norm", "hid_dy_norm",
             "cursor_x_centred", "cursor_y_centred",
-        ],
-        "output_features": ["measured_dx_pct", "measured_dy_pct"],
+        ]
+        output_features = ["measured_dx_pct", "measured_dy_pct"]
+    (args.output / "config.json").write_text(json.dumps({
+        "hidden": args.hidden,
+        "direction": "inverse" if args.inverse else "forward",
+        "input_features": input_features,
+        "output_features": output_features,
+        "augmented": bool(args.augment),
         "train_rows": int(Xtr.shape[0]),
         "val_rows": int(0 if Xv is None else Xv.shape[0]),
         "platform": "ubuntu-libinput-adaptive",
