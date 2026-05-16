@@ -7,6 +7,7 @@ const $frameMeta = document.getElementById("frame-meta");
 const $btnPrev = document.getElementById("btn-prev");
 const $btnNext = document.getElementById("btn-next");
 const $btnLive = document.getElementById("btn-live");
+const $btnRefresh = document.getElementById("btn-refresh");
 
 const $chatLog = document.getElementById("chat-log");
 const $chatForm = document.getElementById("chat-form");
@@ -214,6 +215,28 @@ $btnLive.addEventListener("click", () => {
     setFrameSrc(state.knownIds[state.knownIds.length - 1]);
   } else {
     updateFrameMeta();
+  }
+});
+
+// Manual refresh: fire /api/snapshot and let the poll-until-stable
+// loop on the server stream new frames into the watch dir. We jump
+// to live so the long-poll surfaces them as they land.
+$btnRefresh?.addEventListener("click", async () => {
+  if ($btnRefresh.disabled) return;
+  $btnRefresh.disabled = true;
+  $btnRefresh.classList.add("spinning");
+  state.liveMode = true;
+  try {
+    const res = await fetch("/api/snapshot", { method: "POST" });
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.warn("refresh failed:", res.status, t);
+    }
+  } catch (e) {
+    console.warn("refresh fetch error:", e);
+  } finally {
+    $btnRefresh.disabled = false;
+    $btnRefresh.classList.remove("spinning");
   }
 });
 

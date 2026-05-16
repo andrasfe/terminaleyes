@@ -386,6 +386,13 @@ body.col-resizing img { pointer-events: none; }
   color: #001a26;
   border-color: var(--accent);
 }
+#btn-refresh.spinning {
+  color: var(--accent);
+  animation: refreshSpin 0.9s linear infinite;
+}
+@keyframes refreshSpin {
+  to { transform: rotate(360deg); }
+}
 #frame-meta {
   flex: 1;
   text-align: center;

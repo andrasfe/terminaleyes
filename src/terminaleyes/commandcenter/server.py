@@ -380,32 +380,65 @@ def create_app(
     # Lets the UI drive the host cursor directly: click a point on the
     # screenshot or fire a button. Refuses while a run is in flight
     # because the runner owns the mouse for that window.
-    # Per-action snapshot cadence. Two shots, the second one a few
-    # seconds after the first, so slow-rendering popups, autocomplete
-    # dropdowns, animation frames, etc. land in the watch dir. Tuneable
-    # via env so we don't have to redeploy to widen the window.
+    #
+    # Post-action snapshot policy:
+    # The host might react instantly (a window focuses, a button
+    # depresses) or seconds later (a page loads, a context menu
+    # animates in, a modal renders, an app launches). We can't tell
+    # which up front. Instead of a fixed sleep we run a
+    # poll-until-stable loop: grab the first frame, then keep grabbing
+    # at ``_POLL_INTERVAL_S`` intervals until two consecutive frames
+    # are pixel-stable (normalised MSE < ``_STABLE_MSE_THR``) or the
+    # ``_MAX_WAIT_S`` budget is exhausted. Each "interesting" frame
+    # (initial + every changed frame + last stable frame) is written
+    # so the UI replay shows the full sequence; near-duplicates of
+    # the previous saved frame are skipped to keep the watch dir
+    # readable.
     import os as _os
-    _FOLLOWUP_SHOTS = max(
-        0, int(_os.environ.get("TERMINALEYES_CC_FOLLOWUP_SHOTS", "1"))
+    _POLL_INTERVAL_S = max(
+        0.25,
+        float(_os.environ.get("TERMINALEYES_CC_POLL_INTERVAL_S", "1.5")),
     )
-    _FOLLOWUP_DELAY_S = max(
+    _MAX_WAIT_S = max(
+        _POLL_INTERVAL_S,
+        float(_os.environ.get("TERMINALEYES_CC_MAX_WAIT_S", "15.0")),
+    )
+    # Normalised mean-squared error threshold. We divide MSE by
+    # (255**2) so it's invariant to image bit depth: ~0.0005 catches
+    # tiny webcam flicker as "stable", ~0.002 lets a cursor blink slip
+    # through as motion. Tune via env if your rig is noisier.
+    _STABLE_MSE_THR = max(
         0.0,
-        float(_os.environ.get("TERMINALEYES_CC_FOLLOWUP_DELAY_S", "3.0")),
+        float(_os.environ.get("TERMINALEYES_CC_STABLE_MSE_THR", "0.0008")),
     )
+
+    def _frame_mse(a, b) -> float:
+        """Normalised MSE between two BGR frames. Returns 0 on shape
+        mismatch (treat as "I can't compare, keep polling")."""
+        import numpy as np
+        try:
+            if a.shape != b.shape:
+                return float("inf")
+            d = a.astype("float32") - b.astype("float32")
+            mse = float(np.mean(d * d))
+            return mse / (255.0 * 255.0)
+        except Exception:
+            return float("inf")
 
     async def _snapshot_after_manual_action(label: str) -> None:
-        """Grab webcam frames after a manual action and write them to
-        ``watch_dir/manual/``.
+        """Grab webcam frames after a manual action until the screen
+        settles (or a hard cap elapses).
 
-        Takes one immediate frame plus ``_FOLLOWUP_SHOTS`` more spaced
-        by ``_FOLLOWUP_DELAY_S`` seconds — slow-rendering popups, menus,
-        and animation frames don't always exist at t=0.25s after the
-        HID event lands, so a single shot can miss them entirely.
-        Followups are named ``<label>_t<seconds>``.
+        We can't know whether a click will produce an instantaneous
+        change or a slow one (page load, menu animation, app launch),
+        so instead of betting on a fixed delay we poll the camera
+        every ``_POLL_INTERVAL_S`` seconds and stop once two
+        consecutive frames are pixel-stable. Every changed frame is
+        persisted as ``<label>_tN.Ns`` so the UI replay covers the
+        whole transition; duplicate-of-previous frames are skipped.
 
-        Capture is serialized; the webcam stays open across the followup
-        sleeps so we don't pay open/close cost N times and so we capture
-        a consistent view.
+        Capture is serialized; the webcam stays open across the poll
+        sleeps to avoid open/close cost and keep a consistent view.
         """
         if settings is None:
             return
@@ -433,33 +466,71 @@ def create_app(
             except OSError:
                 return
 
-            async def _grab_and_write(suffix: str) -> None:
-                try:
-                    frame = await cap.capture_frame()
-                except Exception as e:
-                    logger.warning("manual snapshot failed: %s", e)
-                    return
+            def _write(image, suffix: str) -> bool:
                 seq = int(datetime.now().timestamp() * 1000) % 10_000
                 ts = datetime.now().strftime("%H%M%S")
                 tag = label if not suffix else f"{label}_{suffix}"
                 path = out_dir / f"{seq:04d}_{ts}_{tag}.png"
                 try:
-                    ok = cv2.imwrite(str(path), frame.image)
+                    ok = cv2.imwrite(str(path), image)
                     if not ok:
                         logger.warning(
                             "imwrite returned False for %s", path,
                         )
+                    return bool(ok)
                 except Exception as e:
                     logger.warning("imwrite failed for %s: %s", path, e)
+                    return False
 
             try:
                 await cap.open()
                 # Let the cursor settle visually before grabbing.
                 await asyncio.sleep(0.25)
-                await _grab_and_write("")
-                for i in range(1, _FOLLOWUP_SHOTS + 1):
-                    await asyncio.sleep(_FOLLOWUP_DELAY_S)
-                    await _grab_and_write(f"t{i * _FOLLOWUP_DELAY_S:.1f}s")
+                try:
+                    first = await cap.capture_frame()
+                except Exception as e:
+                    logger.warning("manual snapshot failed: %s", e)
+                    return
+                _write(first.image, "")
+                last_saved = first.image
+                prev = first.image
+                t0 = asyncio.get_event_loop().time()
+                stable_streak = 0
+                poll_idx = 0
+                while True:
+                    elapsed = asyncio.get_event_loop().time() - t0
+                    if elapsed >= _MAX_WAIT_S:
+                        break
+                    await asyncio.sleep(_POLL_INTERVAL_S)
+                    poll_idx += 1
+                    try:
+                        cur = await cap.capture_frame()
+                    except Exception as e:
+                        logger.debug("poll capture failed: %s", e)
+                        continue
+                    elapsed = asyncio.get_event_loop().time() - t0
+                    mse_prev = _frame_mse(prev, cur.image)
+                    mse_saved = _frame_mse(last_saved, cur.image)
+                    if mse_prev < _STABLE_MSE_THR:
+                        stable_streak += 1
+                    else:
+                        stable_streak = 0
+                        # Screen changed since last poll — save it.
+                        # But suppress near-duplicates of what we
+                        # already saved so the watch dir doesn't fill
+                        # up with imperceptibly different frames.
+                        if mse_saved >= _STABLE_MSE_THR:
+                            _write(cur.image, f"t{elapsed:.1f}s")
+                            last_saved = cur.image
+                    prev = cur.image
+                    if stable_streak >= 2:
+                        # Two consecutive stable polls — the host has
+                        # settled. Persist the final frame if it
+                        # differs from what we last wrote.
+                        if _frame_mse(last_saved, cur.image) \
+                                >= _STABLE_MSE_THR:
+                            _write(cur.image, f"t{elapsed:.1f}s_stable")
+                        break
             finally:
                 try:
                     await cap.close()

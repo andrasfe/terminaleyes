@@ -200,12 +200,17 @@ Each `POST /api/run` builds a fresh `AgentContext` with `output_dir =
 records (`FrameMeta.run_id == RunRecord.run_id`). The webcam is held
 only during a run, exactly matching `terminaleyes do`.
 
-Manual mouse actions from the UI (click/move/scroll) capture two
-frames: one immediately after the HID event lands and one
-`TERMINALEYES_CC_FOLLOWUP_DELAY_S` seconds later (default 3s, env-
-tuneable) so slow-rendering popups, autocomplete dropdowns, and
-animation frames make it into the watch dir. `TERMINALEYES_CC_FOLLOWUP_SHOTS`
-controls how many follow-ups (default 1).
+Manual mouse actions from the UI (click/move/scroll) and the
+on-screen ⟳ refresh button use a **poll-until-stable** capture loop:
+grab a frame immediately after the HID event, then keep grabbing every
+`TERMINALEYES_CC_POLL_INTERVAL_S` (default 1.5s) until two consecutive
+frames are pixel-stable (normalised MSE below
+`TERMINALEYES_CC_STABLE_MSE_THR`, default 0.0008) or the
+`TERMINALEYES_CC_MAX_WAIT_S` budget (default 15s) is exhausted. Every
+frame that visibly changed gets written so the UI replay covers the
+whole transition. Handles both instantaneous reactions (a button
+depress) and delayed ones (page loads, app launches, modals) without
+a fixed sleep.
 
 ## Vault
 
