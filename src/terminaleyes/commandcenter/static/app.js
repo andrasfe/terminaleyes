@@ -716,26 +716,44 @@ $frame.addEventListener("click", (e) => {
   }, DBL_CLICK_MS);
 });
 
-// Double-click on the screenshot → double-click on the host at the
-// current red-cursor position. Does NOT re-home the cursor — the
-// operator's existing pointer is the intended target (selecting a
-// word, opening a file in a file manager, expanding a folder, etc.).
+// Double-click on the screenshot → home the cursor to the
+// double-click location AND fire two clicks there. Semantically the
+// same as "open the thing under my pointer" — the operator usually
+// wants the host to act on whatever they're aiming at, not on
+// whatever the host's red cursor happens to be hovering. The
+// single-click home is cancelled by clearing the debounce timer so
+// the homer only fires once (with count=2) instead of twice.
 $frame.addEventListener("dblclick", async (e) => {
+  if (!$optClickToMove || !$optClickToMove.checked) return;
   if ($frame.classList.contains("empty")) return;
-  // Cancel the pending single-click home so the homer doesn't fire
-  // for the first click of the pair.
   if (_pendingSingleClickTimer != null) {
     clearTimeout(_pendingSingleClickTimer);
     _pendingSingleClickTimer = null;
   }
   e.preventDefault();
+  const rect = imageRect();
+  if (!rect) return;
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  if (x < 0 || y < 0 || x > rect.width || y > rect.height) return;
+  const x_pct = Math.max(0, Math.min(1, x / rect.width));
+  const y_pct = Math.max(0, Math.min(1, y / rect.height));
   if (_mouseBusy) return;
-  appendSystemLog("INFO", "mouse dblclick at current cursor");
-  await postMouse(
-    "/api/mouse/click",
-    { button: "left", count: 2 },
-    "double-clicking…",
+  showClickMarker(e.clientX, e.clientY);
+  appendSystemLog(
+    "INFO",
+    `mouse dblclick_at (${x_pct.toFixed(3)}, ${y_pct.toFixed(3)})`,
   );
+  await postMouse(
+    "/api/mouse/click_at",
+    { x_pct, y_pct, button: "left", count: 2 },
+    "homing + double-clicking…",
+  );
+  state.hadClickAt = true;
+  if ($passInput) {
+    $passInput.value = "";
+    $passInput.focus();
+  }
 });
 
 // Block the default context menu when right-clicking on the

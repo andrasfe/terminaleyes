@@ -54,6 +54,11 @@ class MouseClickAtRequest(BaseModel):
     x_pct: float = Field(ge=0.0, le=1.0)
     y_pct: float = Field(ge=0.0, le=1.0)
     button: str = Field(default="left", pattern="^(left|right|middle)$")
+    # ``count=2`` → home to the pixel and fire a double-click. The
+    # homer always fires one click as part of landing; for count > 1
+    # we send (count - 1) extra in-place clicks after the home is
+    # reported successful.
+    count: int = Field(default=1, ge=1, le=3)
     # Optional overrides; defaults come from settings.commander.
     screen_width: int | None = Field(default=None, gt=0)
     screen_height: int | None = Field(default=None, gt=0)
@@ -730,6 +735,23 @@ def create_app(
                 # home.
                 if bool(outcome.clicked):
                     app.state.last_scroll_home_xy = (req.x_pct, req.y_pct)
+                    # Multi-click: the homer already fired one click
+                    # as part of landing. Send the extras in-place
+                    # (no movement between) so the OS sees them as a
+                    # genuine double / triple click. 80 ms gap keeps
+                    # us inside macOS's ~250 ms double-click window
+                    # while leaving enough time for the BT HID report
+                    # to land cleanly.
+                    for _ in range(1, req.count):
+                        await asyncio.sleep(0.08)
+                        try:
+                            await mouse.click(req.button)
+                        except Exception as e:
+                            logger.warning(
+                                "extra click in count=%d failed: %s",
+                                req.count, e,
+                            )
+                            break
                 # Drop a post-click frame at the watch-dir top level
                 # so FrameStore (one-level-deep scan) picks it up and
                 # the UI long-poll refreshes.
@@ -752,6 +774,7 @@ def create_app(
                     "steps": outcome.steps,
                     "x_pct": req.x_pct, "y_pct": req.y_pct,
                     "button": req.button,
+                    "count": req.count,
                 })
             except Exception as e:
                 logger.exception("home_to_pixel failed")
