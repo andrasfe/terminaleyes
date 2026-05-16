@@ -876,8 +876,51 @@ const $btnPassClear = document.getElementById("btn-passthrough-clear");
 const _kbQueue = [];
 let _kbDraining = false;
 
+// Typing-snapshot loop: while keystrokes are flowing to the host we
+// want a much tighter refresh cadence than the 60s Active Refresh —
+// the operator wants to see the field fill in. We piggyback on
+// /api/snapshot?dedup=1 so unchanged frames still write nothing.
+// The loop:
+//   - any keystroke pushes lastKeystrokeAt forward
+//   - while (now - lastKeystrokeAt) < TYPING_IDLE_MS, fire a dedup
+//     snapshot every TYPING_SNAPSHOT_MS
+//   - after idle, the timer stops; the long-poll surfaces frames the
+//     way it normally does
+const TYPING_SNAPSHOT_MS = 2000;
+const TYPING_IDLE_MS = 5000;
+let lastKeystrokeAt = 0;
+let typingSnapshotTimer = null;
+
+async function _typingSnapshotTick() {
+  if (activeRefreshInFlight) return;
+  if (document.hidden) return;
+  if (Date.now() - lastKeystrokeAt > TYPING_IDLE_MS) {
+    clearInterval(typingSnapshotTimer);
+    typingSnapshotTimer = null;
+    return;
+  }
+  activeRefreshInFlight = true;
+  try {
+    await fetch("/api/snapshot?dedup=1", { method: "POST" });
+  } catch (e) { /* ignore — next tick will retry */ }
+  finally { activeRefreshInFlight = false; }
+}
+function _markTypingActivity() {
+  lastKeystrokeAt = Date.now();
+  state.liveMode = true;
+  if (typingSnapshotTimer == null) {
+    // Fire one immediately so the operator gets feedback within ~1s
+    // of the first keystroke instead of waiting a full interval.
+    _typingSnapshotTick();
+    typingSnapshotTimer = setInterval(
+      _typingSnapshotTick, TYPING_SNAPSHOT_MS,
+    );
+  }
+}
+
 function _kbEnqueue(job) {
   _kbQueue.push(job);
+  _markTypingActivity();
   _kbDrain();
 }
 

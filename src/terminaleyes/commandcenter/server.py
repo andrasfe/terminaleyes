@@ -415,6 +415,18 @@ def create_app(
         0.0,
         float(_os.environ.get("TERMINALEYES_CC_CHANGE_FRACTION", "0.005")),
     )
+    # Dedup mode (used by /api/snapshot?dedup=1 and the typing /
+    # active-refresh loops) needs to be more sensitive than the
+    # post-mouse-action stability check: a single typed character in
+    # a text field only flips ~3 cells of the 64×64 grid (~0.07%),
+    # well below the post-action 0.5% noise gate. Default 0.001 (4
+    # cells) catches that while still ignoring cursor-only motion.
+    _DEDUP_FRACTION_THR = max(
+        0.0,
+        float(
+            _os.environ.get("TERMINALEYES_CC_DEDUP_FRACTION", "0.001"),
+        ),
+    )
     _CELL_DELTA_THR = max(
         1,
         int(_os.environ.get("TERMINALEYES_CC_CELL_DELTA", "16")),
@@ -611,7 +623,7 @@ def create_app(
                     prior = None
                 if prior is not None and \
                         _changed_fraction(prior, frame.image) \
-                        < _CHANGE_FRACTION_THR:
+                        < _DEDUP_FRACTION_THR:
                     return False
 
             seq = int(datetime.now().timestamp() * 1000) % 10_000
