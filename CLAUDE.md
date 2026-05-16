@@ -88,7 +88,8 @@ The Command Center web UI (`terminaleyes commandcenter`) watches this directory 
   - `log_bus.py` — pub/sub for log records + redirected stdout/stderr; SSE streams subscribe.
   - `static/` — mobile-first SPA (`index.html`, `app.js`, `styles.css`).
 - `src/terminaleyes/commander/` — Implementation modules backing the agents
-  - `visual_servo_homer.py` — closed-loop CV homer; the click engine ClickAgent wraps
+  - `visual_servo_homer.py` — closed-loop CV homer; the click engine ClickAgent wraps. Persists every step to `<run>/homer/<id>/history.jsonl` for training.
+  - `pointer_accel.py` — open-loop pointer-acceleration MLP (NumPy inference + Newton inverse). Used by the homer as the first-iteration HID seed; falls back silently to closed-loop if the checkpoint isn't present. Currently Ubuntu-libinput-adaptive specific.
   - `cursor_finder.py` — HSV finder (saturated red `redglass` cursor) + variance fallback
   - `ocr_finder.py` — tesseract wrapper with multi-pass preprocessing
   - `login.py` — backwards-compat shim; routes to `agents.login.LoginAgent`
@@ -103,6 +104,9 @@ The Command Center web UI (`terminaleyes commandcenter`) watches this directory 
 - `scripts/bt-agent.py` — Python D-Bus pairing agent (auto-accepts, runs as systemd service)
 - `scripts/radio_mode.sh` — Switch between WiFi and BT modes (persists across reboot)
 - `scripts/deploy_pi.sh` — Full deploy: rsync, pip install, test endpoints, install services
+- `scripts/collect_pointer_accel.sh` — fire `/api/mouse/click_at` at an N×M grid to collect homer step records for training the open-loop pointer-accel MLP
+- `scripts/build_pointer_accel_dataset.py` — walk `<run>/homer/*/history.jsonl` → `data/ml/pointer_accel/{train,val,test}.jsonl` (80/10/10 split by trajectory)
+- `scripts/train_pointer_accel.py` — MLX-backed MLP trainer; emits `data/ml/checkpoints/pointer_accel-vN/{weights.npz,config.json}` (load via `commander.pointer_accel.PointerAccelModel`)
 
 ## Commands
 
@@ -172,7 +176,7 @@ Replaces the older static-calibration homer entirely. Per run:
    - Tesseract OCR with multi-pass preprocessing (scales 3–5, PSM 6+11, both polarities for dark mode), restricted to user-quoted tokens when present so generic words like "subreddit"/"entry" don't match
    - Scene-map (multimodal) + ShowUI grounding of the matched label
    - ShowUI on focused crops (left sidebar, footer)
-4. **Visual servo loop** — proportional HID move from current ratio + ROI-prior frame diff to track cursor. Ratio learned online with floor/ceil clamps so a bad sample can't run away. Hard cap on HID per axis.
+4. **Visual servo loop** — proportional HID move from current ratio + ROI-prior frame diff to track cursor. Ratio learned online with floor/ceil clamps so a bad sample can't run away. Hard cap on HID per axis. **First iteration is seeded** by an open-loop pointer-accel MLP (`commander/pointer_accel.py`, checkpoint at `data/ml/checkpoints/pointer_accel-v2/`) which inverts a learned forward model `(hid, cursor_pos) → measured_pct_delta` via Newton's method. Median seed error ~2 px on Ubuntu libinput-adaptive; absence of the checkpoint is harmless (homer logs and falls back to ratio-only seed). Every step (sent HID + measured delta + cursor position) is persisted to `<run>/homer/<id>/history.jsonl` for future retraining.
 5. **Click gate** — geometric: visually-detected cursor within `CLICK_TOL_PCT=1.2%` of aim point for 2 consecutive frames. Hotspot offset compensates for centroid-vs-tip on the default arrow.
 6. **Click retry pattern** — first click overshoots by ~1% on most cursors; if the post-click oracle says nothing changed, nudge through a small diamond (5 attempts) and re-verify.
 7. **Post-click navigation oracle** — captures a frame ~2.5s after click, OCRs the URL bar and page header, looks for the target's distinguishing keywords (quoted text wins over generic descriptors).
@@ -229,6 +233,7 @@ terminaleyes cc --port 8888 --frames-dir /tmp/foo
 - `LogBus` captures the `terminaleyes` logger AND redirects `stdout`/`stderr` of the active run; SSE subscribers (per-run + global) get `LogEvent { ts, level, source, msg, run_id }`.
 - `Runner` is one-at-a-time: each `POST /api/run` builds a fresh `AgentContext` via `make_default_context_factory(settings, base_dir=watch_dir, bus)`, invokes `ControllerAgent.run(intent=...)`, then closes mouse/keyboard/capture. The webcam is held only during a run, exactly matching `terminaleyes do`.
 - Per-run output dir = `<watch_dir>/<run_id>/`. `bus.active_run(run_id)` is set before the factory runs, so `bus.current_run_id()` is read in the factory to name the dir. UI's `FrameMeta.run_id == RunRecord.run_id`.
+- Manual mouse actions (`/api/mouse/click_at`, `/move`, `/scroll`, `/button`) take two snapshots per action — one immediate, one after `TERMINALEYES_CC_FOLLOWUP_DELAY_S` (default 3s) — so slow-rendering popups, autocomplete dropdowns, animation frames land in the watch dir. `TERMINALEYES_CC_FOLLOWUP_SHOTS` (default 1) tunes follow-up count. The webcam stays open across the follow-up sleeps. Snapshots are serialized with `_manual_capture_lock` and refuse to run while a `ControllerAgent` run holds the device.
 
 **Endpoints:**
 | Method | Path | Purpose |

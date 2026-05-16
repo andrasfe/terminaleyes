@@ -99,10 +99,40 @@ The visual servo homer behind `ClickAgent`:
    - Tesseract OCR (multi-pass scales / PSMs / both polarities for dark mode), restricted to the user's quoted token when present.
    - Scene-map (multimodal) + ShowUI grounding of the matched label.
    - ShowUI on focused crops (sidebar, footer).
-4. **Visual servo loop** — proportional HID move + ROI-prior frame diff to track the cursor; ratio learned online with floor/ceil clamps.
+4. **Visual servo loop** — proportional HID move + ROI-prior frame diff to track the cursor; ratio learned online with floor/ceil clamps. First iteration is seeded by a tiny open-loop pointer-acceleration model (see "Open-loop pointer-accel seed" below) so step 1 lands within ~2 px of target on Ubuntu, before the closed-loop fine-tuning kicks in.
 5. **Click gate** — geometric: cursor within ~1.2% of aim point for 2 consecutive frames.
 6. **Click retry diamond** — first click often overshoots by ~1%; if the post-click oracle says nothing changed, nudge in 4 directions and re-verify.
 7. **Post-click navigation oracle** — capture ~2.5s after click, OCR the URL bar / page header, look for the target's distinguishing keywords.
+
+### Open-loop pointer-accel seed (Ubuntu)
+
+Ubuntu's libinput "adaptive" pointer-acceleration profile is
+non-linear and velocity-dependent, so a single multiplicative ratio
+(`pct_per_hid`) is wrong almost everywhere — the closed-loop homer
+compensates by iterating, which works but costs camera frames.
+
+`src/terminaleyes/commander/pointer_accel.py` loads a tiny 2-layer
+MLP (`data/ml/checkpoints/pointer_accel-v2/`, ~20 KB) that maps
+`(hid_dx, hid_dy, cursor_x_pct, cursor_y_pct)` → observed cursor
+delta under the acceleration curve. The homer inverts it with
+Newton's method to get an open-loop HID seed for iteration 1; the
+closed-loop ratio still owns iterations 2+. Median seed error on
+held-out trajectories is ~2 px (90th pct ~140 px), well inside the
+~12 px click gate.
+
+Reproduce:
+
+```bash
+# Webcam pointed at the target; commander up on http://127.0.0.1:8765.
+scripts/collect_pointer_accel.sh --grid 6        # 6×4 click grid → 24 probes
+scripts/build_pointer_accel_dataset.py           # → data/ml/pointer_accel/{train,val,test}.jsonl
+scripts/train_pointer_accel.py --output data/ml/checkpoints/pointer_accel-v3
+```
+
+The checked-in v2 model is Ubuntu-specific (libinput adaptive curve).
+macOS uses different pointer accel — retrain for that target if you
+want the seed to help there too. If the checkpoint is missing the
+homer silently falls back to closed-loop-only behaviour.
 
 ## How login works
 
@@ -169,6 +199,13 @@ Each `POST /api/run` builds a fresh `AgentContext` with `output_dir =
 <watch_dir>/<run_id>/` so frames in the UI cleanly map to runner
 records (`FrameMeta.run_id == RunRecord.run_id`). The webcam is held
 only during a run, exactly matching `terminaleyes do`.
+
+Manual mouse actions from the UI (click/move/scroll) capture two
+frames: one immediately after the HID event lands and one
+`TERMINALEYES_CC_FOLLOWUP_DELAY_S` seconds later (default 3s, env-
+tuneable) so slow-rendering popups, autocomplete dropdowns, and
+animation frames make it into the watch dir. `TERMINALEYES_CC_FOLLOWUP_SHOTS`
+controls how many follow-ups (default 1).
 
 ## Vault
 

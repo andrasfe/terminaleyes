@@ -58,5 +58,13 @@ run_mcp.sh
 .playwright-mcp/
 
 # ML artefacts — adapters, intermediate datasets, checkpoints
-data/ml/
+# Ignore everything under data/ml/ EXCEPT the tiny open-loop pointer-
+# acceleration model (~20 KB) and its training dataset — those are
+# load-bearing for fast cursor homing on Ubuntu and we want a fresh
+# clone to work without retraining.
+data/ml/*
+!data/ml/checkpoints/
+data/ml/checkpoints/*
+!data/ml/checkpoints/pointer_accel-*/
+!data/ml/pointer_accel/
 *.safetensors

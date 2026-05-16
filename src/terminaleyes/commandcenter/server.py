@@ -380,14 +380,32 @@ def create_app(
     # Lets the UI drive the host cursor directly: click a point on the
     # screenshot or fire a button. Refuses while a run is in flight
     # because the runner owns the mouse for that window.
-    async def _snapshot_after_manual_action(label: str) -> None:
-        """Grab one webcam frame and drop it in ``watch_dir/manual/``.
+    # Per-action snapshot cadence. Two shots, the second one a few
+    # seconds after the first, so slow-rendering popups, autocomplete
+    # dropdowns, animation frames, etc. land in the watch dir. Tuneable
+    # via env so we don't have to redeploy to widen the window.
+    import os as _os
+    _FOLLOWUP_SHOTS = max(
+        0, int(_os.environ.get("TERMINALEYES_CC_FOLLOWUP_SHOTS", "1"))
+    )
+    _FOLLOWUP_DELAY_S = max(
+        0.0,
+        float(_os.environ.get("TERMINALEYES_CC_FOLLOWUP_DELAY_S", "3.0")),
+    )
 
-        Without this, manual mouse actions never produce a fresh frame
-        in the watch dir, so the UI's long-poll sits on the stale
-        last-run screenshot and the operator can't see the cursor
-        actually moved. Capture is serialized; the webcam is opened
-        and closed per call so a real run can still claim the device.
+    async def _snapshot_after_manual_action(label: str) -> None:
+        """Grab webcam frames after a manual action and write them to
+        ``watch_dir/manual/``.
+
+        Takes one immediate frame plus ``_FOLLOWUP_SHOTS`` more spaced
+        by ``_FOLLOWUP_DELAY_S`` seconds — slow-rendering popups, menus,
+        and animation frames don't always exist at t=0.25s after the
+        HID event lands, so a single shot can miss them entirely.
+        Followups are named ``<label>_t<seconds>``.
+
+        Capture is serialized; the webcam stays open across the followup
+        sleeps so we don't pay open/close cost N times and so we capture
+        a consistent view.
         """
         if settings is None:
             return
@@ -409,36 +427,44 @@ def create_app(
                 device_index=settings.capture.device_index,
                 resolution=resolution,
             )
-            try:
-                await cap.open()
-                # Let the cursor settle visually before grabbing.
-                await asyncio.sleep(0.25)
-                frame = await cap.capture_frame()
-            except Exception as e:
-                logger.warning("manual snapshot failed: %s", e)
-                try:
-                    await cap.close()
-                except Exception:
-                    pass
-                return
-            try:
-                await cap.close()
-            except Exception:
-                pass
             out_dir = store.watch_dir / "manual"
             try:
                 out_dir.mkdir(parents=True, exist_ok=True)
             except OSError:
                 return
-            seq = int(datetime.now().timestamp() * 1000) % 10_000
-            ts = datetime.now().strftime("%H%M%S")
-            path = out_dir / f"{seq:04d}_{ts}_{label}.png"
+
+            async def _grab_and_write(suffix: str) -> None:
+                try:
+                    frame = await cap.capture_frame()
+                except Exception as e:
+                    logger.warning("manual snapshot failed: %s", e)
+                    return
+                seq = int(datetime.now().timestamp() * 1000) % 10_000
+                ts = datetime.now().strftime("%H%M%S")
+                tag = label if not suffix else f"{label}_{suffix}"
+                path = out_dir / f"{seq:04d}_{ts}_{tag}.png"
+                try:
+                    ok = cv2.imwrite(str(path), frame.image)
+                    if not ok:
+                        logger.warning(
+                            "imwrite returned False for %s", path,
+                        )
+                except Exception as e:
+                    logger.warning("imwrite failed for %s: %s", path, e)
+
             try:
-                ok = cv2.imwrite(str(path), frame.image)
-                if not ok:
-                    logger.warning("imwrite returned False for %s", path)
-            except Exception as e:
-                logger.warning("imwrite failed for %s: %s", path, e)
+                await cap.open()
+                # Let the cursor settle visually before grabbing.
+                await asyncio.sleep(0.25)
+                await _grab_and_write("")
+                for i in range(1, _FOLLOWUP_SHOTS + 1):
+                    await asyncio.sleep(_FOLLOWUP_DELAY_S)
+                    await _grab_and_write(f"t{i * _FOLLOWUP_DELAY_S:.1f}s")
+            finally:
+                try:
+                    await cap.close()
+                except Exception:
+                    pass
 
     def _commander_cfg():
         if settings is None:
