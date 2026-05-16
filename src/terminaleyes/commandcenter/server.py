@@ -61,6 +61,10 @@ class MouseClickAtRequest(BaseModel):
 
 class MouseClickRequest(BaseModel):
     button: str = Field(default="left", pattern="^(left|right|middle)$")
+    # ``count=2`` → double-click (two clicks within the OS's
+    # double-click threshold). Capped at 3 because more than that is
+    # almost never useful and would just be the BT HID timing budget.
+    count: int = Field(default=1, ge=1, le=3)
 
 
 class MouseMoveRequest(BaseModel):
@@ -765,14 +769,32 @@ def create_app(
 
     @app.post("/api/mouse/click")
     async def mouse_click(req: MouseClickRequest) -> JSONResponse:
+        # Inter-click gap for multi-click. macOS double-click threshold
+        # is ~500 ms but most apps treat anything under ~250 ms as a
+        # double. 80 ms keeps us safely inside that AND leaves enough
+        # time for the Pi's BT HID report + ack so the two clicks
+        # land as a distinct down-up-down-up pattern, not a coalesced
+        # long press.
+        gap = 0.08
+
         async def go(mouse):
             await mouse.click(req.button)
-            return JSONResponse({"ok": True, "button": req.button})
+            for _ in range(1, req.count):
+                await asyncio.sleep(gap)
+                await mouse.click(req.button)
+            return JSONResponse({
+                "ok": True, "button": req.button, "count": req.count,
+            })
 
         try:
             return await _with_mouse(go)
         finally:
-            _schedule_snapshot(f"manual_click_{req.button}")
+            tag = (
+                f"manual_click_{req.button}"
+                if req.count == 1
+                else f"manual_click_{req.button}_x{req.count}"
+            )
+            _schedule_snapshot(tag)
 
     @app.post("/api/mouse/move")
     async def mouse_move(req: MouseMoveRequest) -> JSONResponse:

@@ -665,18 +665,19 @@ async function postMouse(path, body, busyLabel) {
   }
 }
 
-$frame.addEventListener("click", async (e) => {
-  if (!$optClickToMove || !$optClickToMove.checked) return;
+// Single-click on the screenshot = home-and-click (visual servo).
+// Double-click = double-click at the current red-cursor position
+// (no re-homing — the host's red cursor is already where the user
+// wants the dblclick to land). We detect the pair ourselves with a
+// debounce timer so the dblclick suppresses the single-click home;
+// otherwise the homer would fire on the first click AND the second.
+const DBL_CLICK_MS = 300;
+let _pendingSingleClickTimer = null;
+
+async function _fireHomingClick(x_pct, y_pct, clientX, clientY) {
   if ($frame.classList.contains("empty")) return;
-  const rect = imageRect();
-  if (!rect) return;
-  const x = e.clientX - rect.left;
-  const y = e.clientY - rect.top;
-  if (x < 0 || y < 0 || x > rect.width || y > rect.height) return;
-  const x_pct = Math.max(0, Math.min(1, x / rect.width));
-  const y_pct = Math.max(0, Math.min(1, y / rect.height));
   if (_mouseBusy) return;
-  showClickMarker(e.clientX, e.clientY);
+  showClickMarker(clientX, clientY);
   appendSystemLog(
     "INFO",
     `mouse click_at (${x_pct.toFixed(3)}, ${y_pct.toFixed(3)})`,
@@ -686,19 +687,55 @@ $frame.addEventListener("click", async (e) => {
     { x_pct, y_pct, button: "left" },
     "homing cursor…",
   );
-  // A successful click_at means the operator has just transferred
-  // focus on the target — the next keystroke goes where they
-  // pointed. Note this so the "you typed without clicking first"
-  // warning doesn't fire on legitimate workflows.
   state.hadClickAt = true;
-  // Always auto-focus the passthrough so typing flows to the host
-  // regardless of whether the homer ultimately reported success.
-  // (Without this, a single "cursor_not_found" outcome leaves the
-  // operator stuck wondering why their keypresses do nothing.)
   if ($passInput) {
     $passInput.value = "";
     $passInput.focus();
   }
+}
+
+$frame.addEventListener("click", (e) => {
+  if (!$optClickToMove || !$optClickToMove.checked) return;
+  if ($frame.classList.contains("empty")) return;
+  const rect = imageRect();
+  if (!rect) return;
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  if (x < 0 || y < 0 || x > rect.width || y > rect.height) return;
+  const x_pct = Math.max(0, Math.min(1, x / rect.width));
+  const y_pct = Math.max(0, Math.min(1, y / rect.height));
+  // Wait DBL_CLICK_MS for a possible second click. If one comes,
+  // the dblclick handler cancels this timer and fires its own action
+  // instead — no homing, just a double-click at the current cursor.
+  if (_pendingSingleClickTimer != null) {
+    clearTimeout(_pendingSingleClickTimer);
+  }
+  _pendingSingleClickTimer = setTimeout(() => {
+    _pendingSingleClickTimer = null;
+    _fireHomingClick(x_pct, y_pct, e.clientX, e.clientY);
+  }, DBL_CLICK_MS);
+});
+
+// Double-click on the screenshot → double-click on the host at the
+// current red-cursor position. Does NOT re-home the cursor — the
+// operator's existing pointer is the intended target (selecting a
+// word, opening a file in a file manager, expanding a folder, etc.).
+$frame.addEventListener("dblclick", async (e) => {
+  if ($frame.classList.contains("empty")) return;
+  // Cancel the pending single-click home so the homer doesn't fire
+  // for the first click of the pair.
+  if (_pendingSingleClickTimer != null) {
+    clearTimeout(_pendingSingleClickTimer);
+    _pendingSingleClickTimer = null;
+  }
+  e.preventDefault();
+  if (_mouseBusy) return;
+  appendSystemLog("INFO", "mouse dblclick at current cursor");
+  await postMouse(
+    "/api/mouse/click",
+    { button: "left", count: 2 },
+    "double-clicking…",
+  );
 });
 
 // Block the default context menu when right-clicking on the
