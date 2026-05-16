@@ -1155,16 +1155,39 @@ function _shouldGlobalCapture() {
   if (a.isContentEditable) return false;
   return true;
 }
+// What the user originally asked for: "capture any special keys
+// like Ctrl-C, etc. when on top of the remote image". That meant
+// modifier combos and special keys (arrows, F-keys, Tab, Enter,
+// Esc, ...), NOT plain letters. Plain typing while hovering the
+// image used to silently forward to the host even when the user
+// thought they were typing locally — surprising and easy to do by
+// accident, because the screenshot fills most of the viewport so
+// the mouse is "over the image" by default.
+//
+// New rule: the global hover-capture only fires for keystrokes that
+// have an explicit reason to land on the host:
+//   - any key with a modifier (Ctrl / Cmd / Alt)
+//   - any non-printable / named key (Arrow*, F*, Escape, Tab, Enter,
+//     Backspace, Delete, Home, End, PageUp, PageDown)
+// Plain printable characters fall through to the browser. If the
+// operator actually wants to type into the host, they click into
+// the passthrough field — its own listener still forwards
+// everything regardless of mouse position.
+function _isSpecialOrModifiedKey(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return true;
+  if (e.key && e.key.length > 1) {
+    // Don't fire on modifier-only press; _passthroughHandleKey
+    // skips those anyway but no point doing the work.
+    if (e.key === "Shift" || e.key === "Control"
+        || e.key === "Alt" || e.key === "Meta") return false;
+    return true;
+  }
+  return false;
+}
 document.addEventListener("keydown", (e) => {
   if (!_shouldGlobalCapture()) return;
-  // Require the mouse to be over the screenshot for global capture.
-  // Without this gate, ANY keystroke fired while no cc input was
-  // focused would go to the host — including ones the operator
-  // typed by accident (browser focus on body, alt-tab back, etc.).
-  // The "host kbd" visual cue already signals exactly this state,
-  // so the rule becomes: if you can see the cue, your keys go to
-  // the host. If not, they don't.
   if (!state.mouseOverFrame) return;
+  if (!_isSpecialOrModifiedKey(e)) return;
   _passthroughHandleKey(e);
 }, true);
 
