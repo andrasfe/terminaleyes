@@ -201,16 +201,23 @@ records (`FrameMeta.run_id == RunRecord.run_id`). The webcam is held
 only during a run, exactly matching `terminaleyes do`.
 
 Manual mouse actions from the UI (click/move/scroll) and the
-on-screen ⟳ refresh button use a **poll-until-stable** capture loop:
-grab a frame immediately after the HID event, then keep grabbing every
-`TERMINALEYES_CC_POLL_INTERVAL_S` (default 1.5s) until two consecutive
-frames are pixel-stable (normalised MSE below
-`TERMINALEYES_CC_STABLE_MSE_THR`, default 0.0008) or the
-`TERMINALEYES_CC_MAX_WAIT_S` budget (default 15s) is exhausted. Every
-frame that visibly changed gets written so the UI replay covers the
-whole transition. Handles both instantaneous reactions (a button
-depress) and delayed ones (page loads, app launches, modals) without
-a fixed sleep.
+on-screen ⟳ refresh button use a **before-and-after** capture loop:
+save one frame immediately after the HID event, then poll the camera
+every `TERMINALEYES_CC_POLL_INTERVAL_S` (default 1.5s) and stop once
+the screen has been *region-scale stable* for two consecutive polls
+or the `TERMINALEYES_CC_MAX_WAIT_S` budget (default 15s) is up. A
+single "final" frame is then saved if-and-only-if it differs from
+the initial one. Intermediary frames are dropped so the UI shows
+before-and-after only.
+
+Stability is measured by downsampling each frame to
+`TERMINALEYES_CC_DOWNSAMPLE`×`…` (default 64×64) grayscale, abs-diffing,
+and counting cells whose delta exceeds `TERMINALEYES_CC_CELL_DELTA`
+(default 16/255). If the fraction of changed cells is below
+`TERMINALEYES_CC_CHANGE_FRACTION` (default 0.5%) the poll counts as
+stable. This is robust to the cursor moving a few pixels and to
+webcam shimmer (both invisible after downsample) but trips on any
+popup / menu / page load / focus-highlight that paints a region.
 
 ## Vault
 

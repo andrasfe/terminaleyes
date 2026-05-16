@@ -403,39 +403,65 @@ def create_app(
         _POLL_INTERVAL_S,
         float(_os.environ.get("TERMINALEYES_CC_MAX_WAIT_S", "15.0")),
     )
-    # Normalised mean-squared error threshold. We divide MSE by
-    # (255**2) so it's invariant to image bit depth: ~0.0005 catches
-    # tiny webcam flicker as "stable", ~0.002 lets a cursor blink slip
-    # through as motion. Tune via env if your rig is noisier.
-    _STABLE_MSE_THR = max(
+    # "How much of the image changed" — fraction of cells in a
+    # downsampled 64×64 luminance grid whose absolute delta exceeds
+    # ``_CELL_DELTA_THR`` (out of 255). Downsampling kills small
+    # localised changes (cursor wiggling a few pixels, webcam shimmer)
+    # because they collapse to <1 cell; real UI events (popup, menu,
+    # page load, focus highlight) move whole regions so 1–50% of
+    # cells flip. Default 0.5% catches popups while ignoring a moving
+    # cursor.
+    _CHANGE_FRACTION_THR = max(
         0.0,
-        float(_os.environ.get("TERMINALEYES_CC_STABLE_MSE_THR", "0.0008")),
+        float(_os.environ.get("TERMINALEYES_CC_CHANGE_FRACTION", "0.005")),
+    )
+    _CELL_DELTA_THR = max(
+        1,
+        int(_os.environ.get("TERMINALEYES_CC_CELL_DELTA", "16")),
+    )
+    _DOWNSAMPLE = max(
+        16,
+        int(_os.environ.get("TERMINALEYES_CC_DOWNSAMPLE", "64")),
     )
 
-    def _frame_mse(a, b) -> float:
-        """Normalised MSE between two BGR frames. Returns 0 on shape
-        mismatch (treat as "I can't compare, keep polling")."""
+    def _changed_fraction(a, b) -> float:
+        """Fraction of cells in a downsampled grayscale grid that
+        moved by more than ``_CELL_DELTA_THR``. Robust to small
+        cursor displacements and webcam noise; sensitive to any
+        region-scale UI change."""
+        import cv2 as _cv2
         import numpy as np
         try:
             if a.shape != b.shape:
-                return float("inf")
-            d = a.astype("float32") - b.astype("float32")
-            mse = float(np.mean(d * d))
-            return mse / (255.0 * 255.0)
+                return 1.0
+            ga = _cv2.cvtColor(a, _cv2.COLOR_BGR2GRAY)
+            gb = _cv2.cvtColor(b, _cv2.COLOR_BGR2GRAY)
+            da = _cv2.resize(
+                ga, (_DOWNSAMPLE, _DOWNSAMPLE),
+                interpolation=_cv2.INTER_AREA,
+            )
+            db = _cv2.resize(
+                gb, (_DOWNSAMPLE, _DOWNSAMPLE),
+                interpolation=_cv2.INTER_AREA,
+            )
+            diff = np.abs(da.astype("int16") - db.astype("int16"))
+            return float(np.mean(diff > _CELL_DELTA_THR))
         except Exception:
-            return float("inf")
+            return 1.0
 
     async def _snapshot_after_manual_action(label: str) -> None:
-        """Grab webcam frames after a manual action until the screen
-        settles (or a hard cap elapses).
+        """Save the initial frame, poll until the host screen settles
+        (or the timeout elapses), then save the *final* frame only if
+        it differs from the initial. Intermediary frames during the
+        transition are not persisted — the UI just shows
+        before-and-after.
 
-        We can't know whether a click will produce an instantaneous
-        change or a slow one (page load, menu animation, app launch),
-        so instead of betting on a fixed delay we poll the camera
-        every ``_POLL_INTERVAL_S`` seconds and stop once two
-        consecutive frames are pixel-stable. Every changed frame is
-        persisted as ``<label>_tN.Ns`` so the UI replay covers the
-        whole transition; duplicate-of-previous frames are skipped.
+        "Settled" = a downsampled-grid change-fraction check between
+        the two most recent polls drops below ``_CHANGE_FRACTION_THR``
+        for two consecutive polls. This is deliberately not pixel-MSE
+        — a moving cursor or a few jittered webcam pixels won't trip
+        it, but any region-scale UI change (popup, menu, page load,
+        focused field highlight) will.
 
         Capture is serialized; the webcam stays open across the poll
         sleeps to avoid open/close cost and keep a consistent view.
@@ -492,45 +518,36 @@ def create_app(
                     logger.warning("manual snapshot failed: %s", e)
                     return
                 _write(first.image, "")
-                last_saved = first.image
                 prev = first.image
+                cur_img = first.image
                 t0 = asyncio.get_event_loop().time()
                 stable_streak = 0
-                poll_idx = 0
                 while True:
                     elapsed = asyncio.get_event_loop().time() - t0
                     if elapsed >= _MAX_WAIT_S:
                         break
                     await asyncio.sleep(_POLL_INTERVAL_S)
-                    poll_idx += 1
                     try:
                         cur = await cap.capture_frame()
                     except Exception as e:
                         logger.debug("poll capture failed: %s", e)
                         continue
-                    elapsed = asyncio.get_event_loop().time() - t0
-                    mse_prev = _frame_mse(prev, cur.image)
-                    mse_saved = _frame_mse(last_saved, cur.image)
-                    if mse_prev < _STABLE_MSE_THR:
+                    cur_img = cur.image
+                    frac = _changed_fraction(prev, cur_img)
+                    if frac < _CHANGE_FRACTION_THR:
                         stable_streak += 1
                     else:
                         stable_streak = 0
-                        # Screen changed since last poll — save it.
-                        # But suppress near-duplicates of what we
-                        # already saved so the watch dir doesn't fill
-                        # up with imperceptibly different frames.
-                        if mse_saved >= _STABLE_MSE_THR:
-                            _write(cur.image, f"t{elapsed:.1f}s")
-                            last_saved = cur.image
-                    prev = cur.image
+                    prev = cur_img
                     if stable_streak >= 2:
-                        # Two consecutive stable polls — the host has
-                        # settled. Persist the final frame if it
-                        # differs from what we last wrote.
-                        if _frame_mse(last_saved, cur.image) \
-                                >= _STABLE_MSE_THR:
-                            _write(cur.image, f"t{elapsed:.1f}s_stable")
                         break
+                # Save the final frame only if it actually differs
+                # from the initial one — otherwise the action was a
+                # no-op and the first frame already shows the state.
+                elapsed = asyncio.get_event_loop().time() - t0
+                if _changed_fraction(first.image, cur_img) \
+                        >= _CHANGE_FRACTION_THR:
+                    _write(cur_img, f"t{elapsed:.1f}s_final")
             finally:
                 try:
                     await cap.close()
