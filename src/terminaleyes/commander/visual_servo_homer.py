@@ -646,19 +646,31 @@ class VisualServoHomer:
             new_pos: tuple[float, float] | None = None
             new_hit: CursorHit | None = None
             if self._hsv_enabled:
-                # Position-aware HSV: look only near where the
-                # ratio-based open-loop predicts the cursor will be.
-                # Prevents the per-step finder from drifting to a
-                # static red UI accent if it happens to sit closer
-                # to the cursor's previous frame than the actual
-                # post-move cursor does.
+                # Position-aware HSV with a motion-proportional
+                # search radius. Without this, a static red icon
+                # near the target (e.g. a tooltip dot under an
+                # adjacent menu item) could fall inside a fixed-
+                # size search ring and hijack the cursor estimate.
+                # Scale the allowed search radius by how far we
+                # actually expected the cursor to move: a tiny
+                # convergence step has tiny uncertainty so the
+                # radius should be tight; a big slam has more model
+                # error so the radius widens. The hard floor (1.5%)
+                # absorbs jitter; the ceiling (4%) keeps us from
+                # going wider than ``find_cursor_hsv_near``'s
+                # default and re-introducing the original bug.
                 expected_new = (
                     cursor_img[0] + hid_dx * self._pct_per_hid_x,
                     cursor_img[1] + hid_dy * self._pct_per_hid_y,
                 )
+                expected_motion = math.hypot(
+                    hid_dx * self._pct_per_hid_x,
+                    hid_dy * self._pct_per_hid_y,
+                )
+                radius = max(0.015, min(0.04, 0.3 * expected_motion + 0.01))
                 new_hit = find_cursor_hsv_near(
                     post_color, near_pct=expected_new,
-                    max_dist_pct=0.05,
+                    max_dist_pct=radius,
                 )
                 if new_hit is not None:
                     new_pos = (new_hit.x_pct, new_hit.y_pct)
