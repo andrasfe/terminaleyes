@@ -240,6 +240,83 @@ $btnRefresh?.addEventListener("click", async () => {
   }
 });
 
+// ── active refresh: idle auto-capture every minute ─────────────
+// When checked, POST /api/snapshot?dedup=1 every ACTIVE_REFRESH_MS.
+// The server's dedup mode only persists a frame if it differs from
+// the most recent stored frame, so an unchanged screen produces zero
+// writes (but still pays for the webcam grab — that's the cost we
+// warn about). Choice persists in localStorage so a reload picks
+// the same setting back up. Tab/window hidden → pause to avoid
+// burning the camera when nothing's watching.
+const $optActiveRefresh = document.getElementById("opt-active-refresh");
+const ACTIVE_REFRESH_KEY = "cc.activeRefresh";
+const ACTIVE_REFRESH_MS = 60_000;
+let activeRefreshTimer = null;
+let activeRefreshInFlight = false;
+
+async function activeRefreshTick() {
+  if (activeRefreshInFlight) return;
+  if (document.hidden) return;
+  activeRefreshInFlight = true;
+  try {
+    await fetch("/api/snapshot?dedup=1", { method: "POST" });
+  } catch (e) {
+    console.warn("active-refresh tick failed:", e);
+  } finally {
+    activeRefreshInFlight = false;
+  }
+}
+function startActiveRefresh() {
+  if (activeRefreshTimer != null) return;
+  $optActiveRefresh?.parentElement?.classList.add("armed");
+  // First tick is immediate so the user sees the loop is alive,
+  // subsequent ones honour the cadence.
+  activeRefreshTick();
+  activeRefreshTimer = setInterval(activeRefreshTick, ACTIVE_REFRESH_MS);
+}
+function stopActiveRefresh() {
+  if (activeRefreshTimer == null) return;
+  clearInterval(activeRefreshTimer);
+  activeRefreshTimer = null;
+  $optActiveRefresh?.parentElement?.classList.remove("armed");
+}
+$optActiveRefresh?.addEventListener("change", () => {
+  const on = !!$optActiveRefresh.checked;
+  if (on) {
+    const ok = window.confirm(
+      "Active Refresh will grab a webcam frame every 60 seconds " +
+      "even when you're idle. This keeps the camera awake and the " +
+      "host's UI continuously analysed — resource intensive on " +
+      "battery / Pi. Identical frames are discarded server-side.\n\n" +
+      "Enable it?"
+    );
+    if (!ok) {
+      $optActiveRefresh.checked = false;
+      return;
+    }
+    try { localStorage.setItem(ACTIVE_REFRESH_KEY, "1"); } catch (_) {}
+    startActiveRefresh();
+  } else {
+    try { localStorage.removeItem(ACTIVE_REFRESH_KEY); } catch (_) {}
+    stopActiveRefresh();
+  }
+});
+// Restore previous setting on load — but DON'T re-prompt, the user
+// already opted in. Restoring is silent.
+try {
+  if (localStorage.getItem(ACTIVE_REFRESH_KEY) === "1" && $optActiveRefresh) {
+    $optActiveRefresh.checked = true;
+    startActiveRefresh();
+  }
+} catch (_) {}
+// Pause/resume on tab visibility so we don't burn the webcam in a
+// hidden tab.
+document.addEventListener("visibilitychange", () => {
+  if (!$optActiveRefresh?.checked) return;
+  if (document.hidden) stopActiveRefresh();
+  else startActiveRefresh();
+});
+
 // ── chat / runs ────────────────────────────────────────────────
 function appendChat({ runId, intent, status, reason }) {
   let li = state.runChats.get(runId);

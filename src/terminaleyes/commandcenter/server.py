@@ -554,6 +554,80 @@ def create_app(
                 except Exception:
                     pass
 
+    async def _snapshot_single_dedup(label: str) -> bool:
+        """Grab exactly one frame and persist it only if it differs
+        from the most recent existing frame in the store. Used by
+        the UI's "Active Refresh" idle poller — we don't need a
+        poll-until-stable loop for an unsolicited capture, we just
+        want to record state transitions and skip duplicates.
+
+        Returns True iff a frame was written.
+        """
+        if settings is None or runner.is_busy():
+            return False
+        async with _manual_capture_lock:
+            from datetime import datetime
+            import cv2
+            from terminaleyes.capture.webcam import WebcamCapture
+            resolution = None
+            if (settings.capture.resolution_width
+                    and settings.capture.resolution_height):
+                resolution = (
+                    settings.capture.resolution_width,
+                    settings.capture.resolution_height,
+                )
+            cap = WebcamCapture(
+                device_index=settings.capture.device_index,
+                resolution=resolution,
+            )
+            out_dir = store.watch_dir / "manual"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return False
+            try:
+                await cap.open()
+                await asyncio.sleep(0.25)
+                try:
+                    frame = await cap.capture_frame()
+                except Exception as e:
+                    logger.warning("idle snapshot failed: %s", e)
+                    return False
+            finally:
+                try:
+                    await cap.close()
+                except Exception:
+                    pass
+
+            # Compare against the most recent frame in the store —
+            # regardless of which run/source produced it. If nothing
+            # has changed, skip the write so the watch dir doesn't
+            # fill with duplicates of an idle screen.
+            latest = store.latest()
+            if latest is not None:
+                try:
+                    prior = cv2.imread(str(latest.path))
+                except Exception:
+                    prior = None
+                if prior is not None and \
+                        _changed_fraction(prior, frame.image) \
+                        < _CHANGE_FRACTION_THR:
+                    return False
+
+            seq = int(datetime.now().timestamp() * 1000) % 10_000
+            ts = datetime.now().strftime("%H%M%S")
+            path = out_dir / f"{seq:04d}_{ts}_{label}.png"
+            try:
+                ok = cv2.imwrite(str(path), frame.image)
+                if not ok:
+                    logger.warning(
+                        "imwrite returned False for %s", path,
+                    )
+                return bool(ok)
+            except Exception as e:
+                logger.warning("imwrite failed for %s: %s", path, e)
+                return False
+
     def _commander_cfg():
         if settings is None:
             class _Default:
@@ -1460,10 +1534,20 @@ def create_app(
             await _cleanup()
 
     @app.post("/api/snapshot")
-    async def manual_snapshot() -> JSONResponse:
-        """Capture a fresh webcam frame on demand (no mouse action)."""
+    async def manual_snapshot(dedup: bool = False) -> JSONResponse:
+        """Capture a fresh webcam frame on demand (no mouse action).
+
+        ``?dedup=1`` switches from the poll-until-stable loop to a
+        single-shot capture that's only persisted when it differs
+        from the most recent frame in the store — used by the UI's
+        Active Refresh idle poller to avoid filling the watch dir
+        with duplicates of an unchanged screen.
+        """
+        if dedup:
+            wrote = await _snapshot_single_dedup("idle_refresh")
+            return JSONResponse({"ok": True, "wrote": wrote})
         await _snapshot_after_manual_action("manual_snapshot")
-        return JSONResponse({"ok": True})
+        return JSONResponse({"ok": True, "wrote": True})
 
     @app.get("/api/state")
     def state() -> JSONResponse:
