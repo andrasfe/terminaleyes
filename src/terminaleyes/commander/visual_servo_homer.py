@@ -136,6 +136,17 @@ DEFAULT_PCT_PER_HID = 1.6 / 1920.0
 HOTSPOT_OFFSET_X_PCT = 0.005
 HOTSPOT_OFFSET_Y_PCT = 0.005
 
+# Menubar-safe homing constants. Top-strip UIs (LibreOffice's
+# File/Edit/View bar, GNOME's title bar, Firefox's tab strip)
+# auto-open whatever menu the cursor hovers, so the visual servo's
+# small-amplitude horizontal wiggle during convergence pops the
+# wrong submenu before we land. Targets with y_pct < MENUBAR_MAX_Y_PCT
+# get a two-phase approach: stage at SAFE_STAGING_Y_PCT (below the
+# menubar in the same X column), then climb straight up — no
+# horizontal motion while in the menubar zone.
+MENUBAR_MAX_Y_PCT = 0.06
+SAFE_STAGING_Y_PCT = 0.13
+
 MAX_STEPS = 30
 PROOF_DIR = Path("/tmp/terminaleyes_homer")
 
@@ -762,6 +773,52 @@ class VisualServoHomer:
         else:
             target_aim = target_img
 
+        # Menubar-safe two-phase approach: when the target sits in the
+        # top strip of the screen, the visual servo's small-amplitude
+        # horizontal wiggle during convergence pops adjacent menus
+        # (the canonical example is LibreOffice's File menu — the
+        # cursor's last-correction sideways twitch crosses Edit or
+        # View on the way and that menu opens instead). Stage the
+        # cursor in the target's X column but well below the menubar,
+        # then climb straight up — no horizontal motion while we're
+        # inside the menubar zone.
+        if y_pct < MENUBAR_MAX_Y_PCT and click:
+            print(
+                f"  Menubar-safe approach: target y={y_pct:.1%} below "
+                f"{MENUBAR_MAX_Y_PCT:.0%} → stage at y={SAFE_STAGING_Y_PCT:.0%} "
+                f"then climb vertically."
+            )
+            staging_target = (
+                target_aim[0],
+                SAFE_STAGING_Y_PCT + HOTSPOT_OFFSET_Y_PCT,
+            )
+            stage_out = await self._servo_loop(
+                target_aim=staging_target,
+                target_img=(target_img[0], SAFE_STAGING_Y_PCT),
+                cursor_img=cursor_img, button=button, run_dir=run_dir,
+                history=history, target_desc="<manual:stage>",
+                verify_navigation=False, last_proof=None,
+                confirm_frames=1,
+                click_tol_pct=0.012,   # looser — staging not a click
+                click=False,
+            )
+            if not stage_out.clicked:
+                # Staging failed (cursor couldn't reach). Fall back
+                # to the regular single-phase path — better to risk
+                # the wiggle than to give up entirely.
+                print("  Staging failed; falling back to single-phase.")
+            else:
+                last_cursor = (
+                    history[-1].cursor_img if history else staging_target
+                )
+                return await self._vertical_climb_to_menubar(
+                    cursor_img=last_cursor,
+                    target_aim=target_aim,
+                    target_img=target_img,
+                    button=button, run_dir=run_dir, history=history,
+                    click=click,
+                )
+
         # Manual clicks demand higher accuracy than the controller's
         # "click on this OCR'd word" flow: an operator picks an exact
         # pixel and expects the cursor to land *there*, not 20px off.
@@ -775,6 +832,116 @@ class VisualServoHomer:
             confirm_frames=1,
             click_tol_pct=0.006,
             click=click,
+        )
+
+    async def _vertical_climb_to_menubar(
+        self, *,
+        cursor_img: tuple[float, float],
+        target_aim: tuple[float, float],
+        target_img: tuple[float, float],
+        button: str,
+        run_dir: Path,
+        history: list[StepRecord],
+        click: bool,
+        max_steps: int = 8,
+    ) -> ClickOutcome:
+        """Move the cursor straight up to ``target_aim`` (which lies
+        in the menubar) without any horizontal HID emission.
+
+        Precondition: the cursor is already roughly in the target's X
+        column, below the menubar. We enter the menubar from below in
+        the SAME column the operator clicked, so we never hover an
+        adjacent menu item on the way.
+        """
+        gate = 0.008  # ~9 px on a 1080 image — comfortably inside one
+                     # menubar item's height (~25 px)
+        for step in range(1, max_steps + 1):
+            dy_pct = target_aim[1] - cursor_img[1]
+            if abs(dy_pct) <= gate:
+                if click:
+                    await self._session._executor._mouse.click(button)
+                try:
+                    await asyncio.sleep(0.4)
+                    proof = await self._capture_proof(run_dir, step * 100)
+                except Exception:
+                    proof = None
+                _record_step(run_dir, history, StepRecord(
+                    cursor_img=cursor_img, target_img=target_img,
+                    residual_pct=abs(dy_pct), hid_dx=0, hid_dy=0,
+                    ratio_x=self._pct_per_hid_x,
+                    ratio_y=self._pct_per_hid_y,
+                    note="click_sent;menubar_vertical_climb",
+                ))
+                print(
+                    f"  ✓ Vertical-climb confirm — clicked {button} at "
+                    f"({target_aim[0]:.2%},{target_aim[1]:.2%})"
+                )
+                return ClickOutcome(
+                    clicked=True, steps=step,
+                    reason="menubar_vertical_climb",
+                    proof_path=proof, history=history,
+                )
+            # Pure vertical motion. The pointer-accel inverse model
+            # accounts for libinput's adaptive curve; if it's not
+            # available we fall back to the online-learned ratio.
+            hid_dx, hid_dy = 0, 0
+            if self._pointer_accel is not None:
+                try:
+                    _, hid_dy = self._pointer_accel.inverse(
+                        target_dx_pct=0.0,
+                        target_dy_pct=dy_pct,
+                        cursor_x_pct=cursor_img[0],
+                        cursor_y_pct=cursor_img[1],
+                        initial_ratio_x=self._pct_per_hid_x,
+                        initial_ratio_y=self._pct_per_hid_y,
+                    )
+                except Exception:
+                    hid_dy = 0
+            if hid_dy == 0:
+                hid_dy = int(round(dy_pct / max(
+                    self._pct_per_hid_y, 1e-6,
+                )))
+            hid_dy = max(-MAX_HID_PER_AXIS, min(MAX_HID_PER_AXIS, hid_dy))
+            if hid_dy == 0:
+                hid_dy = -1 if dy_pct < 0 else 1
+            print(
+                f"  [vc{step:02d}] hid=(0,{hid_dy:+4d}) "
+                f"cursor=({cursor_img[0]:.2%},{cursor_img[1]:.2%}) "
+                f"aim_y={target_aim[1]:.2%} dy={dy_pct:+.2%}"
+            )
+            await self._send_hid(0, hid_dy)
+            await asyncio.sleep(SETTLE_SEC)
+            post = await self._capture_color()
+            new_pos: tuple[float, float] | None = None
+            if self._hsv_enabled:
+                new_hit = find_cursor_hsv(post)
+                if new_hit is not None:
+                    new_pos = (new_hit.x_pct, new_hit.y_pct)
+            if new_pos is None:
+                # Open-loop: trust the ratio for this step. The
+                # next iteration's HSV (if it engages) will correct.
+                new_pos = (
+                    cursor_img[0],
+                    cursor_img[1] + hid_dy * self._pct_per_hid_y,
+                )
+            _record_step(run_dir, history, StepRecord(
+                cursor_img=new_pos, target_img=target_img,
+                residual_pct=abs(target_aim[1] - new_pos[1]),
+                hid_dx=0, hid_dy=hid_dy,
+                ratio_x=self._pct_per_hid_x,
+                ratio_y=self._pct_per_hid_y,
+                note="menubar_vertical_climb",
+            ))
+            cursor_img = new_pos
+        print(
+            f"  Vertical climb did not reach target_y={target_aim[1]:.2%} "
+            f"in {max_steps} steps — last cursor=({cursor_img[0]:.2%},"
+            f"{cursor_img[1]:.2%})"
+        )
+        return ClickOutcome(
+            clicked=False, steps=max_steps,
+            reason="vertical_climb_max_steps",
+            proof_path=None, history=history,
         )
 
     # ────────────────────── target localization ──────────────────────
