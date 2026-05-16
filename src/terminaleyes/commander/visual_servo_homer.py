@@ -193,8 +193,10 @@ def _record_step(
 
 
 _POINTER_ACCEL_CHECKPOINT_CANDIDATES = (
-    # v3+ are direct inverse: single forward pass at runtime, no
-    # Newton iteration. v1/v2 are forward models inverted at runtime.
+    # v4: redglass cursor at size 96. v3+: direct inverse (single
+    # forward pass at runtime). v1/v2: legacy forward models that
+    # the runtime Newton-inverts.
+    Path("data/ml/checkpoints/pointer_accel-v4"),
     Path("data/ml/checkpoints/pointer_accel-v3"),
     Path("data/ml/checkpoints/pointer_accel-v2"),
     Path("data/ml/checkpoints/pointer_accel-v1"),

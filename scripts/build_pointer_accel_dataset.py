@@ -88,7 +88,27 @@ def main() -> int:
         "--out", type=Path, default=Path("data/ml/pointer_accel"),
     )
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--hsv-only", action="store_true",
+        help="Keep only rows where HSV cursor detection succeeded "
+             "(note=hsv_measured). Frame-diff fallback rows are "
+             "noisier; with the redglass cursor on the target we "
+             "get HSV rows directly.",
+    )
+    ap.add_argument(
+        "--since", type=str, default=None,
+        help="Drop history.jsonl files older than this mtime "
+             "(ISO timestamp or epoch). Use after switching cursor "
+             "theme to filter out pre-theme runs.",
+    )
     args = ap.parse_args()
+    since_ts = None
+    if args.since:
+        try:
+            since_ts = float(args.since)
+        except ValueError:
+            from datetime import datetime
+            since_ts = datetime.fromisoformat(args.since).timestamp()
 
     if not args.runs_root.exists():
         print(f"runs root not found: {args.runs_root}", file=sys.stderr)
@@ -97,7 +117,16 @@ def main() -> int:
     rows: list[dict] = []
     n_files = 0
     n_lines = 0
+    n_dropped_note = 0
+    n_dropped_age = 0
     for hist_path in _iter_history_files(args.runs_root):
+        if since_ts is not None:
+            try:
+                if hist_path.stat().st_mtime < since_ts:
+                    n_dropped_age += 1
+                    continue
+            except OSError:
+                continue
         n_files += 1
         traj_id = str(hist_path.parent.relative_to(args.runs_root))
         try:
@@ -112,10 +141,18 @@ def main() -> int:
                     except json.JSONDecodeError:
                         continue
                     r = _row_from_step(traj_id, i, step)
-                    if r is not None:
-                        rows.append(r)
+                    if r is None:
+                        continue
+                    if args.hsv_only and r.get("note") != "hsv_measured":
+                        n_dropped_note += 1
+                        continue
+                    rows.append(r)
         except OSError:
             continue
+    if since_ts is not None:
+        print(f"dropped {n_dropped_age} pre-{args.since} file(s)")
+    if args.hsv_only:
+        print(f"dropped {n_dropped_note} non-HSV row(s)")
 
     print(
         f"scanned {n_files} history.jsonl file(s), {n_lines} step "
