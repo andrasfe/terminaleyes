@@ -1,18 +1,18 @@
 {
-  "total_rows": 1205,
-  "total_trajectories": 142,
+  "total_rows": 299,
+  "total_trajectories": 39,
   "splits": {
     "train": {
-      "rows": 931,
-      "trajectories": 114
+      "rows": 262,
+      "trajectories": 33
     },
     "val": {
-      "rows": 133,
-      "trajectories": 14
+      "rows": 18,
+      "trajectories": 3
     },
     "test": {
-      "rows": 141,
-      "trajectories": 14
+      "rows": 19,
+      "trajectories": 3
     }
   }
 }

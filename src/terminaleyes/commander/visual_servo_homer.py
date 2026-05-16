@@ -194,9 +194,14 @@ def _record_step(
 
 
 _POINTER_ACCEL_CHECKPOINT_CANDIDATES = (
-    # v4: redglass cursor at size 96. v3+: direct inverse (single
-    # forward pass at runtime). v1/v2: legacy forward models that
-    # the runtime Newton-inverts.
+    # v5: trained on HSV-tracked measurements (per-step finder is
+    # the position-aware ``find_cursor_hsv_near`` so the per-row
+    # delta is pixel-accurate instead of frame-diff-noisy).
+    # v4: redglass cursor at size 96, frame-diff measured (v4 was
+    # the data ceiling that motivated the HSV cross-check fix).
+    # v3+: direct inverse (single forward pass at runtime).
+    # v1/v2: legacy forward models that the runtime Newton-inverts.
+    Path("data/ml/checkpoints/pointer_accel-v5"),
     Path("data/ml/checkpoints/pointer_accel-v4"),
     Path("data/ml/checkpoints/pointer_accel-v3"),
     Path("data/ml/checkpoints/pointer_accel-v2"),
