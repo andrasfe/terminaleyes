@@ -280,6 +280,113 @@ jiggle).
 - **macOS**: System Settings → Accessibility → Display → Pointer
   (set saturated colours, max size).
 
+## Calibrating the homer for your setup
+
+The shipped `pointer_accel-v5` and `longjump-v2` checkpoints under
+`data/ml/checkpoints/` are calibrated for ONE specific setup: a
+particular webcam at a particular distance, looking at an Ubuntu
+target with `redglass` cursor at size 96, driving the host's
+libinput-adaptive pointer-acceleration curve via Bluetooth HID. For
+a different webcam, different target distance, different OS, or
+different cursor theme, the shipped models are an *approximation* —
+the closed-loop servo will still converge, just with more
+iterations. For tight, fast clicks on your setup, retrain.
+
+**What's in the shipped data (privacy note).** The training rows are
+pure motion telemetry — `(hid_dx, hid_dy, measured_dx_pct,
+measured_dy_pct, cursor_x_pct, cursor_y_pct)`. No screenshots, no
+keystrokes, no document content, no app names. The model learns
+"send X HID → cursor moves Y pixels on screen" — only pointer-
+acceleration physics. The webcam frames that the homer captures
+during collection are stored locally in
+`~/.local/share/terminaleyes/runs/` (gitignored, never uploaded)
+and the training scripts ONLY consume the numerical
+`history.jsonl`, never the PNGs. Inspect any
+`data/ml/{pointer_accel,longjump}/*.jsonl` to verify.
+
+### From-scratch training (any target OS)
+
+Prerequisites: hardware + Pi BT-HID setup per the Pi section
+below; Command Center reachable at `http://0.0.0.0:8765`; the
+target's pointer made high-contrast (see "Cursor on the target
+machine" — Ubuntu redglass / macOS Accessibility coloured pointer
+/ Windows mouse-pointer colour). The collection clicks at a grid
+of pixel positions, so first park the target on a *quiet* screen
+— a plain desktop or a maximised text editor. Anything with
+clickable toolbars (LibreOffice menubar, browser tabs) will fire
+their actions during collection and pollute the screen state.
+
+```bash
+# 1. Verify the cursor is visible in the webcam frame.
+curl -sX POST http://127.0.0.1:8765/api/snapshot
+# Open the saved PNG; you should see a clear red blob on screen.
+
+# 2. Collect ~7 min of probes. The script clicks an 8×6 grid
+#    (48 positions), and each click_at runs slam → detect →
+#    long-jump chain → closed-loop refinement. Every step is
+#    logged to ~/.local/share/terminaleyes/runs/<id>/homer/.../history.jsonl.
+date +%s > /tmp/train_start.txt
+scripts/collect_pointer_accel.sh --grid 8
+
+# 3. Build the per-step (pointer-accel) dataset. HSV-only keeps only
+#    the rows where cursor detection was pixel-accurate; --since
+#    discards trajectories from before this collection.
+scripts/build_pointer_accel_dataset.py \
+    --hsv-only --since "$(cat /tmp/train_start.txt)"
+
+# 4. Train the per-step model.
+scripts/train_pointer_accel.py \
+    --output data/ml/checkpoints/pointer_accel-v6
+
+# 5. Build the per-trajectory (long-jump) dataset from the SAME
+#    collection run.
+scripts/build_longjump_dataset.py --since "$(cat /tmp/train_start.txt)"
+
+# 6. Train the long-jump model.
+scripts/train_longjump.py \
+    --output data/ml/checkpoints/longjump-v3
+
+# 7. Wire the new checkpoints in: prepend their paths to
+#    _POINTER_ACCEL_CHECKPOINT_CANDIDATES and
+#    _LONGJUMP_CHECKPOINT_CANDIDATES near the top of
+#    src/terminaleyes/commander/visual_servo_homer.py.
+
+# 8. Restart Command Center and smoke-test:
+terminaleyes commandcenter
+# In another shell:
+curl -sX POST http://127.0.0.1:8765/api/mouse/click_at \
+    -H 'Content-Type: application/json' \
+    -d '{"x_pct":0.5,"y_pct":0.5,"button":"left"}'
+# Should land in 2-5 closed-loop steps, geometric_confirm.
+```
+
+**Per-OS notes:**
+- **Ubuntu (libinput-adaptive):** what the shipped models target.
+  Redglass theme at size 96 is the easiest detection setup.
+- **macOS:** different pointer-accel curve and no redglass theme.
+  Crank the Accessibility pointer outline + fill to saturated red
+  at max size before collecting. The pointer shape isn't an
+  asymmetric arrow, so the `arrow-shape` filter in
+  `find_cursor_hsv_motion_directed` (aspect 1.2–2.5, solidity ≥
+  0.45) may need loosening for your specific pointer. If the
+  homer's cross-check log says "no motion-diff red blob near osc
+  result", the shape filter is too strict — sweep the bounds wider
+  in `cursor_finder.py` and re-collect.
+- **Windows:** Settings → Mouse Pointer → Custom → pick a high-
+  contrast colour and max size. Same caveats as macOS for shape.
+- The collection grid clicks at pixel positions on the screen. On
+  any OS, those positions will activate whatever UI happens to be
+  there. Use a plain background.
+- Always wait for `--since` to filter out pre-recalibration runs
+  when retraining; mixing old and new pointer-accel responses
+  produces a model that fits neither distribution.
+
+How much data is enough? With `--grid 8` (48 probes) you'll get
+~30–45 useful trajectories. The shipped models trained on this
+amount; numbers improve with `--grid 10` (75 probes) or two
+back-to-back grid runs. Held-out HID error of `median 5 px / p90
+10 px` is the target.
+
 ## Webcam vs capture card
 
 The webcam path works; the homer compensates for perspective, glare,
