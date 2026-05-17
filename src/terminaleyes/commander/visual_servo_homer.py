@@ -1007,9 +1007,9 @@ class VisualServoHomer:
         )
         if not bursts:
             return cursor_img
-        print(
-            f"  Long-jump: residual {residual:.1%} → "
-            f"total_hid=({total_dx},{total_dy}) in {len(bursts)} bursts"
+        logger.info(
+            "Long-jump: residual %.1f%% → total_hid=(%d,%d) in %d bursts",
+            residual * 100, total_dx, total_dy, len(bursts),
         )
         # Fire all bursts back-to-back with tiny gaps. NO captures
         # between — the whole point is to skip the slow capture loop.
@@ -1025,18 +1025,50 @@ class VisualServoHomer:
         )
         await asyncio.sleep(SETTLE_SEC)
         new_pos: tuple[float, float] = predicted
+        cursor_found_visually = False
         if self._hsv_enabled:
             try:
                 post = await self._capture_color()
-                # Wide-ish radius: the model is approximate, and the
-                # cursor might be ~50-100 px from the prediction.
-                hit = find_cursor_hsv_near(
-                    post, near_pct=predicted, max_dist_pct=0.08,
-                )
-                if hit is not None:
-                    new_pos = (hit.x_pct, hit.y_pct)
+                # Progressively widen the HSV search around the
+                # predicted landing point. The model's per-axis
+                # error is ~3% on val, but tail cases can be >10%,
+                # so a fixed-size ring would miss them and we'd
+                # blindly pass the open-loop prediction to the
+                # closed-loop servo — which then thrashes because
+                # its starting cursor estimate is wrong.
+                for radius in (0.05, 0.12, 0.25):
+                    hit = find_cursor_hsv_near(
+                        post, near_pct=predicted, max_dist_pct=radius,
+                    )
+                    if hit is not None:
+                        new_pos = (hit.x_pct, hit.y_pct)
+                        cursor_found_visually = True
+                        logger.debug(
+                            "longjump post-HSV: found at "
+                            "(%.2f%%,%.2f%%) within %.0f%% radius",
+                            hit.x_pct * 100, hit.y_pct * 100,
+                            radius * 100,
+                        )
+                        break
             except Exception as e:
                 logger.debug("longjump post-capture failed: %s", e)
+        if not cursor_found_visually:
+            # HSV missed altogether — the cursor landed somewhere
+            # we didn't expect (or the post-burst frame has motion
+            # blur). Fall back to oscillation-variance to get a
+            # ground-truth position. Costs ~1.5s but recovers us
+            # from a bad open-loop prediction; without it the
+            # closed-loop servo would thrash for many iterations
+            # before re-discovering the cursor.
+            logger.info(
+                "longjump: HSV miss after chain — re-localizing "
+                "via oscillation"
+            )
+            osc = await self._find_cursor_via_oscillation(
+                run_dir, label="post_longjump",
+            )
+            if osc is not None:
+                new_pos = osc
         _record_step(run_dir, history, StepRecord(
             cursor_img=new_pos, target_img=target_img,
             residual_pct=math.hypot(
@@ -1048,10 +1080,13 @@ class VisualServoHomer:
             ratio_y=self._pct_per_hid_y,
             note="longjump_chain",
         ))
-        print(
-            f"  Long-jump landed: cursor=({new_pos[0]:.2%},"
-            f"{new_pos[1]:.2%}) "
-            f"residual={math.hypot(target_aim[0]-new_pos[0], target_aim[1]-new_pos[1]):.2%}"
+        logger.info(
+            "Long-jump landed: cursor=(%.2f%%,%.2f%%) residual=%.2f%% "
+            "(predicted=(%.2f%%,%.2f%%))",
+            new_pos[0] * 100, new_pos[1] * 100,
+            math.hypot(target_aim[0] - new_pos[0],
+                       target_aim[1] - new_pos[1]) * 100,
+            predicted[0] * 100, predicted[1] * 100,
         )
         return new_pos
 
