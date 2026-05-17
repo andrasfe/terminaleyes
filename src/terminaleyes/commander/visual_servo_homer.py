@@ -434,17 +434,23 @@ class VisualServoHomer:
             # is provably the cursor.
             try:
                 pre_check = await self._capture_color()
-                nudge_hid = 20
+                # 80 HID ≈ 6% image ≈ 128 px → comfortably bigger
+                # than the cursor's own footprint (~30 px wide), so
+                # pre and post cursor positions don't overlap and
+                # the dilated-pre subtraction leaves a clean
+                # "newly red" blob. 20 HID isn't enough — the
+                # cursor in pre and post overlaps by more than the
+                # 4-pixel dilate buffer, eating most of the signal.
+                pre_pct = self._pct_per_hid_x or DEFAULT_PCT_PER_HID
+                nudge_hid = 80
                 await self._send_hid(nudge_hid, 0)
                 await asyncio.sleep(SETTLE_SEC)
                 post_check = await self._capture_color()
                 hsv_check_hit = find_cursor_hsv_motion_directed(
                     pre_check, post_check,
                     cursor_pre_pct=cursor_img,
-                    expected_motion_pct=(
-                        nudge_hid * self._pct_per_hid_x, 0.0,
-                    ),
-                    max_dist_pct=0.10,
+                    expected_motion_pct=(nudge_hid * pre_pct, 0.0),
+                    max_dist_pct=0.12,
                 )
                 if hsv_check_hit is None:
                     logger.info(
@@ -507,6 +513,7 @@ class VisualServoHomer:
         confirm_frames: int = CONFIRM_FRAMES,
         click_tol_pct: float = CLICK_TOL_PCT,
         click: bool = True,
+        axis_aligned: bool = False,
     ) -> ClickOutcome:
         """Run the visual-servo loop until cursor lands on target_aim.
 
@@ -516,6 +523,17 @@ class VisualServoHomer:
         gates the LLM URL-bar oracle: ``False`` skips both the navigation
         verify and the click-retry diamond pattern (click once and
         capture proof — fine for manual operator-driven clicks).
+
+        ``axis_aligned``: per-iteration, send HID along ONLY the
+        larger-residual axis (zero out the other). Used by the no-
+        slam follow-up path so the cursor moves along axis-aligned
+        L-shape paths instead of diagonals — diagonals sweep across
+        sibling UI elements (the canonical case: clicking File then
+        sweeping diagonally toward "Exit LibreOffice" hover-opens
+        Edit, View, Insert on the way and the wrong menu ends up
+        intercepting the click). Closes the residual along Y first
+        for a tall move, then X (or vice versa) — the cursor stays
+        in the column/row of the open UI element.
         """
         confirm_count = 0
         for step in range(1, MAX_STEPS + 1):
@@ -689,6 +707,17 @@ class VisualServoHomer:
                     -MIN_HID_PER_AXIS if dy_pct < 0 else 0
                 )
 
+            # Axis-aligned mode: zero out the smaller-residual axis
+            # so the cursor moves only along the larger axis this
+            # iteration. Two iterations of this produce an L-shaped
+            # path (e.g. down-then-right) instead of a diagonal sweep
+            # that would hover-open sibling UI elements on the way.
+            if axis_aligned:
+                if abs(dx_pct) > abs(dy_pct):
+                    hid_dy = 0
+                else:
+                    hid_dx = 0
+
             pre_color = await self._capture_color()
             await self._send_hid(hid_dx, hid_dy)
             await asyncio.sleep(SETTLE_SEC)
@@ -835,6 +864,7 @@ class VisualServoHomer:
         *,
         hotspot_offset: bool = True,
         click: bool = True,
+        prev_cursor_pct: tuple[float, float] | None = None,
     ) -> ClickOutcome:
         """Home the cursor to a pre-located pixel on the webcam frame.
 
@@ -843,6 +873,20 @@ class VisualServoHomer:
         oracle (manual mode doesn't have a target description to
         verify against). Everything else — slam, cursor detect, visual
         servo, geometric click gate — is the same as ``run()``.
+
+        ``prev_cursor_pct`` is a "no-slam" mode for chained clicks
+        within a transient UI (open menu, modal dialog, dropdown):
+        the slam-to-corner that normally initialises detection would
+        dismiss the open UI on most platforms (LibreOffice closes
+        menus the moment the pointer leaves them), so the second
+        click in a "File → Exit" sequence would land on whatever's
+        underneath the now-vanished menu. When ``prev_cursor_pct`` is
+        given, we trust it as the current cursor location, skip the
+        slam + oscillation entirely, and just run a motion-diff
+        cross-check (small nudge) to refine. If the cross-check
+        fails we keep going with the cached position + nudge
+        displacement — strictly better than re-slamming, which would
+        kill the UI we're trying to navigate.
         """
         session_out = getattr(self._session, "output_dir", None)
         ts = datetime.now().strftime("%H%M%S_manual")
@@ -855,32 +899,54 @@ class VisualServoHomer:
 
         print(
             f"  Manual click homing → ({x_pct:.2%}, {y_pct:.2%}) "
-            f"button={button}"
+            f"button={button}  no-slam={prev_cursor_pct is not None}"
         )
         print(f"  Step log: {run_dir}/")
 
-        await self._slam_to_corner()
-        await self._send_hid(40, 40)
-        await asyncio.sleep(0.30)
-
-        f0 = await self._capture_color()
-        cursor_hit = find_cursor_hsv(f0)
         cursor_img: tuple[float, float] | None = None
-        if cursor_hit is not None:
-            verified = await self._verify_hsv_by_motion(
-                (cursor_hit.x_pct, cursor_hit.y_pct), run_dir,
+        if prev_cursor_pct is not None:
+            # No-slam path: trust the cached cursor position. We
+            # deliberately skip the motion-diff verification nudge
+            # here — that nudge would move the cursor 60 HID right,
+            # which on a menubar starting position (where most no-
+            # slam follow-ups happen) drifts the cursor out of the
+            # current column and onto an adjacent menubar item.
+            # Adjacent items auto-open via hover-trigger as soon as
+            # any sibling menu is already open, so the verification
+            # cure would be worse than the disease: a stray
+            # diagnostic move ends up dismissing the menu we're
+            # trying to navigate. Since the cache is set ONLY after
+            # a click_at successfully landed, the cursor is provably
+            # at that pixel; no verification is needed.
+            cursor_img = prev_cursor_pct
+            self._hsv_enabled = True
+            logger.info(
+                "no-slam: using cached cursor (%.2f%%,%.2f%%)",
+                cursor_img[0] * 100, cursor_img[1] * 100,
             )
-            if verified is not None:
-                cursor_img = verified
-                self._hsv_enabled = True
-                print(
-                    f"  Cursor (HSV verified): ({cursor_img[0]:.2%}, "
-                    f"{cursor_img[1]:.2%})"
+
+        if cursor_img is None:
+            await self._slam_to_corner()
+            await self._send_hid(40, 40)
+            await asyncio.sleep(0.30)
+
+            f0 = await self._capture_color()
+            cursor_hit = find_cursor_hsv(f0)
+            if cursor_hit is not None:
+                verified = await self._verify_hsv_by_motion(
+                    (cursor_hit.x_pct, cursor_hit.y_pct), run_dir,
                 )
-            else:
-                print(
-                    "  HSV candidate failed motion verify — falling back."
-                )
+                if verified is not None:
+                    cursor_img = verified
+                    self._hsv_enabled = True
+                    print(
+                        f"  Cursor (HSV verified): ({cursor_img[0]:.2%}, "
+                        f"{cursor_img[1]:.2%})"
+                    )
+                else:
+                    print(
+                        "  HSV candidate failed motion verify — falling back."
+                    )
 
         if cursor_img is None:
             print("  Using oscillation-variance to find cursor.")
@@ -916,17 +982,23 @@ class VisualServoHomer:
                 # frame position-aware finder when the screen has any
                 # red clutter.
                 pre_check = await self._capture_color()
-                nudge_hid = 20
+                # 80 HID ≈ 6% image ≈ 128 px → comfortably bigger
+                # than the cursor's own footprint (~30 px wide), so
+                # pre and post cursor positions don't overlap and
+                # the dilated-pre subtraction leaves a clean
+                # "newly red" blob. 20 HID isn't enough — the
+                # cursor in pre and post overlaps by more than the
+                # 4-pixel dilate buffer, eating most of the signal.
+                pre_pct = self._pct_per_hid_x or DEFAULT_PCT_PER_HID
+                nudge_hid = 80
                 await self._send_hid(nudge_hid, 0)
                 await asyncio.sleep(SETTLE_SEC)
                 post_check = await self._capture_color()
                 hsv_check_hit = find_cursor_hsv_motion_directed(
                     pre_check, post_check,
                     cursor_pre_pct=cursor_img,
-                    expected_motion_pct=(
-                        nudge_hid * self._pct_per_hid_x, 0.0,
-                    ),
-                    max_dist_pct=0.10,
+                    expected_motion_pct=(nudge_hid * pre_pct, 0.0),
+                    max_dist_pct=0.12,
                 )
                 if hsv_check_hit is None:
                     logger.info(
@@ -962,7 +1034,14 @@ class VisualServoHomer:
         # back-to-back bursts without per-step captures. The standard
         # closed-loop servo below then handles whatever residual
         # remains, in 1-2 iterations instead of 7-10.
-        if self._longjump is not None:
+        # Skip long-jump in no-slam mode: when the operator is
+        # chaining clicks within an open menu/dialog, a multi-burst
+        # chain would sweep the cursor diagonally across whatever's
+        # next to the current UI element (menubar siblings, dialog
+        # neighbours), triggering hover-open on them. Stick with the
+        # closed-loop servo's smaller, controlled moves so navigation
+        # stays inside the current UI element.
+        if self._longjump is not None and prev_cursor_pct is None:
             cursor_img = await self._fire_longjump(
                 cursor_img=cursor_img, target_aim=target_aim,
                 target_img=target_img, run_dir=run_dir, history=history,
@@ -973,6 +1052,9 @@ class VisualServoHomer:
         # pixel and expects the cursor to land *there*, not 20px off.
         # Cursor-detection precision (~5–8 px on a 1080p webcam) is
         # the real floor; we set the gate just above that.
+        # In no-slam mode (chained clicks within an open UI) we
+        # also constrain the closed loop to axis-aligned moves so
+        # diagonal transit doesn't open sibling menus.
         return await self._servo_loop(
             target_aim=target_aim, target_img=target_img,
             cursor_img=cursor_img, button=button, run_dir=run_dir,
@@ -981,6 +1063,7 @@ class VisualServoHomer:
             confirm_frames=1,
             click_tol_pct=0.006,
             click=click,
+            axis_aligned=(prev_cursor_pct is not None),
         )
 
     async def _fire_longjump(

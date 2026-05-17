@@ -185,6 +185,14 @@ def create_app(
     # operator hovers within tolerance of the cached position, so
     # a continuous scroll gesture re-uses the homing cost.
     app.state.last_scroll_home_xy = None
+    # Cache for the no-slam follow-up path. After every successful
+    # click_at the cursor is known to be at (req.x_pct, req.y_pct)
+    # on the host. Subsequent click_at requests within
+    # ``NO_SLAM_CACHE_TTL_S`` reuse that position as the starting
+    # cursor and skip the slam-to-corner + oscillation detection
+    # that would otherwise dismiss any open menu / modal / popover.
+    # Invalidated by any other mouse action.
+    app.state.last_click_xy_at = None  # tuple[(x,y), epoch] | None
 
     @app.on_event("startup")
     async def _on_startup() -> None:
@@ -726,15 +734,35 @@ def create_app(
             try:
                 adapter = _SessionAdapter(ctx)
                 homer = VisualServoHomer(session=adapter)
+                # No-slam follow-up: if a click landed recently, the
+                # cursor is still at that pixel on the host. Reusing
+                # it as the starting cursor lets the next click stay
+                # within whatever UI element the previous click
+                # opened (menu, dialog, dropdown). Without this
+                # every click_at re-slams to the corner, which
+                # dismisses transient UI like LibreOffice's menus.
+                NO_SLAM_CACHE_TTL_S = 30.0
+                import time as _time
+                prev_cursor_pct = None
+                cached = app.state.last_click_xy_at
+                if cached is not None:
+                    cached_xy, cached_t = cached
+                    if _time.time() - cached_t < NO_SLAM_CACHE_TTL_S:
+                        prev_cursor_pct = cached_xy
                 outcome = await homer.home_to_pixel(
                     req.x_pct, req.y_pct, button=req.button,
+                    prev_cursor_pct=prev_cursor_pct,
                 )
                 # click_at successfully landed the cursor at this
                 # pixel — update the scroll-home cache so the next
                 # /api/mouse/scroll at the same spot skips a fresh
-                # home.
+                # home, AND the no-slam cache so the next click_at
+                # within the TTL skips the slam phase entirely.
                 if bool(outcome.clicked):
                     app.state.last_scroll_home_xy = (req.x_pct, req.y_pct)
+                    app.state.last_click_xy_at = (
+                        (req.x_pct, req.y_pct), _time.time(),
+                    )
                     # Multi-click: the homer already fired one click
                     # as part of landing. Send the extras in-place
                     # (no movement between) so the OS sees them as a
@@ -828,6 +856,9 @@ def create_app(
         try:
             return await _with_mouse(go)
         finally:
+            # Manual mouse-move invalidates the no-slam click cache —
+            # the cursor is no longer at the previously-clicked pixel.
+            app.state.last_click_xy_at = None
             _schedule_snapshot("manual_move")
 
     # Tolerance (in normalised coords, both axes) for treating two
