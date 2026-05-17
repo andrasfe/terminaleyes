@@ -241,7 +241,9 @@ _LONGJUMP_CALIBRATION = {
 def _try_load_longjump():
     """Best-effort load of the trained long-jump model. Returns None
     if the package or checkpoint is missing — the homer falls back
-    to standard closed-loop behaviour."""
+    to closed-loop-only behaviour (no long-distance HID seed; the
+    closed loop chips at the residual one step at a time, taking
+    several more iterations per click)."""
     try:
         from terminaleyes.commander.longjump import LongJumpModel
     except Exception as e:
@@ -263,6 +265,15 @@ def _try_load_longjump():
                     "longjump model at %s failed to load: %s",
                     cand, e,
                 )
+    logger.warning(
+        "VisualServoHomer: no long-jump checkpoint at %s. The homer "
+        "will work but the slam-to-target first step uses ratio-only "
+        "open-loop (each click takes ~3-5 more iterations than with "
+        "long-jump). Train your own with scripts/collect_pointer_accel.sh "
+        "+ scripts/train_longjump.py — see README "
+        '"Calibrating the homer for your setup".',
+        ", ".join(str(c) for c in _LONGJUMP_CHECKPOINT_CANDIDATES),
+    )
     return None
 
 
@@ -270,7 +281,8 @@ def _try_load_pointer_accel():
     """Best-effort load of the trained open-loop pointer-accel MLP.
 
     Returns ``None`` if the package or checkpoints are missing — the
-    homer will then fall back to its pure closed-loop behaviour.
+    homer falls back to a ratio-based open-loop seed (still works,
+    just slower convergence).
     """
     try:
         from terminaleyes.commander.pointer_accel import PointerAccelModel
@@ -292,6 +304,14 @@ def _try_load_pointer_accel():
                     "pointer-accel model at %s failed to load: %s",
                     cand, e,
                 )
+    logger.warning(
+        "VisualServoHomer: no pointer-accel checkpoint at %s. The "
+        "homer will work but convergence is slower. Train your own "
+        "with scripts/collect_pointer_accel.sh + "
+        "scripts/train_pointer_accel.py — see README "
+        '"Calibrating the homer for your setup".',
+        ", ".join(str(c) for c in _POINTER_ACCEL_CHECKPOINT_CANDIDATES),
+    )
     return None
 
 

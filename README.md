@@ -282,27 +282,25 @@ jiggle).
 
 ## Calibrating the homer for your setup
 
-The shipped `pointer_accel-v5` and `longjump-v2` checkpoints under
-`data/ml/checkpoints/` are calibrated for ONE specific setup: a
-particular webcam at a particular distance, looking at an Ubuntu
-target with `redglass` cursor at size 96, driving the host's
-libinput-adaptive pointer-acceleration curve via Bluetooth HID. For
-a different webcam, different target distance, different OS, or
-different cursor theme, the shipped models are an *approximation* —
-the closed-loop servo will still converge, just with more
-iterations. For tight, fast clicks on your setup, retrain.
+terminaleyes ships **no pre-trained homer models**. Every install
+trains its own. The reason: the trained models encode a webcam-
+specific perspective + a target-OS-specific pointer-acceleration
+curve + a cursor-specific shape — one user's calibration is wrong
+for the next user's rig. The closed-loop visual servo still works
+on a fresh install (it falls back to a ratio-based seed and chips
+at the residual), it just takes more iterations per click. Train
+once and clicks tighten up dramatically.
 
-**What's in the shipped data (privacy note).** The training rows are
-pure motion telemetry — `(hid_dx, hid_dy, measured_dx_pct,
-measured_dy_pct, cursor_x_pct, cursor_y_pct)`. No screenshots, no
-keystrokes, no document content, no app names. The model learns
-"send X HID → cursor moves Y pixels on screen" — only pointer-
-acceleration physics. The webcam frames that the homer captures
-during collection are stored locally in
+**Privacy note.** The training rows are pure motion telemetry —
+`(hid_dx, hid_dy, measured_dx_pct, measured_dy_pct, cursor_x_pct,
+cursor_y_pct)`. No screenshots, no keystrokes, no document content,
+no app names. The model learns "send X HID → cursor moves Y pixels
+on screen" — only pointer-acceleration physics. The webcam frames
+captured during collection are stored locally in
 `~/.local/share/terminaleyes/runs/` (gitignored, never uploaded)
 and the training scripts ONLY consume the numerical
 `history.jsonl`, never the PNGs. Inspect any
-`data/ml/{pointer_accel,longjump}/*.jsonl` to verify.
+`data/ml/{pointer_accel,longjump}/*.jsonl` after running to verify.
 
 ### From-scratch training (any target OS)
 

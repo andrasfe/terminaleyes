@@ -57,16 +57,11 @@ run_mcp.sh
 # Playwright MCP server logs
 .playwright-mcp/
 
-# ML artefacts — adapters, intermediate datasets, checkpoints
-# Ignore everything under data/ml/ EXCEPT the tiny open-loop pointer-
-# acceleration model (~20 KB) and its training dataset — those are
-# load-bearing for fast cursor homing on Ubuntu and we want a fresh
-# clone to work without retraining.
-data/ml/*
-!data/ml/checkpoints/
-data/ml/checkpoints/*
-!data/ml/checkpoints/pointer_accel-*/
-!data/ml/checkpoints/longjump-*/
-!data/ml/pointer_accel/
-!data/ml/longjump/
+# ML artefacts — adapters, intermediate datasets, checkpoints,
+# trained pointer-accel + long-jump models. Nothing in data/ml/ is
+# shipped: every user trains their own homer-calibration models for
+# their specific webcam / target / cursor setup (see README
+# "Calibrating the homer for your setup"). Without local training
+# the closed-loop servo still converges, it just iterates more.
+data/ml/
 *.safetensors
