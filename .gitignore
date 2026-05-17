@@ -66,5 +66,7 @@ data/ml/*
 !data/ml/checkpoints/
 data/ml/checkpoints/*
 !data/ml/checkpoints/pointer_accel-*/
+!data/ml/checkpoints/longjump-*/
 !data/ml/pointer_accel/
+!data/ml/longjump/
 *.safetensors
