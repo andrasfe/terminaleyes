@@ -46,6 +46,14 @@ for r in $(seq 1 $ROWS); do
 try: print(json.load(sys.stdin).get('ok', False))
 except: print('?')")
     echo "ok=$ok"
+    # Force the next click_at to run with full slam + detect:
+    # invalidate cc's no-slam click cache by sending a manual move.
+    # Without this, consecutive probes within the cache TTL would
+    # skip the slam phase and the long-jump model would never fire,
+    # which is exactly the data we're trying to collect.
+    curl -s --max-time 5 -X POST "$BASE/api/mouse/move" \
+      -H 'Content-Type: application/json' \
+      -d '{"dx": 1, "dy": 0}' >/dev/null
     sleep 1
   done
 done
