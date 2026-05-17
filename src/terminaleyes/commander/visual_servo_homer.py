@@ -208,6 +208,41 @@ _POINTER_ACCEL_CHECKPOINT_CANDIDATES = (
     Path("data/ml/checkpoints/pointer_accel-v1"),
 )
 
+# Long-jump model: predicts the TOTAL HID for a full slam-to-target
+# move. Used at the top of home_to_pixel to fire a chain of back-to-
+# back bursts (no captures between) that lands the cursor near the
+# target in one shot, before handing off to the standard closed-loop
+# servo for the small residual.
+_LONGJUMP_CHECKPOINT_CANDIDATES = (
+    Path("data/ml/checkpoints/longjump-v1"),
+)
+
+
+def _try_load_longjump():
+    """Best-effort load of the trained long-jump model. Returns None
+    if the package or checkpoint is missing — the homer falls back
+    to standard closed-loop behaviour."""
+    try:
+        from terminaleyes.commander.longjump import LongJumpModel
+    except Exception as e:
+        logger.debug("longjump module unavailable: %s", e)
+        return None
+    for cand in _LONGJUMP_CHECKPOINT_CANDIDATES:
+        if (cand / "config.json").exists():
+            try:
+                m = LongJumpModel(cand)
+                logger.info(
+                    "VisualServoHomer: loaded long-jump seed model "
+                    "from %s", cand,
+                )
+                return m
+            except Exception as e:
+                logger.warning(
+                    "longjump model at %s failed to load: %s",
+                    cand, e,
+                )
+    return None
+
 
 def _try_load_pointer_accel():
     """Best-effort load of the trained open-loop pointer-accel MLP.
@@ -274,6 +309,13 @@ class VisualServoHomer:
         # first-iteration seed of the servo loop. Closed-loop still
         # owns iterations 2+, so absence is harmless.
         self._pointer_accel = _try_load_pointer_accel()
+        # Optional long-jump model for the slam-to-target first move.
+        # Trained on aggregated trajectory data
+        # (scripts/build_longjump_dataset.py + train_longjump.py).
+        # When present, home_to_pixel fires a chain of back-to-back
+        # HID bursts based on this model's prediction before entering
+        # the closed-loop servo, cutting typical click time ~2.5x.
+        self._longjump = _try_load_longjump()
 
     async def run(self, target_desc: str, button: str = "left") -> ClickOutcome:
         try:
@@ -894,6 +936,19 @@ class VisualServoHomer:
         else:
             target_aim = target_img
 
+        # Long-jump phase: when the slam-to-target distance is large
+        # (>15% of image, where the per-step pointer_accel model is
+        # out of training distribution), use the long-jump model to
+        # predict the full HID needed and fire it as a chain of
+        # back-to-back bursts without per-step captures. The standard
+        # closed-loop servo below then handles whatever residual
+        # remains, in 1-2 iterations instead of 7-10.
+        if self._longjump is not None:
+            cursor_img = await self._fire_longjump(
+                cursor_img=cursor_img, target_aim=target_aim,
+                target_img=target_img, run_dir=run_dir, history=history,
+            )
+
         # Manual clicks demand higher accuracy than the controller's
         # "click on this OCR'd word" flow: an operator picks an exact
         # pixel and expects the cursor to land *there*, not 20px off.
@@ -908,6 +963,97 @@ class VisualServoHomer:
             click_tol_pct=0.006,
             click=click,
         )
+
+    async def _fire_longjump(
+        self, *,
+        cursor_img: tuple[float, float],
+        target_aim: tuple[float, float],
+        target_img: tuple[float, float],
+        run_dir: Path,
+        history: list[StepRecord],
+        min_trigger_pct: float = 0.15,
+        max_per_burst: int = 127,
+    ) -> tuple[float, float]:
+        """Fire a chain of back-to-back HID bursts predicted by the
+        long-jump model, without per-step captures. Returns the
+        updated cursor position (HSV-tracked if available, otherwise
+        the long-jump's open-loop prediction).
+
+        No-op (returns ``cursor_img`` unchanged) when:
+          - The long-jump model isn't loaded.
+          - The slam-to-target distance is below ``min_trigger_pct``
+            (the closed-loop servo is fine for small moves and the
+            model's training data was mostly large moves).
+        """
+        from terminaleyes.commander.longjump import chunk_hid_for_bursts
+        residual = math.hypot(
+            target_aim[0] - cursor_img[0],
+            target_aim[1] - cursor_img[1],
+        )
+        if residual < min_trigger_pct or self._longjump is None:
+            return cursor_img
+        try:
+            total_dx, total_dy = self._longjump.predict_total_hid(
+                cursor_x_pct=cursor_img[0],
+                cursor_y_pct=cursor_img[1],
+                target_x_pct=target_aim[0],
+                target_y_pct=target_aim[1],
+            )
+        except Exception as e:
+            logger.warning("longjump prediction failed: %s", e)
+            return cursor_img
+        bursts = chunk_hid_for_bursts(
+            total_dx, total_dy, max_per_burst=max_per_burst,
+        )
+        if not bursts:
+            return cursor_img
+        print(
+            f"  Long-jump: residual {residual:.1%} → "
+            f"total_hid=({total_dx},{total_dy}) in {len(bursts)} bursts"
+        )
+        # Fire all bursts back-to-back with tiny gaps. NO captures
+        # between — the whole point is to skip the slow capture loop.
+        for hdx, hdy in bursts:
+            await self._send_hid(hdx, hdy)
+            await asyncio.sleep(0.04)
+        # One capture at the end to update the cursor estimate. If
+        # HSV is engaged, re-localise near the predicted landing
+        # point; else fall back to open-loop prediction.
+        predicted = (
+            cursor_img[0] + total_dx * self._pct_per_hid_x,
+            cursor_img[1] + total_dy * self._pct_per_hid_y,
+        )
+        await asyncio.sleep(SETTLE_SEC)
+        new_pos: tuple[float, float] = predicted
+        if self._hsv_enabled:
+            try:
+                post = await self._capture_color()
+                # Wide-ish radius: the model is approximate, and the
+                # cursor might be ~50-100 px from the prediction.
+                hit = find_cursor_hsv_near(
+                    post, near_pct=predicted, max_dist_pct=0.08,
+                )
+                if hit is not None:
+                    new_pos = (hit.x_pct, hit.y_pct)
+            except Exception as e:
+                logger.debug("longjump post-capture failed: %s", e)
+        _record_step(run_dir, history, StepRecord(
+            cursor_img=new_pos, target_img=target_img,
+            residual_pct=math.hypot(
+                target_aim[0] - new_pos[0],
+                target_aim[1] - new_pos[1],
+            ),
+            hid_dx=total_dx, hid_dy=total_dy,
+            ratio_x=self._pct_per_hid_x,
+            ratio_y=self._pct_per_hid_y,
+            note="longjump_chain",
+        ))
+        print(
+            f"  Long-jump landed: cursor=({new_pos[0]:.2%},"
+            f"{new_pos[1]:.2%}) "
+            f"residual={math.hypot(target_aim[0]-new_pos[0], target_aim[1]-new_pos[1]):.2%}"
+        )
+        return new_pos
 
     # ────────────────────── target localization ──────────────────────
 
