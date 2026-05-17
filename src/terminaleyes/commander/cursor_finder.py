@@ -202,6 +202,108 @@ def find_cursor_hsv_near(
     return best
 
 
+def find_cursor_hsv_motion(
+    pre_bgr: np.ndarray,
+    post_bgr: np.ndarray,
+    *,
+    near_pct: tuple[float, float] | None = None,
+    max_dist_pct: float | None = None,
+    dilate_px: int = 4,
+) -> CursorHit | None:
+    """Find the cursor via differential red-mask between a pre-HID
+    and post-HID frame.
+
+    The cursor is the only red thing on the host that responds to
+    our HID commands. Every other red region (UI accent, syntax-
+    highlighted text, dialog icon, brand colour) is static. By
+    masking only the pixels that BECAME red between the two frames,
+    we cancel out all static red regardless of how much exists on
+    screen.
+
+    Algorithm:
+      1. red_mask_pre, red_mask_post = HSV-threshold both frames.
+      2. Dilate red_mask_pre by ``dilate_px`` so a ±dilate_px webcam
+         jitter on a static blob still cancels.
+      3. newly_red = red_mask_post AND NOT dilated_red_mask_pre.
+      4. Largest contour in newly_red (passing area filters and the
+         optional ``near_pct`` proximity gate) is the cursor.
+
+    Optional ``near_pct`` + ``max_dist_pct`` add a position prior —
+    useful when the homer knows roughly where the cursor should
+    have landed after a known HID burst.
+
+    Returns ``None`` if no blob survives filtering — pre-frame
+    coverage was high enough that nothing was newly red (rare in
+    practice; the cursor's pre-position becomes "newly NOT red" but
+    its post-position is brand-new red).
+    """
+    if (pre_bgr.ndim != 3 or post_bgr.ndim != 3
+            or pre_bgr.shape != post_bgr.shape):
+        return None
+    h, w = post_bgr.shape[:2]
+    img_area = h * w
+
+    def _red(bgr):
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        m1 = cv2.inRange(hsv, WIDE_RED_LO_A, WIDE_RED_HI_A)
+        m2 = cv2.inRange(hsv, WIDE_RED_LO_B, WIDE_RED_HI_B)
+        return cv2.bitwise_or(m1, m2)
+
+    mask_pre = _red(pre_bgr)
+    mask_post = _red(post_bgr)
+
+    if dilate_px > 0:
+        k = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (dilate_px * 2 + 1, dilate_px * 2 + 1),
+        )
+        mask_pre_dil = cv2.dilate(mask_pre, k)
+    else:
+        mask_pre_dil = mask_pre
+
+    newly_red = cv2.bitwise_and(mask_post, cv2.bitwise_not(mask_pre_dil))
+    # Clean noise; close adjacent fragments into a single blob.
+    kernel3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    newly_red = cv2.morphologyEx(newly_red, cv2.MORPH_OPEN, kernel3)
+    kernel5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    newly_red = cv2.morphologyEx(newly_red, cv2.MORPH_CLOSE, kernel5)
+
+    contours, _ = cv2.findContours(
+        newly_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None
+
+    best: CursorHit | None = None
+    best_area = 0.0
+    for c in contours:
+        area = cv2.contourArea(c)
+        area_pct = area / img_area
+        if area_pct < WIDE_MIN_AREA_PCT:
+            continue
+        if area_pct > MAX_AREA_PCT:
+            continue
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+        x_pct = cx / w
+        y_pct = cy / h
+        if near_pct is not None and max_dist_pct is not None:
+            dx = x_pct - near_pct[0]
+            dy = y_pct - near_pct[1]
+            if (dx * dx + dy * dy) ** 0.5 > max_dist_pct:
+                continue
+        if area > best_area:
+            best_area = area
+            best = CursorHit(
+                x_pct=x_pct, y_pct=y_pct,
+                area_pct=area_pct,
+                confidence=min(1.0, area_pct / 0.005),
+            )
+    return best
+
+
 def annotate_cursor(
     image_bgr: np.ndarray, hit: CursorHit,
     color: tuple[int, int, int] = (0, 255, 255),

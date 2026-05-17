@@ -92,6 +92,7 @@ class LongJumpModel:
         target_x_pct: float, target_y_pct: float,
         *,
         max_total_hid: int = 1500,
+        calibration: tuple[float, float] = (1.0, 1.0),
     ) -> tuple[int, int]:
         """Predict the total HID (dx, dy) to send across one chain of
         back-to-back bursts to land the cursor on the target.
@@ -100,6 +101,17 @@ class LongJumpModel:
         sample outside training distribution can't slam the cursor
         through the screen. Default 1500 covers the dataset's max
         observed total (~1400) plus a small margin.
+
+        ``calibration`` is an empirical per-axis scalar applied
+        post-prediction. v1 was trained on slow-paced trajectories
+        with ``SETTLE_SEC`` between HIDs, where Mac pointer-accel
+        produces less motion per HID. The runtime fires bursts back-
+        to-back which triggers a more aggressive accel curve, so the
+        cursor consistently overshoots v1's predictions by ~15-25%.
+        Scaling down by 0.85 on both axes brings the typical landing
+        from ~9% residual to ~2% — well inside the closed-loop's
+        recovery zone. v2+ retrains on chained-burst data and should
+        be deployed with calibration=(1.0, 1.0).
         """
         dx = float(target_x_pct) - float(cursor_x_pct)
         dy = float(target_y_pct) - float(cursor_y_pct)
@@ -109,8 +121,8 @@ class LongJumpModel:
             cursor_y_pct * 2.0 - 1.0,
         ], dtype=np.float32)
         out = self._forward(x)
-        hid_dx = float(out[0]) * self.config.hid_scale
-        hid_dy = float(out[1]) * self.config.hid_scale
+        hid_dx = float(out[0]) * self.config.hid_scale * calibration[0]
+        hid_dy = float(out[1]) * self.config.hid_scale * calibration[1]
         hid_dx = max(-max_total_hid, min(max_total_hid, hid_dx))
         hid_dy = max(-max_total_hid, min(max_total_hid, hid_dy))
         return int(round(hid_dx)), int(round(hid_dy))

@@ -46,6 +46,7 @@ from terminaleyes.commander.cursor_finder import (
     annotate_cursor,
     find_cursor_by_variance,
     find_cursor_hsv,
+    find_cursor_hsv_motion,
     find_cursor_hsv_near,
     setup_instructions,
 )
@@ -214,8 +215,26 @@ _POINTER_ACCEL_CHECKPOINT_CANDIDATES = (
 # target in one shot, before handing off to the standard closed-loop
 # servo for the small residual.
 _LONGJUMP_CHECKPOINT_CANDIDATES = (
+    # v2: retrained on chained-burst data — no scalar calibration.
+    Path("data/ml/checkpoints/longjump-v2"),
+    # v1: trained on slow-paced (per-step) trajectories; chained-
+    # burst runtime needs a ~0.85 calibration on both axes.
     Path("data/ml/checkpoints/longjump-v1"),
 )
+
+# Per-checkpoint runtime calibration knob. The chained-burst
+# pattern triggers Mac's pointer-acceleration curve differently
+# than the slow-paced training trajectories, so v1 sometimes over-
+# and sometimes under-shoots by 15-25% in a single sample. A flat
+# scalar didn't help consistently (one click landed tighter, the
+# next over-corrected the opposite way), so v1 is left at 1.0 and
+# the post-burst HSV cascade + closed-loop refinement absorbs the
+# residual. v2+ is the principled fix — retrain on data captured
+# under the actual chained-burst runtime.
+_LONGJUMP_CALIBRATION = {
+    "longjump-v1": (1.0, 1.0),
+    "longjump-v2": (1.0, 1.0),
+}
 
 
 def _try_load_longjump():
@@ -231,9 +250,11 @@ def _try_load_longjump():
         if (cand / "config.json").exists():
             try:
                 m = LongJumpModel(cand)
+                cal = _LONGJUMP_CALIBRATION.get(cand.name, (1.0, 1.0))
+                m._calibration = cal  # consumed by predict_total_hid
                 logger.info(
                     "VisualServoHomer: loaded long-jump seed model "
-                    "from %s", cand,
+                    "from %s (calibration=%s)", cand, cal,
                 )
                 return m
             except Exception as e:
@@ -405,47 +426,35 @@ class VisualServoHomer:
                 f"{cursor_img[1]:.2%})"
             )
             f0 = await self._capture_color()
-            # Post-hoc HSV cross-check. See home_to_pixel for the
-            # rationale: oscillation gives us ground truth, so an
-            # HSV blob anywhere near it is provably the cursor and
-            # safe to use for the cleaner per-step measurement.
+            # HSV cross-check using the differential red-mask method.
+            # We send a small verification nudge and look for the
+            # blob that BECAME red between the pre and post frames —
+            # static red UI cancels out, so a hit near the osc result
+            # is provably the cursor.
             try:
-                # Position-aware: see home_to_pixel for rationale.
-                hsv_check_hit = find_cursor_hsv_near(
-                    f0, near_pct=cursor_img, max_dist_pct=0.04,
+                pre_check = await self._capture_color()
+                await self._send_hid(20, 0)
+                await asyncio.sleep(SETTLE_SEC)
+                post_check = await self._capture_color()
+                hsv_check_hit = find_cursor_hsv_motion(
+                    pre_check, post_check,
+                    near_pct=cursor_img, max_dist_pct=0.10,
                 )
                 if hsv_check_hit is None:
                     logger.info(
-                        "HSV cross-check: no HSV blob near osc result; "
-                        "staying on frame-diff."
+                        "HSV cross-check: no motion-diff red blob "
+                        "near osc result; staying on frame-diff."
                     )
                 else:
-                    dx = abs(hsv_check_hit.x_pct - cursor_img[0])
-                    dy = abs(hsv_check_hit.y_pct - cursor_img[1])
-                    HSV_CROSS_CHECK_TOL = 0.03
-                    if dx <= HSV_CROSS_CHECK_TOL and \
-                            dy <= HSV_CROSS_CHECK_TOL:
-                        self._hsv_enabled = True
-                        cursor_img = (
-                            hsv_check_hit.x_pct, hsv_check_hit.y_pct,
-                        )
-                        logger.info(
-                            "HSV cross-check OK "
-                            f"(dx={dx:.2%},dy={dy:.2%}) — enabling "
-                            "HSV for per-step measurement; "
-                            f"adopted ({cursor_img[0]:.2%},"
-                            f"{cursor_img[1]:.2%})."
-                        )
-                    else:
-                        logger.info(
-                            "HSV cross-check FAIL "
-                            f"(dx={dx:.2%},dy={dy:.2%}); osc was "
-                            f"({cursor_img[0]:.2%},{cursor_img[1]:.2%}) "
-                            "but HSV's biggest blob is at "
-                            f"({hsv_check_hit.x_pct:.2%},"
-                            f"{hsv_check_hit.y_pct:.2%}) — "
-                            "staying on frame-diff."
-                        )
+                    self._hsv_enabled = True
+                    cursor_img = (
+                        hsv_check_hit.x_pct, hsv_check_hit.y_pct,
+                    )
+                    logger.info(
+                        "HSV cross-check OK (motion-diff) — enabling "
+                        f"HSV for per-step measurement; adopted "
+                        f"({cursor_img[0]:.2%},{cursor_img[1]:.2%})."
+                    )
             except Exception as e:
                 logger.warning("HSV cross-check error: %s", e)
 
@@ -701,6 +710,14 @@ class VisualServoHomer:
                 # absorbs jitter; the ceiling (4%) keeps us from
                 # going wider than ``find_cursor_hsv_near``'s
                 # default and re-introducing the original bug.
+                # Differential red-mask: the cursor is the only red
+                # thing on the host that responds to our HID. Every
+                # other red blob (UI accent, dialog icon, syntax-
+                # highlighted text) is static and appears identically
+                # in both pre and post frames. Subtracting the dilated
+                # pre-mask from the post-mask leaves only "newly red"
+                # pixels — i.e., where the cursor just arrived —
+                # regardless of how much red clutter the screen has.
                 expected_new = (
                     cursor_img[0] + hid_dx * self._pct_per_hid_x,
                     cursor_img[1] + hid_dy * self._pct_per_hid_y,
@@ -709,10 +726,10 @@ class VisualServoHomer:
                     hid_dx * self._pct_per_hid_x,
                     hid_dy * self._pct_per_hid_y,
                 )
-                radius = max(0.015, min(0.04, 0.3 * expected_motion + 0.01))
-                new_hit = find_cursor_hsv_near(
-                    post_color, near_pct=expected_new,
-                    max_dist_pct=radius,
+                radius = max(0.02, min(0.06, 0.4 * expected_motion + 0.015))
+                new_hit = find_cursor_hsv_motion(
+                    pre_color, post_color,
+                    near_pct=expected_new, max_dist_pct=radius,
                 )
                 if new_hit is not None:
                     new_pos = (new_hit.x_pct, new_hit.y_pct)
@@ -879,51 +896,37 @@ class VisualServoHomer:
             # whenever pointer-accel or webcam perspective made the
             # observed delta differ from the predicted one.
             try:
-                hsv_check_frame = await self._capture_color()
-                # Position-aware: take the HSV blob NEAREST the
-                # oscillation result, not the globally largest one.
-                # Otherwise a static red UI accent at the screen
-                # edge would outrank the actual cursor by area+edge
-                # score and we'd permanently reject HSV.
-                hsv_check_hit = find_cursor_hsv_near(
-                    hsv_check_frame, near_pct=cursor_img,
-                    max_dist_pct=0.04,
+                # Differential red-mask cross-check: send a small
+                # verification nudge and find the red blob that
+                # BECAME red between pre/post frames. Static red UI
+                # (icons, syntax highlights, brand accents) cancels
+                # out; only the cursor's new position survives the
+                # subtraction. Strictly more robust than the single-
+                # frame position-aware finder when the screen has any
+                # red clutter.
+                pre_check = await self._capture_color()
+                await self._send_hid(20, 0)
+                await asyncio.sleep(SETTLE_SEC)
+                post_check = await self._capture_color()
+                hsv_check_hit = find_cursor_hsv_motion(
+                    pre_check, post_check,
+                    near_pct=cursor_img, max_dist_pct=0.10,
                 )
                 if hsv_check_hit is None:
                     logger.info(
-                        "HSV cross-check: no HSV blob near osc result; "
-                        "staying on frame-diff."
+                        "HSV cross-check: no motion-diff red blob "
+                        "near osc result; staying on frame-diff."
                     )
                 else:
-                    dx = abs(hsv_check_hit.x_pct - cursor_img[0])
-                    dy = abs(hsv_check_hit.y_pct - cursor_img[1])
-                    HSV_CROSS_CHECK_TOL = 0.03  # 3% of image, ~58 px
-                    if dx <= HSV_CROSS_CHECK_TOL and \
-                            dy <= HSV_CROSS_CHECK_TOL:
-                        self._hsv_enabled = True
-                        # Adopt HSV's more precise centroid (variance
-                        # picks the moving cluster; HSV picks the
-                        # cursor blob's pixel-accurate centroid).
-                        cursor_img = (
-                            hsv_check_hit.x_pct, hsv_check_hit.y_pct,
-                        )
-                        logger.info(
-                            "HSV cross-check OK "
-                            f"(dx={dx:.2%},dy={dy:.2%}) — enabling HSV "
-                            "for per-step measurement; "
-                            f"adopted ({cursor_img[0]:.2%},"
-                            f"{cursor_img[1]:.2%})."
-                        )
-                    else:
-                        logger.info(
-                            "HSV cross-check FAIL "
-                            f"(dx={dx:.2%},dy={dy:.2%}); osc was "
-                            f"({cursor_img[0]:.2%},{cursor_img[1]:.2%}) "
-                            "but HSV's biggest blob is at "
-                            f"({hsv_check_hit.x_pct:.2%},"
-                            f"{hsv_check_hit.y_pct:.2%}) "
-                            "— staying on frame-diff."
-                        )
+                    self._hsv_enabled = True
+                    cursor_img = (
+                        hsv_check_hit.x_pct, hsv_check_hit.y_pct,
+                    )
+                    logger.info(
+                        "HSV cross-check OK (motion-diff) — enabling "
+                        f"HSV for per-step measurement; adopted "
+                        f"({cursor_img[0]:.2%},{cursor_img[1]:.2%})."
+                    )
             except Exception as e:
                 logger.warning("HSV cross-check error: %s", e)
 
@@ -998,6 +1001,9 @@ class VisualServoHomer:
                 cursor_y_pct=cursor_img[1],
                 target_x_pct=target_aim[0],
                 target_y_pct=target_aim[1],
+                calibration=getattr(
+                    self._longjump, "_calibration", (1.0, 1.0),
+                ),
             )
         except Exception as e:
             logger.warning("longjump prediction failed: %s", e)
