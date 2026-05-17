@@ -47,6 +47,7 @@ from terminaleyes.commander.cursor_finder import (
     find_cursor_by_variance,
     find_cursor_hsv,
     find_cursor_hsv_motion,
+    find_cursor_hsv_motion_directed,
     find_cursor_hsv_near,
     setup_instructions,
 )
@@ -433,12 +434,17 @@ class VisualServoHomer:
             # is provably the cursor.
             try:
                 pre_check = await self._capture_color()
-                await self._send_hid(20, 0)
+                nudge_hid = 20
+                await self._send_hid(nudge_hid, 0)
                 await asyncio.sleep(SETTLE_SEC)
                 post_check = await self._capture_color()
-                hsv_check_hit = find_cursor_hsv_motion(
+                hsv_check_hit = find_cursor_hsv_motion_directed(
                     pre_check, post_check,
-                    near_pct=cursor_img, max_dist_pct=0.10,
+                    cursor_pre_pct=cursor_img,
+                    expected_motion_pct=(
+                        nudge_hid * self._pct_per_hid_x, 0.0,
+                    ),
+                    max_dist_pct=0.10,
                 )
                 if hsv_check_hit is None:
                     logger.info(
@@ -710,26 +716,31 @@ class VisualServoHomer:
                 # absorbs jitter; the ceiling (4%) keeps us from
                 # going wider than ``find_cursor_hsv_near``'s
                 # default and re-introducing the original bug.
-                # Differential red-mask: the cursor is the only red
-                # thing on the host that responds to our HID. Every
-                # other red blob (UI accent, dialog icon, syntax-
-                # highlighted text) is static and appears identically
-                # in both pre and post frames. Subtracting the dilated
-                # pre-mask from the post-mask leaves only "newly red"
-                # pixels — i.e., where the cursor just arrived —
-                # regardless of how much red clutter the screen has.
-                expected_new = (
-                    cursor_img[0] + hid_dx * self._pct_per_hid_x,
-                    cursor_img[1] + hid_dy * self._pct_per_hid_y,
-                )
-                expected_motion = math.hypot(
+                # Differential red-mask + direction + shape: the
+                # cursor is the only red thing on the host that
+                # responds to our HID. Static UI red (icons, syntax
+                # highlights, text-field selection) cancels out in
+                # the pre/post subtraction. Among the "newly red"
+                # blobs that survive, we add two more priors:
+                #   - direction match: observed displacement from
+                #     the previous cursor position must align with
+                #     the HID we sent (cos similarity ≥ 0.5),
+                #     killing newly-red regions caused by a popup
+                #     appearing (they don't lie on our HID vector).
+                #   - arrow-like shape: the redglass cursor is
+                #     taller than wide and fairly solid; static UI
+                #     red is usually round / wide / sparse.
+                expected_motion_pct = (
                     hid_dx * self._pct_per_hid_x,
                     hid_dy * self._pct_per_hid_y,
                 )
-                radius = max(0.02, min(0.06, 0.4 * expected_motion + 0.015))
-                new_hit = find_cursor_hsv_motion(
+                expected_motion_mag = math.hypot(*expected_motion_pct)
+                radius = max(0.02, min(0.06, 0.4 * expected_motion_mag + 0.015))
+                new_hit = find_cursor_hsv_motion_directed(
                     pre_color, post_color,
-                    near_pct=expected_new, max_dist_pct=radius,
+                    cursor_pre_pct=cursor_img,
+                    expected_motion_pct=expected_motion_pct,
+                    max_dist_pct=radius,
                 )
                 if new_hit is not None:
                     new_pos = (new_hit.x_pct, new_hit.y_pct)
@@ -905,12 +916,17 @@ class VisualServoHomer:
                 # frame position-aware finder when the screen has any
                 # red clutter.
                 pre_check = await self._capture_color()
-                await self._send_hid(20, 0)
+                nudge_hid = 20
+                await self._send_hid(nudge_hid, 0)
                 await asyncio.sleep(SETTLE_SEC)
                 post_check = await self._capture_color()
-                hsv_check_hit = find_cursor_hsv_motion(
+                hsv_check_hit = find_cursor_hsv_motion_directed(
                     pre_check, post_check,
-                    near_pct=cursor_img, max_dist_pct=0.10,
+                    cursor_pre_pct=cursor_img,
+                    expected_motion_pct=(
+                        nudge_hid * self._pct_per_hid_x, 0.0,
+                    ),
+                    max_dist_pct=0.10,
                 )
                 if hsv_check_hit is None:
                     logger.info(

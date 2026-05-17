@@ -21,6 +21,7 @@ this returns ``None`` and ``setup_instructions()`` prints what to do.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import cv2
@@ -301,6 +302,163 @@ def find_cursor_hsv_motion(
                 area_pct=area_pct,
                 confidence=min(1.0, area_pct / 0.005),
             )
+    return best
+
+
+def find_cursor_hsv_motion_directed(
+    pre_bgr: np.ndarray,
+    post_bgr: np.ndarray,
+    *,
+    cursor_pre_pct: tuple[float, float],
+    expected_motion_pct: tuple[float, float],
+    max_dist_pct: float = 0.08,
+    dilate_px: int = 4,
+    require_arrow_shape: bool = True,
+    min_cos_similarity: float = 0.5,
+) -> CursorHit | None:
+    """Locate the cursor using the motion-diff red mask AND two
+    additional priors:
+
+      1. Direction match — we know what HID we sent, so the cursor's
+         observed displacement should align with the expected motion
+         vector. Each candidate's ``cos(observed, expected)`` must
+         exceed ``min_cos_similarity``. This rejects "newly red"
+         regions caused by side effects (a dialog or menu appearing
+         after the click) since their apparent position relative to
+         the previous cursor doesn't lie in the HID direction.
+      2. Arrow-like shape — the redglass cursor is a tall asymmetric
+         arrow (aspect ratio h/w roughly 1.2-2.5, fairly solid).
+         Static UI red is usually round (close-button), wide (text
+         highlight), or sparse (icon outline). Filtering by shape
+         double-filters in addition to (1).
+
+    ``cursor_pre_pct`` is the cursor's position BEFORE the HID
+    (image-percent). ``expected_motion_pct`` is the predicted
+    displacement (target_new - cursor_pre). Both are required;
+    callers without them should use ``find_cursor_hsv_motion``
+    instead.
+
+    Returns the best-scoring candidate, or None if no newly-red
+    blob satisfies all filters.
+    """
+    if (pre_bgr.ndim != 3 or post_bgr.ndim != 3
+            or pre_bgr.shape != post_bgr.shape):
+        return None
+    h, w = post_bgr.shape[:2]
+    img_area = h * w
+
+    def _red(bgr):
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        m1 = cv2.inRange(hsv, WIDE_RED_LO_A, WIDE_RED_HI_A)
+        m2 = cv2.inRange(hsv, WIDE_RED_LO_B, WIDE_RED_HI_B)
+        return cv2.bitwise_or(m1, m2)
+
+    mask_pre = _red(pre_bgr)
+    mask_post = _red(post_bgr)
+    if dilate_px > 0:
+        k = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (dilate_px * 2 + 1, dilate_px * 2 + 1),
+        )
+        mask_pre_dil = cv2.dilate(mask_pre, k)
+    else:
+        mask_pre_dil = mask_pre
+    newly_red = cv2.bitwise_and(mask_post, cv2.bitwise_not(mask_pre_dil))
+    kernel3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    newly_red = cv2.morphologyEx(newly_red, cv2.MORPH_OPEN, kernel3)
+    kernel5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    newly_red = cv2.morphologyEx(newly_red, cv2.MORPH_CLOSE, kernel5)
+    contours, _ = cv2.findContours(
+        newly_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None
+
+    expected_new_pct = (
+        cursor_pre_pct[0] + expected_motion_pct[0],
+        cursor_pre_pct[1] + expected_motion_pct[1],
+    )
+    ex_mag = math.hypot(*expected_motion_pct)
+
+    best: CursorHit | None = None
+    best_score = -1.0
+    best_diag = None
+    for c in contours:
+        area = cv2.contourArea(c)
+        area_pct = area / img_area
+        if area_pct < WIDE_MIN_AREA_PCT or area_pct > MAX_AREA_PCT:
+            continue
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+        x_pct = cx / w
+        y_pct = cy / h
+        # Position prior — must land near expected_new.
+        d_to_expected = math.hypot(
+            x_pct - expected_new_pct[0],
+            y_pct - expected_new_pct[1],
+        )
+        if d_to_expected > max_dist_pct:
+            continue
+        # Shape prior — arrow aspect ratio + solidity.
+        _, _, bw, bh = cv2.boundingRect(c)
+        aspect = bh / max(1, bw)
+        hull = cv2.convexHull(c)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / max(1.0, hull_area)
+        shape_ok = (
+            0.9 <= aspect <= 3.0 and solidity >= 0.45
+            if require_arrow_shape else True
+        )
+        if require_arrow_shape and not shape_ok:
+            continue
+        # Direction prior — observed displacement vs expected.
+        obs_dx = x_pct - cursor_pre_pct[0]
+        obs_dy = y_pct - cursor_pre_pct[1]
+        obs_mag = math.hypot(obs_dx, obs_dy)
+        if ex_mag > 1e-6 and obs_mag > 1e-6:
+            cos_sim = (
+                (obs_dx * expected_motion_pct[0]
+                 + obs_dy * expected_motion_pct[1])
+                / (obs_mag * ex_mag)
+            )
+        else:
+            # Either the expected motion or observed motion is ~0;
+            # direction is meaningless. Pass the gate but get no
+            # direction bonus.
+            cos_sim = 1.0
+        if cos_sim < min_cos_similarity:
+            continue
+        # Composite score: closer to expected + better direction
+        # match + larger blob (within the cursor-size band) + more
+        # arrow-like.
+        proximity_score = max(0.0, 1.0 - d_to_expected / max_dist_pct)
+        size_score = min(1.0, area_pct / 0.005)
+        aspect_score = 1.0 - abs(aspect - 1.7) / 1.7  # peaks at h/w=1.7
+        score = (
+            2.0 * cos_sim
+            + 1.5 * proximity_score
+            + 0.5 * size_score
+            + 0.5 * max(0.0, aspect_score)
+        )
+        if score > best_score:
+            best_score = score
+            best = CursorHit(
+                x_pct=x_pct, y_pct=y_pct,
+                area_pct=area_pct,
+                confidence=min(1.0, score / 4.5),
+            )
+            best_diag = (cos_sim, aspect, solidity, d_to_expected)
+    if best is not None and best_diag is not None:
+        import logging
+        logging.getLogger(__name__).debug(
+            "find_cursor_hsv_motion_directed: hit=(%.2f%%,%.2f%%) "
+            "cos=%.2f aspect=%.2f solidity=%.2f d=%.3f score=%.2f",
+            best.x_pct * 100, best.y_pct * 100,
+            best_diag[0], best_diag[1], best_diag[2], best_diag[3],
+            best_score,
+        )
     return best
 
 
