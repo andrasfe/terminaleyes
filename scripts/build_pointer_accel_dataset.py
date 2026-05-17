@@ -61,6 +61,23 @@ def _row_from_step(traj_id: str, idx: int, step: dict) -> dict | None:
     mdy = step.get("measured_dy_pct")
     if mdx is None or mdy is None:
         return None
+    # Sanity gate on the per-axis pct-per-hid ratio. The libinput-
+    # adaptive curve produces ~5e-4 to ~5e-3 pct-per-hid depending
+    # on velocity; rows outside [3e-4, 8e-3] are almost certainly
+    # corrupted (operator moved the mouse mid-click, webcam glare
+    # confused HSV, modal dialog appeared, network glitch dropped
+    # the HID, etc.) and would poison the next training round.
+    # Threshold chosen with ~2× margin around observed extremes.
+    SANE_MIN = 3e-4
+    SANE_MAX = 8e-3
+    for h, m in ((hid_dx, mdx), (hid_dy, mdy)):
+        if abs(h) < 3:
+            # Skip axes with tiny HIDs — they're dominated by noise
+            # in the measured delta and the ratio is meaningless.
+            continue
+        ratio = abs(float(m) / float(h))
+        if ratio < SANE_MIN or ratio > SANE_MAX:
+            return None
     cursor = step.get("cursor_img")
     cx = cy = None
     if isinstance(cursor, list) and len(cursor) == 2:
@@ -101,6 +118,14 @@ def main() -> int:
              "(ISO timestamp or epoch). Use after switching cursor "
              "theme to filter out pre-theme runs.",
     )
+    ap.add_argument(
+        "--exclude-canary", type=Path,
+        default=Path("data/ml/canary/pointer_accel.jsonl"),
+        help="Exclude any trajectory_id present in this canary "
+             "file from the training corpus. Prevents training data "
+             "from overlapping the eval set used to gate retrains. "
+             "Set empty to skip.",
+    )
     args = ap.parse_args()
     since_ts = None
     if args.since:
@@ -109,6 +134,18 @@ def main() -> int:
         except ValueError:
             from datetime import datetime
             since_ts = datetime.fromisoformat(args.since).timestamp()
+
+    canary_traj_ids: set[str] = set()
+    if args.exclude_canary and args.exclude_canary.exists():
+        with args.exclude_canary.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    canary_traj_ids.add(json.loads(line)["trajectory_id"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
     if not args.runs_root.exists():
         print(f"runs root not found: {args.runs_root}", file=sys.stderr)
@@ -119,6 +156,7 @@ def main() -> int:
     n_lines = 0
     n_dropped_note = 0
     n_dropped_age = 0
+    n_dropped_canary = 0
     for hist_path in _iter_history_files(args.runs_root):
         if since_ts is not None:
             try:
@@ -129,6 +167,9 @@ def main() -> int:
                 continue
         n_files += 1
         traj_id = str(hist_path.parent.relative_to(args.runs_root))
+        if traj_id in canary_traj_ids:
+            n_dropped_canary += 1
+            continue
         try:
             with hist_path.open("r", encoding="utf-8") as f:
                 for i, line in enumerate(f, 1):
@@ -153,6 +194,8 @@ def main() -> int:
         print(f"dropped {n_dropped_age} pre-{args.since} file(s)")
     if args.hsv_only:
         print(f"dropped {n_dropped_note} non-HSV row(s)")
+    if n_dropped_canary:
+        print(f"dropped {n_dropped_canary} canary trajectory(s)")
 
     print(
         f"scanned {n_files} history.jsonl file(s), {n_lines} step "

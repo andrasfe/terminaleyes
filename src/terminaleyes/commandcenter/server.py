@@ -194,6 +194,16 @@ def create_app(
     # Invalidated by any other mouse action.
     app.state.last_click_xy_at = None  # tuple[(x,y), epoch] | None
 
+    # Homer-retrain state. n_trajectories_since_train is incremented
+    # after every successful click_at — each click writes a fresh
+    # history.jsonl which is exactly the kind of row build_*_dataset
+    # consumes. is_retraining is True while a retrain subprocess
+    # runs (we lock the endpoint behind this so two concurrent
+    # retrains can't fight over the checkpoint dir).
+    app.state.n_trajectories_since_train = 0
+    app.state.last_retrain = None  # dict | None — most recent verdict
+    app.state.is_retraining = False
+
     @app.on_event("startup")
     async def _on_startup() -> None:
         bus.bind_loop(asyncio.get_event_loop())
@@ -763,6 +773,10 @@ def create_app(
                     app.state.last_click_xy_at = (
                         (req.x_pct, req.y_pct), _time.time(),
                     )
+                    # Every successful click produced a fresh
+                    # history.jsonl trajectory — a new training row
+                    # for the homer's retrain pipeline.
+                    app.state.n_trajectories_since_train += 1
                     # Multi-click: the homer already fired one click
                     # as part of landing. Send the extras in-place
                     # (no movement between) so the OS sees them as a
@@ -1649,6 +1663,117 @@ def create_app(
             "active_run": active.public() if active else None,
             "screen_width": cfg.screen_width,
             "screen_height": cfg.screen_height,
+        })
+
+    # ── homer retrain (online training) ──────────────────────────
+    @app.get("/api/homer/training-state")
+    def homer_training_state() -> JSONResponse:
+        return JSONResponse({
+            "n_trajectories_since_train": (
+                app.state.n_trajectories_since_train
+            ),
+            "is_retraining": app.state.is_retraining,
+            "last_retrain": app.state.last_retrain,
+        })
+
+    @app.post("/api/homer/retrain")
+    async def homer_retrain() -> JSONResponse:
+        """Run scripts/retrain_homer.py as a background subprocess.
+
+        The script: builds dataset (canary-excluded + sanity-gated) →
+        trains a new vN+1 → canary-evals against the previous
+        checkpoint → installs if the regression check passes, deletes
+        the new dir if it doesn't. We just orchestrate, stream
+        output to the LogBus, and on success hot-reload the homer's
+        model caches so the next click_at picks up the new
+        checkpoint without cc restart.
+        """
+        if app.state.is_retraining:
+            raise HTTPException(409, "retrain already in progress")
+        app.state.is_retraining = True
+        async def _run():
+            import sys as _sys
+            from pathlib import Path as _Path
+            summary_path = _Path("/tmp/retrain_summary.json")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    _sys.executable, "scripts/retrain_homer.py",
+                    "--summary-out", str(summary_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                import time as _time_local
+                from terminaleyes.commandcenter.log_bus import (
+                    LogEvent as _LogEvent,
+                )
+                async for raw in proc.stdout:
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    bus.publish(_LogEvent(
+                        ts=_time_local.time(), level="INFO",
+                        source="retrain", msg=line, run_id=None,
+                    ))
+                rc = await proc.wait()
+                verdict: dict | None = None
+                try:
+                    verdict = json.loads(summary_path.read_text())
+                except Exception:
+                    verdict = None
+                app.state.last_retrain = {
+                    "rc": rc, "verdict": verdict,
+                    "ts": _time_local.time(),
+                }
+                if verdict and verdict.get("any_accepted"):
+                    # Hot-reload: a new instance of VisualServoHomer
+                    # is constructed per click_at, so it'll pick up
+                    # the new checkpoints automatically on the next
+                    # click. No explicit reload needed because the
+                    # candidate list is read at __init__ time.
+                    app.state.n_trajectories_since_train = 0
+                bus.publish(_LogEvent(
+                    ts=_time_local.time(), level="INFO", source="retrain",
+                    msg=(
+                        f"retrain done rc={rc} "
+                        f"accepted={verdict.get('any_accepted') if verdict else None}"
+                    ),
+                    run_id=None,
+                ))
+            except Exception as e:
+                logger.exception("retrain subprocess failed")
+                import time as _time_local
+                app.state.last_retrain = {
+                    "rc": -1, "verdict": None, "error": str(e),
+                    "ts": _time_local.time(),
+                }
+            finally:
+                app.state.is_retraining = False
+        asyncio.create_task(_run())
+        return JSONResponse({"ok": True, "started": True})
+
+    @app.post("/api/homer/rollback")
+    def homer_rollback() -> JSONResponse:
+        """Remove the NEWEST checkpoint of each family, so the homer
+        falls back to the previous one on the next click. Doesn't
+        delete the only-remaining checkpoint of a family (we'd lose
+        the homer entirely)."""
+        import re as _re
+        import shutil as _shutil
+        from pathlib import Path as _Path
+        ck_root = _Path("data/ml/checkpoints")
+        rolled_back = []
+        for family in ("pointer_accel", "longjump"):
+            pat = _re.compile(rf"^{family}-v(\d+)$")
+            dirs = []
+            for d in ck_root.glob(f"{family}-v*"):
+                m = pat.match(d.name)
+                if m and (d / "config.json").exists():
+                    dirs.append((int(m.group(1)), d))
+            dirs.sort(reverse=True)
+            if len(dirs) >= 2:
+                newest = dirs[0][1]
+                _shutil.rmtree(newest, ignore_errors=True)
+                rolled_back.append(newest.name)
+        return JSONResponse({
+            "ok": True, "rolled_back": rolled_back,
         })
 
     return app

@@ -508,6 +508,83 @@ $btnExecScript.addEventListener("click", openExecModal);
 $execModalClose.addEventListener("click", closeExecModal);
 $execModalCancel.addEventListener("click", closeExecModal);
 
+// ── homer retrain (online training) ────────────────────────────
+const $btnRetrain = document.getElementById("btn-retrain");
+const $btnRollback = document.getElementById("btn-rollback");
+const $retrainCount = document.getElementById("retrain-count");
+let _retrainInFlight = false;
+
+async function refreshRetrainState() {
+  try {
+    const r = await fetch("/api/homer/training-state");
+    if (!r.ok) return;
+    const j = await r.json();
+    const n = j.n_trajectories_since_train || 0;
+    $retrainCount.textContent = `(${n} new)`;
+    if (j.is_retraining || _retrainInFlight) {
+      $btnRetrain.disabled = true;
+      $btnRetrain.textContent = "Retraining…";
+    } else {
+      $btnRetrain.disabled = false;
+      // Restore button text + the span.
+      $btnRetrain.textContent = "Retrain homer ";
+      $btnRetrain.appendChild($retrainCount);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+$btnRetrain?.addEventListener("click", async () => {
+  if (_retrainInFlight) return;
+  const confirmMsg =
+    "Retrain pointer-accel + long-jump models on accumulated clicks?\n\n" +
+    "• Build the dataset (canary-excluded, sanity-gated).\n" +
+    "• Train new vN+1 checkpoints.\n" +
+    "• Canary eval: if the new model regresses by >1.5× on the\n" +
+    "  held-out set, it gets rejected and the previous stays.\n" +
+    "• Training takes ~30-60s; clicks continue working in parallel.";
+  if (!window.confirm(confirmMsg)) return;
+  _retrainInFlight = true;
+  refreshRetrainState();
+  try {
+    const r = await fetch("/api/homer/retrain", { method: "POST" });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      window.alert(`retrain failed to start: ${r.status} ${t}`);
+    }
+  } catch (e) {
+    window.alert(`retrain error: ${e}`);
+  } finally {
+    _retrainInFlight = false;
+    refreshRetrainState();
+  }
+});
+
+$btnRollback?.addEventListener("click", async () => {
+  if (!window.confirm(
+    "Roll back homer checkpoints?\n\n" +
+    "Removes the newest pointer-accel and long-jump checkpoints. " +
+    "The homer falls back to the previous ones on the next click. " +
+    "Use this if a fresh retrain made clicks visibly worse."
+  )) return;
+  try {
+    const r = await fetch("/api/homer/rollback", { method: "POST" });
+    const j = await r.json();
+    window.alert(
+      "Rolled back: " +
+      (j.rolled_back && j.rolled_back.length
+        ? j.rolled_back.join(", ")
+        : "(nothing to roll back — already at oldest)")
+    );
+  } catch (e) {
+    window.alert(`rollback error: ${e}`);
+  }
+});
+
+// Poll retrain state every 5s so the counter stays fresh and we
+// can show "Retraining…" if another tab kicked off training.
+setInterval(refreshRetrainState, 5000);
+refreshRetrainState();
+
 // ESC closes the modal when it's open.
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !$execModal.classList.contains("hidden")) {

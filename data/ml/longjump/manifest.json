@@ -1,8 +1,8 @@
 {
-  "total_rows": 45,
+  "total_rows": 421,
   "splits": {
-    "train": 37,
-    "val": 4,
-    "test": 4
+    "train": 337,
+    "val": 42,
+    "test": 42
   }
 }

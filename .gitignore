@@ -58,17 +58,19 @@ run_mcp.sh
 .playwright-mcp/
 
 # ML artefacts — adapters, intermediate datasets, checkpoints.
-# Ignore everything under data/ml/ EXCEPT the shipped Ubuntu-tuned
-# pointer-accel and long-jump models (+ their training datasets).
-# They're load-bearing for fast cursor homing on the default
-# Ubuntu + redglass setup; users targeting other OSes or webcams
-# follow the README runbook to add their own pointer_accel-vN /
-# longjump-vN checkpoints alongside.
+# Ignore everything under data/ml/ EXCEPT:
+#   - the SHIPPED Ubuntu-tuned baseline checkpoints
+#     (pointer_accel-v5, longjump-v2) and their training datasets,
+#   - the canary eval sets used by the online-retrain endpoint.
+# New versions created by the user's retrain (pointer_accel-v6+,
+# longjump-v3+) stay strictly local — they encode the user's
+# specific webcam/setup and aren't useful to anyone else.
 data/ml/*
 !data/ml/checkpoints/
 data/ml/checkpoints/*
-!data/ml/checkpoints/pointer_accel-*/
-!data/ml/checkpoints/longjump-*/
+!data/ml/checkpoints/pointer_accel-v5/
+!data/ml/checkpoints/longjump-v2/
 !data/ml/pointer_accel/
 !data/ml/longjump/
+!data/ml/canary/
 *.safetensors

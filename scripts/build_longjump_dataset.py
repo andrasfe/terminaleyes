@@ -139,6 +139,13 @@ def main() -> int:
              "fraction of the image from the target. Default 0.02 (2%%, "
              "~38 px on 1920×1080) — clean clicks only.",
     )
+    ap.add_argument(
+        "--exclude-canary", type=Path,
+        default=Path("data/ml/canary/longjump.jsonl"),
+        help="Exclude any trajectory_id present in this canary "
+             "file from the training corpus. Prevents training "
+             "data / eval-set overlap. Set empty to skip.",
+    )
     args = ap.parse_args()
     since_ts: float | None = None
     if args.since:
@@ -148,6 +155,18 @@ def main() -> int:
             from datetime import datetime
             since_ts = datetime.fromisoformat(args.since).timestamp()
 
+    canary_traj_ids: set[str] = set()
+    if args.exclude_canary and args.exclude_canary.exists():
+        with args.exclude_canary.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    canary_traj_ids.add(json.loads(line)["trajectory_id"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
     if not args.runs_root.exists():
         print(f"runs root not found: {args.runs_root}", file=sys.stderr)
         return 2
@@ -155,6 +174,7 @@ def main() -> int:
     rows: list[dict] = []
     n_files = 0
     n_lines = 0
+    n_dropped_canary = 0
     n_dropped_age = 0
     n_dropped_quality = 0
     for hist_path in _iter_history_files(args.runs_root):
@@ -167,6 +187,9 @@ def main() -> int:
                 continue
         n_files += 1
         traj_id = str(hist_path.parent.relative_to(args.runs_root))
+        if traj_id in canary_traj_ids:
+            n_dropped_canary += 1
+            continue
         steps: list[dict] = []
         try:
             with hist_path.open("r", encoding="utf-8") as f:
@@ -202,6 +225,8 @@ def main() -> int:
             f"  dropped {n_dropped_quality} trajectory(s) with final "
             f"residual > {args.max_final_residual:.0%}"
         )
+    if n_dropped_canary:
+        print(f"  dropped {n_dropped_canary} canary trajectory(s)")
     if not rows:
         print(
             "no usable rows — run scripts/collect_pointer_accel.sh first.",
