@@ -84,6 +84,7 @@ class NavigateAgent(Agent):
             )
 
         # 1. Pre-flight: ensure a browser is the foreground app.
+        had_to_recover_focus = False
         if ensure_browser:
             ok, reason = await self._ensure_browser_focused(
                 max_attempts=max_focus_attempts, platform=platform,
@@ -93,6 +94,17 @@ class NavigateAgent(Agent):
                     success=False,
                     reason=f"could not focus a browser: {reason}",
                 )
+            # ``_ensure_browser_focused`` prepends "activated via "
+            # to ``reason`` iff it had to fire one of the corrective
+            # actions (LaunchAgent / ClickAgent / Super+N sweep). If
+            # the initial pre-flight verify passed without any
+            # activation, the reason is the verifier's free-form
+            # answer ("The visible address bar and …"). We use this
+            # to skip the redundant force-activate-as-precaution
+            # below: it would launch a duplicate browser window on
+            # the very common case of "the browser was already
+            # focused".
+            had_to_recover_focus = reason.startswith("activated via ")
             # Tight check: re-verify immediately before typing. The
             # initial pre-flight may have spent several seconds on
             # model calls / activation; in that gap the foreground
@@ -110,19 +122,17 @@ class NavigateAgent(Agent):
                         f"shifted before typing: {v_tight.reason}"
                     ),
                 )
-            # Hard transfer of WM focus to a browser. The verifier
-            # judges by window size, but on GNOME the *actually
-            # focused* app may be something else whose window is
-            # tiny (App Center notification, system dialog, etc.).
-            # GNOME activities + "chrome" + Enter focuses an
-            # existing browser window when one is already running, so
-            # this is idempotent — safe to run even when the browser
-            # already has focus. Clicking the viewport alone is not
-            # enough because clicking inside an unfocused window
-            # doesn't always transfer WM focus (the click is
-            # consumed by the click-to-focus behaviour without a
-            # subsequent typing-ready state).
-            await self._force_activate_browser_for_typing(platform)
+            # Hard transfer of WM focus to a browser ONLY when we
+            # had to recover focus (initial check failed). On a
+            # clean initial check the browser was already foreground
+            # and force-activating would launch a duplicate window
+            # (the operator-reported bug). If typing still ends up
+            # in the wrong place because of a hidden focus thief,
+            # the post-flight URL-bar OCR oracle below catches it
+            # and returns success=False rather than silently
+            # mis-navigating.
+            if had_to_recover_focus:
+                await self._force_activate_browser_for_typing(platform)
 
         # 2. Type the URL.
         focus_mods = ["cmd"] if platform == "macos" else ["ctrl"]
