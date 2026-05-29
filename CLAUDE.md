@@ -317,7 +317,7 @@ If BT HID stops working, check in this order:
 
 2. **Is the SDP record visible?**
    ```bash
-   sudo sdptool browse local | grep -A5 "TerminalEyes HID"
+   sudo sdptool browse local | grep -A5 "devmouse"
    # Must show: "Human Interface Device" (0x1124)
    ```
 
@@ -374,7 +374,7 @@ If BT HID stops working, check in this order:
 12. Run `sudo bash scripts/setup_bt_hid.sh` (one-time: installs override, configures adapter)
 13. Run `sudo bash scripts/radio_mode.sh bt` (switch to BT mode, disables WiFi)
 14. Reboot Pi, reconfigure Mac en10 IP if needed
-15. On target Mac: Bluetooth Settings → Connect to "TerminalEyes HID" (or "keyboarder")
+15. On target Mac: Bluetooth Settings → Connect to "devmouse" (or "keyboarder")
 16. Dismiss Keyboard Setup Assistant if it appears
 17. Test: `curl -X POST -H 'Content-Type: application/json' -d '{"text":"hello"}' http://10.0.0.2:8080/bt/text`
 

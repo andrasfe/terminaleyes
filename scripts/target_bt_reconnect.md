@@ -105,7 +105,7 @@ Survives logout / reboot. Installs once, runs forever.
 mkdir -p ~/.config/systemd/user
 cat > ~/.config/systemd/user/bt-keepalive.service <<'UNIT'
 [Unit]
-Description=Keep TerminalEyes HID BT connection alive
+Description=Keep devmouse BT connection alive
 After=bluetooth.service
 
 [Service]
@@ -148,7 +148,7 @@ launching from a shell.
 
 | var | default | what it does |
 |---|---|---|
-| `PI_BT_NAMES` | `keyboarder,TerminalEyes HID` | Comma-separated names to look up. The Pi has been observed under either `keyboarder` (its hostname) or `TerminalEyes HID` (its BT alias) depending on the pairing flow — the script tries them in order. Override if your Pi has a different name. |
+| `PI_BT_NAMES` | `keyboarder,devmouse` | Comma-separated names to look up. The Pi has been observed under either `keyboarder` (its hostname) or `devmouse` (its BT alias) depending on the pairing flow — the script tries them in order. Override if your Pi has a different name. |
 | `PI_BT_MAC` | *(auto-discovered)* | Explicit Pi MAC, e.g. `AA:BB:CC:DD:EE:FF`. Skips the by-name lookup — set this when `--probe` shows no name match. |
 | `INTERVAL` | `300` | Seconds between checks. Drop to `60` for snappier recovery during active development. |
 | `LOG_FILE` | *(unset)* | Optional path; output is also appended to this file. Useful when running under tmux. |
@@ -181,7 +181,7 @@ Each iteration:
 
 The script never **pairs** a new device — only reconnects already-
 paired ones. Initial pairing is a one-time manual step (Bluetooth
-settings → `TerminalEyes HID` → Pair).
+settings → `devmouse` → Pair).
 
 ---
 
@@ -194,7 +194,7 @@ name. Three likely fixes:
 
   1. The Pi's BT name on this host isn't in the default list.
      `bluetoothctl paired-devices` will show what it is. Re-run
-     with `PI_BT_NAMES="that name,keyboarder,TerminalEyes HID"`.
+     with `PI_BT_NAMES="that name,keyboarder,devmouse"`.
   2. Pin the MAC: `PI_BT_MAC=AA:BB:CC:DD:EE:FF ./target_bt_reconnect.sh`.
   3. The device genuinely isn't paired here. Open the OS
      Bluetooth settings, pair with the Pi once manually, then

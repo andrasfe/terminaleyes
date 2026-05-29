@@ -491,7 +491,7 @@ tmux new-session -d -s btka './scripts/target_bt_reconnect.sh'
 mkdir -p ~/.config/systemd/user
 cat > ~/.config/systemd/user/bt-keepalive.service <<'UNIT'
 [Unit]
-Description=Keep TerminalEyes HID BT connection alive
+Description=Keep devmouse BT connection alive
 After=bluetooth.service
 
 [Service]

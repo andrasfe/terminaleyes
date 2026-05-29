@@ -142,8 +142,8 @@ EOF
     #   Service class: none extra
     cat > "$CONF_FILE" <<'BTCONF'
 [General]
-# TerminalEyes Bluetooth HID Configuration (Keyboard + Mouse)
-Name = TerminalEyes HID
+# devmouse — Bluetooth HID (Keyboard + Mouse)
+Name = devmouse
 Class = 0x0025C0
 DiscoverableTimeout = 0
 PairableTimeout = 0
@@ -224,7 +224,7 @@ AGENTSERVICE
     # Power on via hciconfig (more reliable than bluetoothctl for class/name)
     hciconfig hci0 up 2>/dev/null || true
     hciconfig hci0 class 0x0025C0 2>/dev/null || true
-    hciconfig hci0 name "TerminalEyes HID" 2>/dev/null || true
+    hciconfig hci0 name "devmouse" 2>/dev/null || true
     hciconfig hci0 piscan 2>/dev/null || true
     sleep 1
 
@@ -287,12 +287,12 @@ AGENTSERVICE
     echo ""
     echo "=== Bluetooth HID Setup Complete ==="
     echo ""
-    echo "The Pi is now discoverable as 'TerminalEyes HID'."
+    echo "The Pi is now discoverable as 'devmouse'."
     echo "It presents as a combo keyboard + mouse device."
     echo ""
     echo "Next steps:"
     echo "  1. Start the REST API: sudo systemctl start terminaleyes-pi"
-    echo "  2. On the host machine, pair with 'TerminalEyes HID'"
+    echo "  2. On the host machine, pair with 'devmouse'"
     echo "  3. The REST API accepts Bluetooth commands at:"
     echo ""
     echo "  Keyboard:"
