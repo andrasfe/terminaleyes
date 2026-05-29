@@ -157,7 +157,10 @@ Class = 0x0025C0
 DiscoverableTimeout = 0
 PairableTimeout = 0
 Discoverable = true
-Pairable = true
+# Pairable is NOT a valid main.conf key in BlueZ 5.82 — bluetoothd
+# warns "Unknown key Pairable for group General" and ignores it.
+# The correct path is bluetoothctl `pairable on` at runtime, which
+# bt-strip-audio-sdp.sh re-asserts after every bluetoothd cycle.
 
 [Policy]
 AutoEnable=true
@@ -217,8 +220,35 @@ AGENTSERVICE
 
     systemctl daemon-reload
     systemctl enable bt-agent
-    echo "  Pairing agent: $AGENT_SCRIPT"
+    echo "  Pairing agent: $AGENT_PY_DEST"
     echo "  Auto-accept: NoInputNoOutput (Just Works pairing)"
+    echo "  OK"
+
+    # -----------------------------------------------------------------------
+    # Step 4.25: Remove stale Pi-side pairings.
+    # -----------------------------------------------------------------------
+    # The Pi remembers every device it has ever paired with under
+    # /var/lib/bluetooth/<adapter>/<peer-mac>/.  If the operator has
+    # Forgotten the Pi on the Mac side without also removing it on the
+    # Pi, the next pair attempt arrives with new credentials but the
+    # Pi auto-rejects because it already has a (stale) bond — silently,
+    # at HCI level, before the agent ever fires.  Symptom: Mac scan
+    # finds the Pi but Pair just spins and times out, while
+    # journalctl -u bt-agent shows nothing because the agent isn't
+    # even being consulted.
+    #
+    # Wiping these as part of setup gives every fresh install a clean
+    # pair surface and is harmless on a Pi that's never been paired.
+    echo "[4.25/6] Removing stale Pi-side pairings..."
+    STALE_DEVS=$(bluetoothctl devices 2>/dev/null | awk '/^Device / {print $2}')
+    if [ -n "$STALE_DEVS" ]; then
+        for MAC in $STALE_DEVS; do
+            bluetoothctl remove "$MAC" >/dev/null 2>&1 || true
+            echo "  removed $MAC"
+        done
+    else
+        echo "  (none to remove)"
+    fi
     echo "  OK"
 
     # -----------------------------------------------------------------------
