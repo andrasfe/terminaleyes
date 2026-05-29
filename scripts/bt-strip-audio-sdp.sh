@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# bt-strip-audio-sdp.sh — Remove default audio/telephony SDP records.
+# bt-strip-audio-sdp.sh — Remove default audio/telephony SDP records
+# AND make sure the adapter is in a connectable state.
 #
 # BlueZ 5.x publishes Hands-Free, Audio Gateway, SIM Access, and
 # similar SDP records automatically as part of its protocol stack,
@@ -11,11 +12,19 @@
 # the audio goes nowhere and the operator loses Mac speaker audio
 # every time the Pi connects.
 #
-# This script runs after bluetoothd starts (driven by a systemd
-# Wants= on bluetooth.service) and removes the offending SDP records
-# by handle.  bluetoothd keeps the HID record we registered through
-# RegisterProfile + the standard GAP / GATT / Device Information
-# records, which is exactly what a HID-only peer should advertise.
+# This script ALSO restores the adapter's runtime settings that
+# bluetoothd doesn't reliably re-apply from main.conf on a hot
+# restart: Pairable=yes (the load-bearing one — without it macOS
+# pair requests get silently rejected), Discoverable=yes, and the
+# user-visible Alias=devmouse.  hciconfig name is forced too because
+# bluetoothd falls back to the Pi's hostname for the GAP Name field
+# even when main.conf sets one.
+#
+# Runs after bluetoothd starts (driven by a systemd Wants= /
+# PartOf= on bluetooth.service).  bluetoothd keeps the HID record
+# we registered through RegisterProfile + the standard GAP / GATT /
+# Device Information records — exactly what a HID-only peer should
+# advertise.
 
 set -u
 
@@ -61,3 +70,24 @@ for NAME in "${UNWANTED_NAMES[@]}"; do
 done
 
 echo "bt-strip-audio-sdp: removed $DELETED audio/telephony record(s)."
+
+# ------------------------------------------------------------------
+# Force adapter into a connectable, pairable state.
+# main.conf's Pairable= isn't reliably honoured on hot restart, and
+# the user-visible Alias gets reset to the hostname.  Setting these
+# from the script makes them deterministic regardless of how bluetoothd
+# came up.
+# ------------------------------------------------------------------
+hciconfig hci0 name "devmouse" 2>/dev/null || true
+
+bluetoothctl <<'BCTL' >/dev/null 2>&1
+power on
+discoverable on
+pairable on
+system-alias devmouse
+BCTL
+
+# Quick verify line for the journal
+PAIR_STATE=$(bluetoothctl show 2>/dev/null | awk -F': ' '/Pairable/ {print $2}' | head -1)
+ALIAS_NOW=$(bluetoothctl show 2>/dev/null | awk -F': ' '/Alias/ {print $2}' | head -1)
+echo "bt-strip-audio-sdp: pairable=$PAIR_STATE alias=$ALIAS_NOW"

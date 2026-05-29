@@ -168,43 +168,52 @@ BTCONF
     echo "  OK"
 
     # -----------------------------------------------------------------------
-    # Step 4: Set up auto-accept pairing agent
+    # Step 4: Set up auto-accept pairing agent (Python D-Bus agent)
     # -----------------------------------------------------------------------
-    echo "[4/6] Setting up pairing agent..."
+    echo "[4/6] Setting up Python D-Bus pairing agent..."
 
-    # Create a script that runs bluetoothctl in a persistent session
-    # with the agent registered.  Plain `bluetoothctl agent NoInputNoOutput`
-    # exits immediately — we need to keep the process alive.
-    cat > "$AGENT_SCRIPT" <<'AGENTSCRIPT'
-#!/usr/bin/env bash
-# Persistent Bluetooth pairing agent — auto-accepts all pair requests.
-# Uses bluetoothctl in interactive mode to keep the agent alive.
-exec bluetoothctl <<EOF
-agent NoInputNoOutput
-default-agent
-EOF
-# bluetoothctl stays in interactive mode reading from stdin (which is
-# the heredoc).  After the heredoc ends, it keeps running as a
-# foreground process until killed.  If it exits, systemd restarts it.
-AGENTSCRIPT
-    chmod +x "$AGENT_SCRIPT"
+    # bluetoothctl-based agents (the heredoc/pipe trick) routinely
+    # fail with "Failed to register agent object" on recent BlueZ —
+    # the interactive bluetoothctl process exits before the D-Bus
+    # session that owns the agent finishes registering it.  The
+    # Python agent registers via dbus directly and stays in a GLib
+    # main loop, which is the pattern every working BT HID project
+    # converges on (see CLAUDE.md "BT HID Architecture").
+    AGENT_PY_DEST="/usr/local/bin/bt-agent.py"
+    REPO_AGENT_PY="$(dirname "$(readlink -f "$0")")/bt-agent.py"
+    if [ -f "$REPO_AGENT_PY" ]; then
+        cp "$REPO_AGENT_PY" "$AGENT_PY_DEST"
+        chmod +x "$AGENT_PY_DEST"
+        # Make sure dbus python binding is installed (apt install in
+        # step [1/6] already does this, but be defensive).
+        apt-get install -y -qq python3-dbus python3-gi >/dev/null 2>&1 || true
+    else
+        echo "  ERROR: $REPO_AGENT_PY not found — cannot install agent."
+        echo "  Pairing will fail.  Copy scripts/bt-agent.py to the Pi"
+        echo "  and re-run this script."
+        return 1
+    fi
 
     cat > "$AGENT_CONF" <<AGENTSERVICE
 [Unit]
-Description=Bluetooth Auto-Accept Pairing Agent
+Description=Bluetooth Auto-Accept Pairing Agent (D-Bus, Python)
 After=bluetooth.service
 Requires=bluetooth.service
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sleep 2
-ExecStart=$AGENT_SCRIPT
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/python3 $AGENT_PY_DEST
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 AGENTSERVICE
+
+    # Tidy up the previous bash-shim if it was installed by an
+    # earlier version of this script.
+    rm -f /usr/local/bin/bt-pairing-agent.sh
 
     systemctl daemon-reload
     systemctl enable bt-agent
