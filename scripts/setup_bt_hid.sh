@@ -86,14 +86,24 @@ setup() {
     echo "  OK"
 
     # -----------------------------------------------------------------------
-    # Step 2: Configure bluetoothd with --compat and --noplugin=input
+    # Step 2: Configure bluetoothd with --compat and --noplugin=input,a2dp,...
     # -----------------------------------------------------------------------
-    echo "[2/6] Configuring bluetoothd (disable input plugin)..."
+    echo "[2/6] Configuring bluetoothd (disable input + audio plugins)..."
 
     # CRITICAL: The BlueZ 'input' plugin binds to PSM 17/19 (HID control
     # and interrupt channels).  If loaded, our application gets EADDRINUSE
     # when trying to bind its own L2CAP sockets.  Every working BT HID
     # project requires disabling it.
+    #
+    # ALSO disabled: every audio-side plugin (a2dp-sink, a2dp-source,
+    # avrcp, hfp, hsp, gateway, media).  Without this, the moment macOS
+    # pairs with the Pi it ALSO offers it as a Bluetooth audio output
+    # device — and routes the Mac's system sound to it.  Operator then
+    # loses Mac speaker audio every time the Pi is connected.  The Pi
+    # advertises nothing useful audio-wise (no DAC, no speaker driver
+    # in this build), so the right answer is to stop bluetoothd from
+    # ever loading the plugins in the first place.  Once they're gone
+    # from the SDP record macOS no longer treats the Pi as audio.
     #
     # --compat enables the SDP server socket so sdptool and
     # RegisterProfile SDP records are visible to remote devices.
@@ -109,11 +119,11 @@ setup() {
     cat > "$OVERRIDE_FILE" <<EOF
 [Service]
 ExecStart=
-ExecStart=$BTDAEMON --compat --noplugin=input
+ExecStart=$BTDAEMON --compat --noplugin=input,a2dp,avrcp,hfp,hsp,gateway,media,audio
 EOF
 
     echo "  Override: $OVERRIDE_FILE"
-    echo "  Flags: --compat --noplugin=input"
+    echo "  Flags: --compat --noplugin=input,a2dp,avrcp,hfp,hsp,gateway,media,audio"
     echo "  OK"
 
     # -----------------------------------------------------------------------
@@ -230,11 +240,18 @@ AGENTSERVICE
     BTPID=$(pgrep -x bluetoothd 2>/dev/null || echo "")
     if [ -n "$BTPID" ]; then
         BTCMDLINE=$(cat "/proc/$BTPID/cmdline" 2>/dev/null | tr '\0' ' ' || echo "")
-        if echo "$BTCMDLINE" | grep -q "noplugin=input"; then
+        if echo "$BTCMDLINE" | grep -qE "noplugin=[^ ]*input"; then
             echo "  bluetoothd: input plugin disabled (correct)"
         else
             echo "  WARNING: input plugin may still be loaded!"
             echo "  cmdline: $BTCMDLINE"
+        fi
+        if echo "$BTCMDLINE" | grep -qE "noplugin=[^ ]*a2dp"; then
+            echo "  bluetoothd: audio plugins (a2dp/avrcp/hfp/hsp) disabled"
+            echo "                — Pi will not appear as a Mac audio output"
+        else
+            echo "  WARNING: audio plugins may still be loaded — Mac will"
+            echo "  route sound to the Pi when paired. Re-run this script."
         fi
         if echo "$BTCMDLINE" | grep -q "compat"; then
             echo "  bluetoothd: --compat mode (SDP server enabled)"
