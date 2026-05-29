@@ -55,6 +55,15 @@ teardown() {
         echo "Removed bt-agent service"
     fi
 
+    # Remove the audio-SDP stripper
+    if [ -f "/etc/systemd/system/bt-strip-audio-sdp.service" ]; then
+        systemctl disable bt-strip-audio-sdp 2>/dev/null || true
+        rm -f /etc/systemd/system/bt-strip-audio-sdp.service
+        rm -f /usr/local/bin/bt-strip-audio-sdp.sh
+        systemctl daemon-reload
+        echo "Removed bt-strip-audio-sdp service"
+    fi
+
     # Restart bluetooth
     systemctl daemon-reload
     systemctl restart bluetooth
@@ -202,6 +211,59 @@ AGENTSERVICE
     echo "  Pairing agent: $AGENT_SCRIPT"
     echo "  Auto-accept: NoInputNoOutput (Just Works pairing)"
     echo "  OK"
+
+    # -----------------------------------------------------------------------
+    # Step 4.5: Install audio-SDP stripper
+    # -----------------------------------------------------------------------
+    echo "[4.5/6] Installing audio-SDP stripper..."
+
+    # Even with --noplugin=a2dp,avrcp,hfp,hsp,gateway,media,audio,
+    # bluetoothd still publishes Hands-Free / SIM Access SDP records
+    # as part of its protocol stack — those flags are at plugin level
+    # not at protocol level.  macOS sees those records on pair and
+    # auto-routes the Mac's system sound to the Pi.  We strip them
+    # after every bluetoothd start with this oneshot unit.
+    STRIP_SCRIPT="/usr/local/bin/bt-strip-audio-sdp.sh"
+    STRIP_UNIT="/etc/systemd/system/bt-strip-audio-sdp.service"
+    REPO_SCRIPT="$(dirname "$(readlink -f "$0")")/bt-strip-audio-sdp.sh"
+
+    if [ -f "$REPO_SCRIPT" ]; then
+        cp "$REPO_SCRIPT" "$STRIP_SCRIPT"
+        chmod +x "$STRIP_SCRIPT"
+
+        cat > "$STRIP_UNIT" <<STRIPSERVICE
+[Unit]
+Description=Strip non-HID audio/telephony SDP records after bluetoothd starts
+# PartOf= is what makes this re-fire whenever bluetooth.service
+# restarts — without it the oneshot stays "active (exited)" forever
+# and the HFP/SAP records come back the next time bluetoothd cycles
+# (e.g. via radio_mode.sh apply during terminaleyes-pi startup).
+After=bluetooth.service terminaleyes-pi.service
+Requires=bluetooth.service
+PartOf=bluetooth.service
+
+[Service]
+Type=oneshot
+# Wait long enough for terminaleyes-pi to call RegisterProfile +
+# bluetoothd to publish the HID SDP record before we start tearing
+# records down.  10s is conservative; pi-zero-2-w usually settles in
+# 3-5s but the race is annoying when it happens.
+ExecStartPre=/bin/sleep 10
+ExecStart=$STRIP_SCRIPT
+
+[Install]
+WantedBy=bluetooth.service
+STRIPSERVICE
+
+        systemctl daemon-reload
+        systemctl enable bt-strip-audio-sdp 2>/dev/null || true
+        echo "  Stripper installed: $STRIP_SCRIPT"
+        echo "  Unit: $STRIP_UNIT (oneshot, fires after bluetoothd)"
+        echo "  OK"
+    else
+        echo "  WARNING: $REPO_SCRIPT not found — Pi will continue"
+        echo "  advertising HFP/SAP SDP records (Mac will route audio)."
+    fi
 
     # -----------------------------------------------------------------------
     # Step 5: Apply configuration and power on adapter
