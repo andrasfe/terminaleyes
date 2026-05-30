@@ -350,6 +350,46 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e)) from e
         return {"status": "ok", "x": str(request.x), "y": str(request.y)}
 
+    @app.post("/bt/mouse/move_large")
+    async def bt_mouse_move_large(request: MouseMoveRequest) -> dict[str, str]:
+        """Send a single relative mouse move of arbitrary magnitude.
+
+        The on-wire BT HID report uses int8 deltas (±127 per axis),
+        so a logical move of e.g. (+220, +220) has to be split into
+        multiple reports. ``/bt/mouse/move`` accepts only a single
+        report's-worth of HID and forces the dev-side to chunk
+        across many HTTP roundtrips — at ~5 ms per roundtrip across
+        USB ECM this dominates wall time for large moves.
+
+        This endpoint takes the FULL logical delta and splits into
+        ±127 reports on the Pi, sending them back-to-back with no
+        inter-report sleep. One POST replaces many. macOS sees a
+        single high-velocity burst (rather than a stream of small
+        deltas) and applies its high-speed pointer-accel curve, so
+        callers must calibrate a SEPARATE pct-per-HID ratio for
+        this path — see VisualServoHomer's fast-mode handling.
+        """
+        bt = _get_bt()
+        try:
+            rem_x, rem_y = request.x, request.y
+            n_reports = 0
+            while rem_x != 0 or rem_y != 0:
+                sx = max(-127, min(127, rem_x))
+                sy = max(-127, min(127, rem_y))
+                if sx != 0 or sy != 0:
+                    await bt.move(sx, sy)
+                    n_reports += 1
+                rem_x -= sx
+                rem_y -= sy
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return {
+            "status": "ok",
+            "x": str(request.x),
+            "y": str(request.y),
+            "reports": str(n_reports),
+        }
+
     @app.post("/bt/mouse/click")
     async def bt_mouse_click(request: MouseClickRequest) -> dict[str, str]:
         bt = _get_bt()
