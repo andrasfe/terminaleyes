@@ -76,6 +76,8 @@ class MouseMoveRequest(BaseModel):
 
 class MouseClickRequest(BaseModel):
     button: str = Field(default="left", description="Button: left, right, middle")
+    count: int = Field(default=1, ge=1, le=5, description="Number of clicks (1=single, 2=double, 3=triple)")
+    inter_click_ms: int = Field(default=40, ge=0, le=200, description="Sleep between successive clicks (ms)")
 
 
 class MouseScrollRequest(BaseModel):
@@ -392,12 +394,32 @@ def create_app(
 
     @app.post("/bt/mouse/click")
     async def bt_mouse_click(request: MouseClickRequest) -> dict[str, str]:
+        """Send N clicks to the host with TIGHT inter-click timing.
+
+        For count > 1, the clicks fire on the Pi without any HTTP
+        roundtrip between them — only the configured inter_click_ms
+        sleep. That keeps the press-to-press gap well inside macOS's
+        double-click threshold (which can be ~250 ms in user settings
+        for "Fast" double-click speed). Single-click HTTP roundtrip
+        adds ~5 ms each way, which is fine for one click but
+        compounds across multiple clicks when the dev side dispatches
+        them — better to let the Pi sequence them locally.
+        """
         bt = _get_bt()
         try:
             await bt.click(request.button)
+            for _ in range(1, request.count):
+                if request.inter_click_ms > 0:
+                    import asyncio as _aio
+                    await _aio.sleep(request.inter_click_ms / 1000.0)
+                await bt.click(request.button)
         except (ValueError, Exception) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-        return {"status": "ok", "button": request.button}
+        return {
+            "status": "ok",
+            "button": request.button,
+            "count": str(request.count),
+        }
 
     @app.post("/bt/mouse/press")
     async def bt_mouse_press(request: MouseClickRequest) -> dict[str, str]:
