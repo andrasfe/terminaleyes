@@ -87,5 +87,46 @@ if __name__ == "__main__":
         except Exception:
             pass
 
+    # Auto-trust newly-paired devices. Without this, macOS hosts pair
+    # OK but the resulting bond is Trusted=no, which on some macOS
+    # versions blocks the Mac from auto-opening the L2CAP HID channels
+    # (PSM 17/19) when it next comes in range. The HID server reports
+    # bt_hid_connected=false and the operator has to manually click
+    # Connect in System Settings → Bluetooth every session.
+    #
+    # We listen for PropertiesChanged on org.bluez.Device1 and the
+    # moment a device flips to Paired=True we mark it Trusted=True via
+    # the same Properties interface. Idempotent: re-trust calls are a
+    # no-op if the device is already trusted.
+    def _on_device_props_changed(interface, changed, invalidated, path=None):
+        if interface != "org.bluez.Device1":
+            return
+        if "Paired" not in changed:
+            return
+        if not changed["Paired"]:
+            return
+        try:
+            dev_props = dbus.Interface(
+                bus.get_object("org.bluez", path),
+                "org.freedesktop.DBus.Properties",
+            )
+            trusted = bool(dev_props.Get("org.bluez.Device1", "Trusted"))
+            if trusted:
+                print(f"auto-trust: {path} already trusted, skipping")
+                return
+            dev_props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+            print(f"auto-trust: {path} → Trusted=True")
+        except Exception as exc:
+            print(f"auto-trust failed for {path}: {exc}")
+
+    bus.add_signal_receiver(
+        _on_device_props_changed,
+        dbus_interface="org.freedesktop.DBus.Properties",
+        signal_name="PropertiesChanged",
+        arg0="org.bluez.Device1",
+        path_keyword="path",
+    )
+    print("Auto-trust handler registered on Device1.PropertiesChanged")
+
     print("Waiting for pairing requests...")
     GLib.MainLoop().run()

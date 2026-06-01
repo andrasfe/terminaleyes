@@ -27,7 +27,9 @@ Bluetooth HID endpoints (keyboard + mouse, optional):
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -182,8 +184,203 @@ def create_app(
                             logger.warning("Bluetooth accept error: %s", e)
                             break
 
-                import asyncio
                 bt_accept_task = asyncio.create_task(_accept_bt_loop())
+
+                # Reconnect watchdog. macOS hosts that we've previously
+                # paired with don't reliably auto-reopen the L2CAP HID
+                # channels after sleep / range loss / bluetoothd cycle
+                # — even when the bond record is Paired+Trusted. The
+                # symptom: bt_hid_connected stays false until the
+                # operator manually clicks Connect in System Settings.
+                #
+                # The watchdog runs `bluetoothctl connect <MAC>` from
+                # the Pi side every BT_RECONNECT_INTERVAL_S seconds
+                # whenever the HID server reports no client. The Pi-
+                # initiated connect goes through the same SDP record
+                # macOS knows about, so the Mac opens PSM 17/19 (the
+                # HID L2CAP channels) and the BluetoothHidServer's
+                # accept loop picks them up exactly as if the Mac had
+                # initiated the connection itself.
+                #
+                # Only acts on devices with Trusted=true (set by
+                # scripts/bt-agent.py on pair). Unpaired devices and
+                # accidentally-paired phones / headphones are ignored.
+                #
+                # Safe in BT mode (radio_mode.sh apply bt). In WiFi
+                # mode the watchdog would still run, but `bluetoothctl
+                # connect` has been observed to crash the BCM43436s
+                # WiFi/BT shared radio — see CLAUDE.md. We don't try
+                # to detect WiFi state here; the operator is expected
+                # to use BT mode when they want BT HID to work.
+                BT_RECONNECT_INTERVAL_S = float(
+                    os.environ.get("TERMINALEYES_BT_RECONNECT_INTERVAL_S", "20")
+                )
+
+                async def _list_trusted_macs() -> list[str]:
+                    """Return MACs of every paired+trusted device. Empty
+                    list on any bluetoothctl error (treated as 'don't
+                    bother trying').
+
+                    Uses `bluetoothctl devices Paired` — BlueZ 5.82
+                    replaced the older `paired-devices` shorthand with
+                    this filtered form.
+                    """
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "bluetoothctl", "devices", "Paired",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        out, _ = await asyncio.wait_for(
+                            proc.communicate(), timeout=5.0,
+                        )
+                    except Exception:
+                        return []
+                    macs = []
+                    for line in out.decode("utf-8", "replace").splitlines():
+                        # Format: "Device AA:BB:CC:DD:EE:FF Name"
+                        parts = line.strip().split()
+                        if len(parts) >= 2 and parts[0] == "Device":
+                            macs.append(parts[1])
+                    # Filter to Trusted=true
+                    trusted = []
+                    for mac in macs:
+                        try:
+                            proc = await asyncio.create_subprocess_exec(
+                                "bluetoothctl", "info", mac,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            out, _ = await asyncio.wait_for(
+                                proc.communicate(), timeout=5.0,
+                            )
+                            text = out.decode("utf-8", "replace")
+                            if "Trusted: yes" in text:
+                                trusted.append(mac)
+                        except Exception:
+                            continue
+                    return trusted
+
+                async def _try_connect(mac: str) -> bool:
+                    """Issue `bluetoothctl connect <MAC>` with a 10 s
+                    timeout. Returns True on success exit code."""
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "bluetoothctl", "connect", mac,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        out, _ = await asyncio.wait_for(
+                            proc.communicate(), timeout=10.0,
+                        )
+                        return proc.returncode == 0
+                    except Exception as exc:
+                        logger.debug(
+                            "bluetoothctl connect %s raised %s", mac, exc,
+                        )
+                        return False
+
+                async def _bredr_connected(mac: str) -> bool:
+                    """Parse `bluetoothctl info <MAC>` for the BR/EDR
+                    Connected flag. Returns False on any error.
+
+                    BR/EDR and HID L2CAP are independent: macOS often
+                    keeps the BR/EDR control link to a paired device
+                    even after disconnecting HID, and the Pi can't
+                    force HID open from this state — only the Mac can
+                    re-attach. We use this to skip pointless connect
+                    attempts when BR/EDR is already up."""
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "bluetoothctl", "info", mac,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        out, _ = await asyncio.wait_for(
+                            proc.communicate(), timeout=5.0,
+                        )
+                        return "Connected: yes" in out.decode(
+                            "utf-8", "replace",
+                        )
+                    except Exception:
+                        return False
+
+                async def _reconnect_watchdog() -> None:
+                    # WARNING-level so logs show in journal regardless
+                    # of root logger config — operator wants visibility
+                    # into reconnect attempts.
+                    logger.warning(
+                        "BT reconnect watchdog started (interval=%.0fs)",
+                        BT_RECONNECT_INTERVAL_S,
+                    )
+                    # Small initial delay so we don't fight the first
+                    # natural connect attempt the Mac makes after the
+                    # service starts.
+                    await asyncio.sleep(BT_RECONNECT_INTERVAL_S)
+                    while True:
+                        try:
+                            if bt.is_connected:
+                                await asyncio.sleep(BT_RECONNECT_INTERVAL_S)
+                                continue
+                            macs = await _list_trusted_macs()
+                            if not macs:
+                                logger.warning(
+                                    "BT reconnect: no trusted devices, "
+                                    "sleeping",
+                                )
+                                await asyncio.sleep(BT_RECONNECT_INTERVAL_S)
+                                continue
+                            for mac in macs:
+                                if bt.is_connected:
+                                    break
+                                # Only attempt connect when BR/EDR is
+                                # also down — Pi-initiated reconnect
+                                # can re-establish the BR/EDR control
+                                # link, but can NOT force macOS to
+                                # open the HID L2CAP channels (PSM
+                                # 17/19). If BR/EDR is already up,
+                                # the Mac is choosing not to attach
+                                # HID and only the operator (System
+                                # Settings → Bluetooth → Connect)
+                                # can recover. Log the situation so
+                                # the operator knows what to do.
+                                if await _bredr_connected(mac):
+                                    logger.warning(
+                                        "BT reconnect: %s BR/EDR up but "
+                                        "HID not — macOS won't auto-"
+                                        "open HID L2CAP from Pi side. "
+                                        "Toggle Bluetooth off/on on the "
+                                        "Mac, or click Connect in "
+                                        "System Settings → Bluetooth.",
+                                        mac,
+                                    )
+                                    continue
+                                logger.warning(
+                                    "BT reconnect: BR/EDR down, "
+                                    "attempting %s", mac,
+                                )
+                                ok = await _try_connect(mac)
+                                if ok:
+                                    logger.warning(
+                                        "BT reconnect: %s connect OK", mac,
+                                    )
+                                    break
+                                else:
+                                    logger.warning(
+                                        "BT reconnect: %s connect failed",
+                                        mac,
+                                    )
+                            await asyncio.sleep(BT_RECONNECT_INTERVAL_S)
+                        except asyncio.CancelledError:
+                            return
+                        except Exception:
+                            logger.exception("BT reconnect watchdog error")
+                            await asyncio.sleep(BT_RECONNECT_INTERVAL_S)
+
+                bt_reconnect_task = asyncio.create_task(
+                    _reconnect_watchdog(),
+                )
+                app.state.bt_reconnect_task = bt_reconnect_task
 
             except Exception as exc:
                 logger.info("Bluetooth HID not available: %s", exc)
@@ -191,9 +388,12 @@ def create_app(
 
         yield
 
-        # Cancel BT accept loop
+        # Cancel BT accept loop and reconnect watchdog
         if bt_accept_task is not None:
             bt_accept_task.cancel()
+        rwd = getattr(app.state, "bt_reconnect_task", None)
+        if rwd is not None:
+            rwd.cancel()
 
         # Cleanup
         if app.state.bt_hid is not None:
